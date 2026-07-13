@@ -1,8 +1,6 @@
-use std::collections::HashSet;
-
 use crate::board::Board;
 use crate::hex::hex_offsets;
-use crate::types::Coord;
+use crate::types::{Coord, CoordSet};
 
 /// Returns all legal move positions for a board state.
 ///
@@ -11,7 +9,8 @@ use crate::types::Coord;
 pub fn legal_moves(board: &Board, radius: i32) -> Vec<Coord> {
     let offsets = hex_offsets(radius);
     let stones = board.stones();
-    let mut candidates: HashSet<Coord> = HashSet::with_capacity(offsets.len());
+    let mut candidates: CoordSet =
+        CoordSet::with_capacity_and_hasher(offsets.len(), Default::default());
 
     for &stone in stones.keys() {
         for &(dq, dr) in &offsets {
@@ -77,7 +76,7 @@ mod tests {
     fn no_duplicates_in_moves() {
         let board = Board::new();
         let moves = legal_moves(&board, 8);
-        let unique: HashSet<Coord> = moves.iter().copied().collect();
+        let unique: CoordSet = moves.iter().copied().collect();
         assert_eq!(
             moves.len(),
             unique.len(),

@@ -5,7 +5,7 @@
 //! edges along each WIN_AXIS direction up to `win_length - 1` steps, plus a
 //! global dummy node connected to all other nodes.
 
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use hexo_engine::hex::hex_distance;
 use hexo_engine::types::{Coord, Player, WIN_AXES};
@@ -179,7 +179,8 @@ fn build_axis_graph(
     // --- Coordinate arrays and lookup maps ---
 
     let mut coords = Vec::with_capacity(n * 2);
-    let mut coord_to_idx: HashMap<Coord, usize> = HashMap::with_capacity(n_real);
+    let mut coord_to_idx: FxHashMap<Coord, usize> =
+        FxHashMap::with_capacity_and_hasher(n_real, Default::default());
     let mut node_kind: Vec<NodeKind> = Vec::with_capacity(n);
 
     for (i, &(coord, player)) in stones.iter().enumerate() {
@@ -404,7 +405,8 @@ fn build_axis_graph(
     // walks discover the same pair. Keep the first occurrence.
     {
         let n_edges = edge_src.len();
-        let mut seen = std::collections::HashSet::with_capacity(n_edges);
+        let mut seen: FxHashSet<(i64, i64, u8)> =
+            FxHashSet::with_capacity_and_hasher(n_edges, Default::default());
         let mut keep = Vec::with_capacity(n_edges);
         for e in 0..n_edges {
             let key = (edge_src[e], edge_dst[e], axis_idx_of(&edge_attr, e));

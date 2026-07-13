@@ -1,7 +1,19 @@
 use std::fmt;
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 /// Axial coordinate (q, r) on the hex grid.
 pub type Coord = (i32, i32);
+
+/// Sparse map from board coordinate to owning player.
+///
+/// Uses `rustc_hash`'s Fx hasher rather than the standard SipHash: coordinate
+/// keys are small and non-adversarial, so the faster hash is a large win on
+/// the win-check / legal-move / graph-build hot paths (see `benches/`).
+pub type StoneMap = FxHashMap<Coord, Player>;
+
+/// Set of board coordinates, Fx-hashed for the same reason as [`StoneMap`].
+pub type CoordSet = FxHashSet<Coord>;
 
 /// The 6 neighbor directions in axial coordinates.
 pub const HEX_DIRS: [Coord; 6] = [

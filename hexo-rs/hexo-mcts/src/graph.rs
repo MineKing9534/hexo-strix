@@ -3,7 +3,7 @@
 //! Mirrors the Python `game_to_graph` but returns flat Vecs instead of tensors.
 //! Python wraps these into `torch.tensor` + `torch_geometric.data.Data`.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use hexo_engine::hex::hex_distance;
 use hexo_engine::symmetry::D6_TRANSFORMS;
@@ -165,7 +165,8 @@ fn build_graph(
     }
 
     // Edges (hex adjacency)
-    let mut coord_to_idx: HashMap<Coord, usize> = HashMap::with_capacity(n);
+    let mut coord_to_idx: FxHashMap<Coord, usize> =
+        FxHashMap::with_capacity_and_hasher(n, Default::default());
     for i in 0..n_stones {
         coord_to_idx.insert((coords[i * 2], coords[i * 2 + 1]), i);
     }

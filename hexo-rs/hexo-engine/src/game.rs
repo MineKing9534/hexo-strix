@@ -1,11 +1,10 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::board::Board;
 use crate::hex::hex_offsets;
 use crate::legal_moves::legal_moves;
 use crate::turn::TurnState;
-use crate::types::{Coord, Player};
+use crate::types::{Coord, CoordSet, Player, StoneMap};
 use crate::win::check_win;
 
 /// Configuration parameters for a HeXO game.
@@ -50,7 +49,7 @@ pub struct GameState {
     /// Precomputed hex-circle offsets for the configured radius (shared across clones).
     offsets: Arc<[Coord]>,
     /// Cached set of legal moves, updated incrementally on each apply_move.
-    cached_legal: HashSet<Coord>,
+    cached_legal: CoordSet,
 }
 
 impl GameState {
@@ -73,7 +72,7 @@ impl GameState {
 
         let board = Board::new();
         let offsets: Arc<[Coord]> = hex_offsets(config.placement_radius).into();
-        let initial_legal: HashSet<Coord> =
+        let initial_legal: CoordSet =
             legal_moves(&board, config.placement_radius).into_iter().collect();
         GameState {
             board,
@@ -148,7 +147,7 @@ impl GameState {
 
     /// Returns a reference to the internal legal moves set. Iteration order is
     /// arbitrary (not sorted). Use this on hot paths where sorting is unnecessary.
-    pub fn legal_moves_set(&self) -> &HashSet<Coord> {
+    pub fn legal_moves_set(&self) -> &CoordSet {
         &self.cached_legal
     }
 
@@ -200,7 +199,7 @@ impl GameState {
     }
 
     /// Returns a reference to the underlying stone map (no allocation).
-    pub fn stones(&self) -> &HashMap<Coord, Player> {
+    pub fn stones(&self) -> &StoneMap {
         self.board.stones()
     }
 
@@ -239,7 +238,7 @@ impl GameState {
                 .expect("from_state: stones must not collide");
         }
         let offsets: Arc<[Coord]> = hex_offsets(config.placement_radius).into();
-        let cached_legal: HashSet<Coord> =
+        let cached_legal: CoordSet =
             legal_moves(&board, config.placement_radius).into_iter().collect();
         let turn = match current_player {
             Player::P1 => TurnState::P1Turn { moves_left: moves_remaining },

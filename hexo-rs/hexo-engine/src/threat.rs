@@ -6,14 +6,12 @@
 //! other player's stones. A clean window with >= win_length-2 stones is a
 //! "win this turn" line (turns are two placements).
 
-use std::collections::HashMap;
-
-use crate::types::{Coord, Player, WIN_AXES};
+use crate::types::{Coord, Player, StoneMap, WIN_AXES};
 
 /// Returns [own_max_line, opp_max_line, own_threat_axes, opp_threat_axes],
 /// normalised by win_length (lines) and 3 (axes). "Own" = `to_move`.
 pub fn node_threat_features(
-    stones: &HashMap<Coord, Player>,
+    stones: &StoneMap,
     coord: Coord,
     to_move: Player,
     win_length: u8,
@@ -69,9 +67,8 @@ pub fn node_threat_features(
 mod tests {
     use super::*;
     use crate::types::Player;
-    use std::collections::HashMap;
 
-    fn stones(items: &[((i32, i32), Player)]) -> HashMap<Coord, Player> {
+    fn stones(items: &[((i32, i32), Player)]) -> StoneMap {
         items.iter().copied().collect()
     }
 

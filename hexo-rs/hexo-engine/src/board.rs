@@ -1,12 +1,11 @@
-use std::collections::HashMap;
 use std::fmt;
 
-use crate::types::{Coord, Player};
+use crate::types::{Coord, Player, StoneMap};
 
 /// Sparse board storage: maps placed coordinates to their owning player.
 #[derive(Clone)]
 pub struct Board {
-    stones: HashMap<Coord, Player>,
+    stones: StoneMap,
 }
 
 /// Error returned when attempting to place a stone on an occupied cell.
@@ -28,7 +27,7 @@ impl std::error::Error for PlaceError {}
 impl Board {
     /// Creates a new board with P1's opening stone at the origin (0, 0).
     pub fn new() -> Self {
-        let mut stones = HashMap::new();
+        let mut stones = StoneMap::default();
         stones.insert((0, 0), Player::P1);
         Board { stones }
     }
@@ -50,7 +49,7 @@ impl Board {
     }
 
     /// Returns a reference to the underlying stone map.
-    pub fn stones(&self) -> &HashMap<Coord, Player> {
+    pub fn stones(&self) -> &StoneMap {
         &self.stones
     }
 
