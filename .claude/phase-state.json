@@ -30,12 +30,12 @@
     }
   ],
   "current_phase_id": 1,
-  "current_state": "phase_breakdown",
+  "current_state": "human_phase_gate",
   "adversarial_review": {
     "active": false,
-    "context": null,
-    "current_round": 0
+    "context": "code",
+    "current_round": 4
   },
   "notes": "",
-  "updated_at": "2026-07-14T09:51:34+01:00"
+  "updated_at": "2026-07-14T12:07:14+01:00"
 }

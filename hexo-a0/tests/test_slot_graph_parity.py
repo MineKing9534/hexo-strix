@@ -148,7 +148,8 @@ def test_slot_graph_matches_rust(seed, nmoves, flags):
     )
     out = sg.build_slot_graph(
         g.placed_stones(), g.legal_moves(), g.current_player(),
-        g.moves_remaining_this_turn(), g.config().win_length, **flags,
+        g.moves_remaining_this_turn(), g.config().win_length,
+        with_edge_set=True, **flags,
     )
 
     # 1. Node count + masks + coords.

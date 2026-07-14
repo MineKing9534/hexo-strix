@@ -307,18 +307,21 @@ def build_node_features(
         feats[:n_real, layout["moves"]] = moves_feat
 
     # --- centroid / spread over stones; norm_q/norm_r on all real nodes ---
+    # Computed in f64 like the Rust builder (which only casts the final
+    # normalised value to f32) so non-representable centroids (e.g. 1/3)
+    # don't diverge in the last ulps.
     if node_coords:
         if n_stones > 0:
-            sc = coords[:n_stones].float()
+            sc = coords[:n_stones].double()
             cq = sc[:, 0].mean()
             cr = sc[:, 1].mean()
             dev = torch.maximum((sc[:, 0] - cq).abs(), (sc[:, 1] - cr).abs())
             spread = torch.clamp(dev.max(), min=1.0)
         else:
-            cq = cr = torch.tensor(0.0, device=device)
-            spread = torch.tensor(1.0, device=device)
-        feats[:n_real, layout["norm_q"]] = (coords[:, 0].float() - cq) / spread
-        feats[:n_real, layout["norm_r"]] = (coords[:, 1].float() - cr) / spread
+            cq = cr = torch.tensor(0.0, dtype=torch.float64, device=device)
+            spread = torch.tensor(1.0, dtype=torch.float64, device=device)
+        feats[:n_real, layout["norm_q"]] = ((coords[:, 0].double() - cq) / spread).float()
+        feats[:n_real, layout["norm_r"]] = ((coords[:, 1].double() - cr) / spread).float()
 
     # --- inv_dist on legal nodes: 1 / max(min hex-dist to any stone, 1) ---
     if n_stones > 0 and legal_idx.numel() > 0:
@@ -329,6 +332,11 @@ def build_node_features(
         hexd = torch.maximum(torch.maximum(dq.abs(), dr.abs()), (dq + dr).abs())
         min_d = hexd.min(dim=1).values.clamp(min=1.0)
         feats[legal_idx, layout["inv_dist"]] = 1.0 / min_d
+    elif legal_idx.numel() > 0:
+        # No stones: Rust's min-dist fold is `.min().unwrap_or(1)` → every
+        # legal node gets inv_dist = 1.0 (unreachable from a real GameState —
+        # the engine seeds (0,0) — but the port must match exactly).
+        feats[legal_idx, layout["inv_dist"]] = 1.0
     # stones keep inv_dist = 0.
 
     # --- dummy node: moves_feat (+ to_move in absolute mode); threat stays 0 ---
@@ -367,6 +375,7 @@ def build_slot_graph(
     moves_scope: str = "node",
     compact_stone_onehot: bool = False,
     device: torch.device | str = "cpu",
+    with_edge_set: bool = False,
 ) -> dict:
     """Build the slot-table axis-window graph from the same ingredients the Rust
     builder reads from a GameState.
@@ -377,9 +386,16 @@ def build_slot_graph(
 
     Returns a dict with: ``features`` [N+1, fdim], ``partner`` / ``filled``
     [N,3,2,W], ``coords`` [N+1, 2], ``stone_mask`` / ``legal_mask`` [N+1],
-    ``num_nodes``, and ``edge_set`` (directed axis edges as coord tuples).
+    ``kinds`` [N] int8 (real nodes; 0=P1, 1=P2, 2=empty), ``num_nodes``, and —
+    only when ``with_edge_set`` (a parity-test decode that costs a host sync +
+    Python set build) — ``edge_set`` (directed axis edges as coord tuples).
     """
     device = torch.device(device)
+
+    # Terminal states are outside the contract (no side to move — features
+    # like to_move/threat are undefined); match game_to_axis_graph's raise.
+    if current_player is None:
+        raise ValueError("build_slot_graph: game is terminal (no current player)")
 
     # Node identity order: stones sorted by (q, r), then legal sorted by (q, r).
     stones_sorted = sorted(stones, key=lambda s: s[0])
@@ -391,6 +407,10 @@ def build_slot_graph(
     n_real = len(all_qr)
 
     coords_real = torch.tensor(all_qr, dtype=torch.int32, device=device).reshape(-1, 2)
+    if n_real and int(coords_real.abs().max()) > 32000:
+        # §1 of the plan: coords leaving [-32000, 32000] are an assertion
+        # failure (HexKey packs q,r into 16-bit fields), not a real case.
+        raise ValueError("build_slot_graph: coordinate outside the packable ±32000 range")
     kinds = torch.tensor(
         [_kind_of(p) for _, p in stones_sorted] + [KIND_EMPTY] * len(legal_sorted),
         dtype=torch.int8, device=device,
@@ -418,15 +438,16 @@ def build_slot_graph(
     legal_mask = torch.zeros(n_real + 1, dtype=torch.bool, device=device)
     legal_mask[n_stones:n_real] = True
 
-    edge_set = slots_to_edge_set(coords_real, partner, filled)
-
-    return dict(
+    out = dict(
         features=feats,
         partner=partner,
         filled=filled,
         coords=coords,
         stone_mask=stone_mask,
         legal_mask=legal_mask,
+        kinds=kinds,
         num_nodes=n_real + 1,
-        edge_set=edge_set,
     )
+    if with_edge_set:
+        out["edge_set"] = slots_to_edge_set(coords_real, partner, filled)
+    return out
