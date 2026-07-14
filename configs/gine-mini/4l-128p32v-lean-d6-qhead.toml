@@ -38,7 +38,7 @@ checkpoint_lag = 30
 champion_threshold = 0.55
 sprt_s0 = 0.50
 sprt_s1 = 0.525
-sprt_alpha = 0.01
+sprt_alpha = 0.05
 sprt_beta = 0.05
 sprt_alpha_stage = 0.0
 sprt_beta_stage = 0.0
@@ -60,7 +60,7 @@ sprt_prev_ckpt_band_low = 0.40
 sprt_prev_ckpt_band_high = 0.60
 sprt_promo_velocity_factor = 3.0
 sprt_promo_velocity_min_intervals = 3
-sprt_eval_workers = 4
+sprt_eval_workers = 8
 
 [model]
 # Backbone
@@ -115,12 +115,12 @@ forcing_node_budget = 25000
 batch_size = 512
 edge_budget = 250_000
 grad_accumulation = true
-lr = 2e-04
+lr = 1e-5
 weight_decay = 0.0001
 max_grad_norm = 1.0
-lr_schedule = "cosine"
+lr_schedule = "constant"
 lr_min = 2e-05
-lr_warmup_steps = 1000
+lr_warmup_steps = 0
 total_train_steps = 12000
 step_delay = 0.0
 target_reuse = 8.0
@@ -131,7 +131,7 @@ pc_loss_weight = 0.0
 horizon_loss_weight = 0.25  # weight on the short-horizon value heads' aggregate CE
 q_loss_weight = 0.5         # *** ABLATION: weight on the train-only per-move Q head's masked MSE ***
 augment_symmetries = false  # redundant: the model is exactly D6-invariant
-buffer_capacity = 2_000_000
+buffer_capacity = 150_000  # roughly an hour and a half of recent history
 reanalyze_fraction = 0
 reanalyze_sims = 24
 reanalyze_m_actions = 8
@@ -261,11 +261,8 @@ training_lr_min = 5e-6
 name = "S3: 6-in-a-row, radius 6"
 run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s3-6-6"
 game_placement_radius = 6
-training_lr = 1e-4
-training_lr_min = 5e-6
+training_lr = 1e-5
 
 [[curriculum.stages]]
 name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
 run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s4-6-8"
-training_lr = 1e-4
-training_lr_min = 5e-6

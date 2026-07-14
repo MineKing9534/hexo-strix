@@ -2533,6 +2533,74 @@ class TestFileWatcherSeekBehavior:
 
 
 # ---------------------------------------------------------------------------
+# Rust self-play producer supervision
+# ---------------------------------------------------------------------------
+
+class TestSelfPlayProducerRecovery:
+    def test_restart_backoff_is_capped_and_resets_after_healthy_run(self):
+        from hexo_a0.trainer import _next_self_play_restart_backoff
+
+        assert _next_self_play_restart_backoff(0.0, uptime=10.0) == 5.0
+        assert _next_self_play_restart_backoff(5.0, uptime=10.0) == 10.0
+        assert _next_self_play_restart_backoff(40.0, uptime=10.0) == 60.0
+        assert _next_self_play_restart_backoff(60.0, uptime=10.0) == 60.0
+        assert _next_self_play_restart_backoff(60.0, uptime=121.0) == 5.0
+
+    def test_local_launch_preserves_stderr_log_routing(self, tmp_path):
+        from unittest.mock import patch
+        from hexo_a0.trainer import Trainer
+        import hexo_a0.trainer as trainer_mod
+
+        trainer = object.__new__(Trainer)
+        fake_process = object()
+        log_path = tmp_path / "self_play.log"
+        with patch.object(trainer_mod.subprocess, "Popen", return_value=fake_process) as popen:
+            trainer._launch_rust_self_play_process(
+                ["self_play", "--continuous"],
+                {"PATH": "/bin"},
+                actor_host=False,
+                log_path=log_path,
+                append=False,
+            )
+
+        kwargs = popen.call_args.kwargs
+        assert kwargs["stdout"] is trainer_mod.subprocess.DEVNULL
+        assert kwargs["stderr"] is trainer._sp_stderr_file
+        assert trainer._sp_process is fake_process
+        assert not trainer._sp_stderr_file.closed
+        trainer._sp_stderr_file.close()
+
+    def test_fresh_ingest_unblocks_training_and_resets_backoff(self):
+        import threading
+        from hexo_a0.trainer import Trainer
+
+        trainer = object.__new__(Trainer)
+        trainer._sp_recovering = threading.Event()
+        trainer._sp_recovering.set()
+        trainer._sp_restart_backoff_s = 40.0
+
+        trainer._confirm_self_play_recovery(n_examples=120, n_games=2)
+
+        assert not trainer._sp_recovering.is_set()
+        assert trainer._sp_restart_backoff_s == 0.0
+
+    def test_worker_restarts_local_process_and_marks_recovery(self):
+        import inspect
+        from hexo_a0 import trainer
+
+        src = inspect.getsource(trainer.Trainer._rust_self_play_worker_inner)
+        assert "self._sp_recovering.set()" in src
+        assert "else \"local\"" in src
+        assert "self._launch_rust_self_play_process(" in src
+        assert "self._confirm_self_play_recovery" in src
+
+        supervisor_src = inspect.getsource(trainer.Trainer._rust_self_play_worker)
+        assert "while not self._sp_stop.is_set()" in supervisor_src
+        assert "self._sp_recovering.set()" in supervisor_src
+        assert "full restart" in supervisor_src
+
+
+# ---------------------------------------------------------------------------
 # Champion mode (eval-vs-champion, export, model update suppression)
 # ---------------------------------------------------------------------------
 

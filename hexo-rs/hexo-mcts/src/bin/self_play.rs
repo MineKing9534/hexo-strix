@@ -37,7 +37,10 @@ use hexo_rs::graph::game_to_graph_raw_opts;
 use hexo_rs::graph_tensors::{GraphTensors, GraphType};
 #[cfg(feature = "torch")]
 use hexo_rs::inference::TorchModel;
-use hexo_rs::inference_subprocess::SubprocessModel;
+use hexo_rs::inference_subprocess::{
+    BUILDER_FLAG_PRUNE, BUILDER_FLAG_RELATIVE, BUILDER_FLAG_THREAT, StateSnapshot,
+    StatesWireConfig, SubprocessModel,
+};
 use hexo_rs::mcts::MCTSConfig;
 use hexo_rs::mcts::acting::exploration_weights;
 
@@ -139,39 +142,206 @@ fn play_perf_flush() {
 /// Result payload returned to a game thread: per-state (logit maps, values).
 type EvalResult = (Vec<HashMap<Coord, f64>>, Vec<f64>);
 
-/// A request from a game thread to the inference server.
+/// A request from a game thread to the inference server. Carries graphs OR
+/// state snapshots, never both: in graph mode (default) `snapshots` is empty;
+/// with `--wire-states` `graphs` is empty. Parallel-Vec representation keeps
+/// the GraphTensors hot path structurally identical (`Vec::new()` never
+/// allocates, and every graph-mode expression sees the same values as before).
 struct EvalRequest {
     /// Pre-built graph tensors (game threads build these on CPU).
     graphs: Vec<GraphTensors>,
+    /// Board-state snapshots for the MSG_FORWARD_STATES wire (`--wire-states`).
+    snapshots: Vec<StateSnapshot>,
     /// Channel to send results back to the requesting thread.
     response_tx: mpsc::Sender<EvalResult>,
 }
 
-/// A batch of graphs flattened from several [`EvalRequest`]s, retaining each
+/// Number of positions (graphs or snapshots) in a request.
+fn req_item_count(req: &EvalRequest) -> usize {
+    req.graphs.len() + req.snapshots.len()
+}
+
+/// Edge total of a request for edge-budget batching: exact `num_edges` for
+/// graphs, the prune-aware estimate for snapshots (nodes ≈ stones+legal+1,
+/// edges ≈ nodes × (6 prune / 24 not) × 1.25).
+fn req_edge_total(req: &EvalRequest) -> usize {
+    req.graphs.iter().map(|g| g.num_edges).sum::<usize>()
+        + req.snapshots.iter().map(|s| s.edge_estimate).sum::<usize>()
+}
+
+/// A batch of positions flattened from several [`EvalRequest`]s, retaining each
 /// requester's response channel and its `[start, end)` slice of the flattened
 /// results so the compute stage can scatter outputs back to the right thread.
 struct AssembledBatch {
     graphs: Vec<GraphTensors>,
+    snapshots: Vec<StateSnapshot>,
     slices: Vec<(mpsc::Sender<EvalResult>, usize, usize)>,
 }
 
-/// Flatten drained `requests` into one graph batch plus per-request response
-/// slices. Consumes each request's graph vector.
+/// Flatten drained `requests` into one batch plus per-request response
+/// slices. Consumes each request's graph/snapshot vectors. A run is
+/// payload-homogeneous (all-graphs or all-snapshots), so exactly one of the
+/// flattened vectors is non-empty.
 fn assemble_batch(requests: Vec<EvalRequest>) -> AssembledBatch {
-    let total: usize = requests.iter().map(|r| r.graphs.len()).sum();
-    let mut graphs = Vec::with_capacity(total);
+    let total_graphs: usize = requests.iter().map(|r| r.graphs.len()).sum();
+    let total_snaps: usize = requests.iter().map(|r| r.snapshots.len()).sum();
+    let mut graphs = Vec::with_capacity(total_graphs);
+    let mut snapshots = Vec::with_capacity(total_snaps);
     let mut slices = Vec::with_capacity(requests.len());
     for mut req in requests {
-        let start = graphs.len();
+        debug_assert!(
+            req.graphs.is_empty() || req.snapshots.is_empty(),
+            "an EvalRequest must carry graphs OR snapshots, never both"
+        );
+        let start = graphs.len() + snapshots.len();
         graphs.append(&mut req.graphs);
-        slices.push((req.response_tx, start, graphs.len()));
+        snapshots.append(&mut req.snapshots);
+        slices.push((req.response_tx, start, graphs.len() + snapshots.len()));
     }
-    AssembledBatch { graphs, slices }
+    AssembledBatch { graphs, snapshots, slices }
 }
 
-/// Scatter forward-pass results back to each requester. `None` (a forward
-/// error) sends empty logits + zero values sized to each request's slice so
-/// game threads unblock instead of hanging.
+/// Abort self-play loudly because an inference server died or errored.
+/// `component` names what failed (e.g. "pool inference subprocess"). Never
+/// downgrade a mid-run inference failure to empty logits: the historical
+/// empty-logits unblock let MCTS keep searching on uniform-garbage priors
+/// and self-play silently emitted poisoned trajectories.
+fn inference_fatal(component: &str, err: &str) -> ! {
+    eprintln!("FATAL: {component} inference failure: {err}");
+    eprintln!(
+        "FATAL: aborting self-play (inference-server failures are never \
+         downgraded to empty logits)."
+    );
+    std::process::exit(1);
+}
+
+/// Abort self-play loudly for a MID-RUN states-mode (`--wire-states`) failure:
+/// an in-band server ERROR, legal-order hash mismatch, or wire failure while
+/// `running` is set. Same classifier as graph mode ([`classify_forward_failure`]):
+/// only a mid-run failure is fatal; a forward that fails because a Ctrl-C
+/// killed the child mid-flush during orderly shutdown unblocks waiters with
+/// empty results instead (the game threads discard their partial games), so a
+/// clean stop no longer exits 1.
+fn wire_states_fatal(component: &str, err: &str) -> ! {
+    // Pass `component` straight through to `inference_fatal` (no prefix-wrap):
+    // the caller already knows which subprocess failed, and double-labeling
+    // (component in the message body AND a generic "--wire-states" component)
+    // made the FATAL line read "--wire-states inference failure: pool ...: ...".
+    inference_fatal(component, err)
+}
+
+/// Validate `--radius` for `--wire-states` at startup.
+///
+/// The states wire carries `placement_radius` as a u8, but the server rebuilds
+/// each request via `hexo_rs.GameConfig`, whose own placement_radius bound is
+/// `1..=64` — a larger radius would parse into the u8 field fine and then be
+/// rejected server-side on the FIRST request, aborting a run that already
+/// started. Reject it here instead, with a message naming the server bound.
+fn validate_wire_states_radius(radius: i32) -> Result<u8, String> {
+    if (1..=64).contains(&radius) {
+        Ok(radius as u8)
+    } else {
+        Err(format!(
+            "--wire-states requires --radius in 1..=64 (the server rebuilds states \
+             via hexo_rs.GameConfig, whose placement_radius bound is 1..=64; radius 0 \
+             has no legal region), got {radius}"
+        ))
+    }
+}
+
+/// What a subprocess batcher must do when a graph-mode forward pass fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardFailureAction {
+    /// `running` was still set: the inference server died (or its wire broke)
+    /// mid-run. Abort self-play loudly via [`inference_fatal`].
+    Fatal,
+    /// `running` was already cleared: orderly shutdown. Ctrl-C delivers
+    /// SIGINT to the whole foreground process group, so the Python child
+    /// routinely dies mid-forward on shutdown; that failure is an artifact
+    /// of stopping, not a server crash. Unblock waiters with empty results —
+    /// each game thread re-checks `running` at its next move boundary and
+    /// discards the partial game (`play_one_game` returns `None`), so the
+    /// empty results never reach output.
+    ShutdownUnblock,
+}
+
+/// Decide between the two [`ForwardFailureAction`]s from the `running` flag,
+/// sampled AFTER the forward failed (a Ctrl-C arriving before the failure is
+/// observed either way; one arriving after is a genuine mid-run death that
+/// happens to race shutdown — both classifications are safe there because
+/// exit-with-error during shutdown and empty-unblock differ only in noise).
+fn classify_forward_failure(running_flag: bool) -> ForwardFailureAction {
+    if running_flag {
+        ForwardFailureAction::Fatal
+    } else {
+        ForwardFailureAction::ShutdownUnblock
+    }
+}
+
+/// Forward one assembled batch through the subprocess model and scatter the
+/// results back to the requesters. Shared by the serial batcher, the
+/// double-buffered compute stage, and the pool batcher.
+///
+/// Dispatch is on `states_cfg` (the run-level payload mode), NOT on
+/// `batch.snapshots.is_empty()` — the wire mode is fixed for the run, and a
+/// snapshot batch that happened to be empty must never silently fall into the
+/// graph path. Error policy is now identical for both modes: fatal mid-run
+/// (server died / wire broke / in-band ERROR / hash mismatch), empty-results
+/// unblock ONLY during orderly shutdown, when a Ctrl-C-killed child dying
+/// mid-forward is a stopping artifact and every game thread re-checks `running`
+/// and discards its partial game (see [`classify_forward_failure`]).
+fn forward_batch_and_scatter(
+    model: &mut SubprocessModel,
+    batch: AssembledBatch,
+    states_cfg: Option<&StatesWireConfig>,
+    running: &AtomicBool,
+    component: &str,
+) {
+    // RU2-W1: an all-empty batch (zero graphs AND zero snapshots) must never
+    // hit the wire. A zero-graph MSG_FORWARD_STATES is the capability PROBE, so
+    // forwarding one here would draw a PROBE_ACK and spuriously abort the run
+    // via the fatal classifier; a zero-graph MSG_FORWARD is equally degenerate.
+    // Scatter empty results to each requester's (start==end) slice and return.
+    if batch.graphs.is_empty() && batch.snapshots.is_empty() {
+        scatter_results(batch.slices, Some((Vec::new(), Vec::new())));
+        return;
+    }
+    match states_cfg {
+        None => match model.forward_graphs(batch.graphs) {
+            Ok(r) => scatter_results(batch.slices, Some(r)),
+            Err(e) => match classify_forward_failure(running.load(Ordering::Relaxed)) {
+                ForwardFailureAction::Fatal => inference_fatal(component, &e),
+                ForwardFailureAction::ShutdownUnblock => {
+                    eprintln!(
+                        "{component}: forward failed during shutdown ({e}); \
+                         unblocking waiting game threads with empty results \
+                         (their partial games are discarded)."
+                    );
+                    scatter_results(batch.slices, None);
+                }
+            },
+        },
+        Some(cfg) => match model.forward_states(&batch.snapshots, cfg) {
+            Ok(r) => scatter_results(batch.slices, Some(r)),
+            Err(e) => match classify_forward_failure(running.load(Ordering::Relaxed)) {
+                ForwardFailureAction::Fatal => wire_states_fatal(component, &e),
+                ForwardFailureAction::ShutdownUnblock => {
+                    eprintln!(
+                        "{component}: states forward failed during shutdown ({e}); \
+                         unblocking waiting game threads with empty results \
+                         (their partial games are discarded)."
+                    );
+                    scatter_results(batch.slices, None);
+                }
+            },
+        },
+    }
+}
+
+/// Scatter forward-pass results back to each requester. `None` sends empty
+/// logits + zero values sized to each request's slice so game threads
+/// unblock instead of hanging — shutdown-only semantics: mid-run forward
+/// failures never reach the `None` arm (see [`classify_forward_failure`]).
 fn scatter_results(slices: Vec<(mpsc::Sender<EvalResult>, usize, usize)>, result: Option<EvalResult>) {
     match result {
         Some((all_logits, all_values)) => {
@@ -240,7 +410,21 @@ impl InferenceClient {
         let (response_tx, response_rx) = mpsc::channel();
         let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.request_txs.len();
         self.request_txs[idx]
-            .send(EvalRequest { graphs, response_tx })
+            .send(EvalRequest { graphs, snapshots: Vec::new(), response_tx })
+            .expect("inference server gone");
+        response_rx.recv().expect("inference server dropped response")
+    }
+
+    /// Submit board-state snapshots for evaluation (`--wire-states`) and
+    /// block until results arrive. Same routing as [`evaluate`](Self::evaluate).
+    fn evaluate_states(
+        &self,
+        snapshots: Vec<StateSnapshot>,
+    ) -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+        let (response_tx, response_rx) = mpsc::channel();
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.request_txs.len();
+        self.request_txs[idx]
+            .send(EvalRequest { graphs: Vec::new(), snapshots, response_tx })
             .expect("inference server gone");
         response_rx.recv().expect("inference server dropped response")
     }
@@ -289,8 +473,23 @@ static MAX_BATCH_EDGES: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether the batcher should keep accumulating: below the graph cap AND — when
 /// an edge budget is set — below it too. `total_edges` is summed by each loop.
+/// Reads the process-wide [`MAX_BATCH_EDGES`] budget and delegates to the pure
+/// [`batch_wants_more_with_cap`] (which is directly unit-testable).
 fn batch_wants_more(total_graphs: usize, total_edges: usize, max_batch: usize) -> bool {
     let edge_cap = MAX_BATCH_EDGES.load(Ordering::Relaxed);
+    batch_wants_more_with_cap(total_graphs, total_edges, max_batch, edge_cap)
+}
+
+/// Pure batching predicate: keep accumulating while below the graph cap and —
+/// when `edge_cap > 0` — below the edge budget. `edge_cap == 0` disables the
+/// edge budget (graph cap only). Split from [`batch_wants_more`] so the logic
+/// is testable without touching the [`MAX_BATCH_EDGES`] global.
+fn batch_wants_more_with_cap(
+    total_graphs: usize,
+    total_edges: usize,
+    max_batch: usize,
+    edge_cap: usize,
+) -> bool {
     total_graphs < max_batch && (edge_cap == 0 || total_edges < edge_cap)
 }
 
@@ -419,6 +618,11 @@ fn inference_server(
 
 /// Run the inference server loop using a Python subprocess model.
 /// Same batching logic as `inference_server` but uses `SubprocessModel`.
+/// `states_cfg` is `Some` only under `--wire-states`; snapshot batches are
+/// forwarded via MSG_FORWARD_STATES and any states-mode failure is fatal.
+/// Graph-mode forward failures are fatal mid-run too — only during orderly
+/// shutdown do they downgrade to the empty-results unblock (see
+/// [`forward_batch_and_scatter`]).
 fn inference_server_subprocess(
     request_rx: ReqReceiver<EvalRequest>,
     model: &mut SubprocessModel,
@@ -426,6 +630,7 @@ fn inference_server_subprocess(
     batch_timeout: Duration,
     running: &AtomicBool,
     model_path: Option<&str>,
+    states_cfg: Option<StatesWireConfig>,
 ) {
     loop {
         // Block on first request (or check shutdown)
@@ -446,8 +651,8 @@ fn inference_server_subprocess(
 
         // Collect more requests up to max_batch or timeout
         let mut requests = vec![first];
-        let mut total_graphs: usize = requests[0].graphs.len();
-        let mut total_edges: usize = requests[0].graphs.iter().map(|g| g.num_edges).sum();
+        let mut total_graphs: usize = req_item_count(&requests[0]);
+        let mut total_edges: usize = req_edge_total(&requests[0]);
         let deadline = Instant::now() + batch_timeout;
 
         while batch_wants_more(total_graphs, total_edges, max_batch) {
@@ -457,8 +662,8 @@ fn inference_server_subprocess(
             }
             match request_rx.recv_timeout(remaining) {
                 Ok(req) => {
-                    total_graphs += req.graphs.len();
-                    total_edges += req.graphs.iter().map(|g| g.num_edges).sum::<usize>();
+                    total_graphs += req_item_count(&req);
+                    total_edges += req_edge_total(&req);
                     requests.push(req);
                 }
                 Err(_) => break,
@@ -467,14 +672,9 @@ fn inference_server_subprocess(
 
         // Flatten, run a single forward pass via subprocess, scatter results.
         let batch = assemble_batch(requests);
-        let result = match model.forward_graphs(batch.graphs) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                eprintln!("Subprocess forward error: {e}");
-                None
-            }
-        };
-        scatter_results(batch.slices, result);
+        forward_batch_and_scatter(
+            model, batch, states_cfg.as_ref(), running, "inference subprocess",
+        );
 
         // Check for model reload after processing a batch
         if let Some(path) = model_path {
@@ -508,8 +708,8 @@ fn gather_stage(
         };
 
         let mut requests = vec![first];
-        let mut total_graphs: usize = requests[0].graphs.len();
-        let mut total_edges: usize = requests[0].graphs.iter().map(|g| g.num_edges).sum();
+        let mut total_graphs: usize = req_item_count(&requests[0]);
+        let mut total_edges: usize = req_edge_total(&requests[0]);
         let deadline = Instant::now() + batch_timeout;
         while batch_wants_more(total_graphs, total_edges, max_batch) {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -518,8 +718,8 @@ fn gather_stage(
             }
             match request_rx.recv_timeout(remaining) {
                 Ok(req) => {
-                    total_graphs += req.graphs.len();
-                    total_edges += req.graphs.iter().map(|g| g.num_edges).sum::<usize>();
+                    total_graphs += req_item_count(&req);
+                    total_edges += req_edge_total(&req);
                     requests.push(req);
                 }
                 Err(_) => break,
@@ -549,6 +749,7 @@ fn inference_server_subprocess_double_buffered(
     batch_timeout: Duration,
     running: &AtomicBool,
     model_path: Option<&str>,
+    states_cfg: Option<StatesWireConfig>,
 ) {
     // One-deep handoff: the gather thread can stage exactly one batch ahead.
     let (assembled_tx, assembled_rx) = mpsc::sync_channel::<AssembledBatch>(1);
@@ -576,14 +777,13 @@ fn inference_server_subprocess_double_buffered(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
 
-            let result = match model.forward_graphs(batch.graphs) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    eprintln!("Subprocess forward error: {e}");
-                    None
-                }
-            };
-            scatter_results(batch.slices, result);
+            forward_batch_and_scatter(
+                model,
+                batch,
+                states_cfg.as_ref(),
+                running,
+                "inference subprocess (double-buffered)",
+            );
 
             if let Some(path) = model_path {
                 model.try_reload(path);
@@ -604,6 +804,7 @@ fn pool_inference_server_subprocess(
     python_bin: &str,
     inference_bin: Option<&Path>,
     model_args: &[String],
+    states_cfg: Option<StatesWireConfig>,
 ) {
     // Wait for the first checkpoint path from the loader.
     let first_path = match pool_path_rx.recv() {
@@ -614,10 +815,25 @@ fn pool_inference_server_subprocess(
     let mut model = match SubprocessModel::spawn_labeled(python_bin, inference_bin, &first_path, model_args, "python pool") {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("Pool subprocess failed to spawn: {e}");
+            // Previously eprintln + silent thread exit: pool-side game
+            // threads would only discover the dead batcher minutes later
+            // via a confusing "inference server gone" panic. Mid-run this
+            // is a dead inference server — abort loudly.
+            if running.load(Ordering::Relaxed) {
+                inference_fatal("pool inference subprocess", &format!("failed to spawn: {e}"));
+            }
+            eprintln!("Pool subprocess spawn failed during shutdown (ignored): {e}");
             return;
         }
     };
+
+    // Under --wire-states the pool server serves snapshot requests too:
+    // require the capability ACK up front, exactly like the main workers.
+    if let Some(cfg) = states_cfg.as_ref() {
+        if let Err(e) = model.probe_states(cfg) {
+            wire_states_fatal("pool inference subprocess", &e);
+        }
+    }
 
     loop {
         // Swap to any newly-staged checkpoint path before blocking on requests.
@@ -637,8 +853,8 @@ fn pool_inference_server_subprocess(
         };
 
         let mut requests = vec![first];
-        let mut total_graphs: usize = requests[0].graphs.len();
-        let mut total_edges: usize = requests[0].graphs.iter().map(|g| g.num_edges).sum();
+        let mut total_graphs: usize = req_item_count(&requests[0]);
+        let mut total_edges: usize = req_edge_total(&requests[0]);
         let deadline = Instant::now() + batch_timeout;
 
         while batch_wants_more(total_graphs, total_edges, max_batch) {
@@ -646,41 +862,18 @@ fn pool_inference_server_subprocess(
             if remaining.is_zero() { break; }
             match request_rx.recv_timeout(remaining) {
                 Ok(req) => {
-                    total_graphs += req.graphs.len();
-                    total_edges += req.graphs.iter().map(|g| g.num_edges).sum::<usize>();
+                    total_graphs += req_item_count(&req);
+                    total_edges += req_edge_total(&req);
                     requests.push(req);
                 }
                 Err(_) => break,
             }
         }
 
-        let mut all_graphs = Vec::with_capacity(total_graphs);
-        let mut slice_ranges: Vec<(usize, usize)> = Vec::with_capacity(requests.len());
-        for req in &mut requests {
-            let start = all_graphs.len();
-            all_graphs.extend(req.graphs.drain(..));
-            slice_ranges.push((start, all_graphs.len()));
-        }
-
-        match model.forward_graphs(all_graphs) {
-            Ok((all_logits, all_values)) => {
-                for (i, req) in requests.into_iter().enumerate() {
-                    let (start, end) = slice_ranges[i];
-                    let logits = all_logits[start..end].to_vec();
-                    let values = all_values[start..end].to_vec();
-                    let _ = req.response_tx.send((logits, values));
-                }
-            }
-            Err(e) => {
-                eprintln!("Pool subprocess forward error: {e}");
-                for req in requests {
-                    let n = req.graphs.len().max(1);
-                    let empty_logits: Vec<HashMap<Coord, f64>> =
-                        (0..n).map(|_| HashMap::default()).collect();
-                    let _ = req.response_tx.send((empty_logits, vec![0.0; n]));
-                }
-            }
-        }
+        let batch = assemble_batch(requests);
+        forward_batch_and_scatter(
+            &mut model, batch, states_cfg.as_ref(), running, "pool inference subprocess",
+        );
     }
 }
 
@@ -1466,6 +1659,7 @@ fn play_one_game(
     prune_empty_edges: bool,
     threat_features: bool,
     relative_stones: bool,
+    wire_states: bool,
     rng: &mut ChaCha8Rng,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
@@ -1494,10 +1688,17 @@ fn play_one_game(
             None => "?",
         };
 
-        // Build graph ONCE for this position — reuse for both output and root eval
+        // Build graph ONCE for this position — reuse for both output and root
+        // eval. With --wire-states no client-side graph is ever built; the
+        // eval closure snapshots board states instead.
         let t = if profile { Some(Instant::now()) } else { None };
-        let root_tensors =
-            build_position_graph(&game, graph_type, prune_empty_edges, threat_features, relative_stones);
+        let root_tensors = if wire_states {
+            None
+        } else {
+            Some(build_position_graph(
+                &game, graph_type, prune_empty_edges, threat_features, relative_stones,
+            ))
+        };
         let graph_build_ns = t.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
 
         // Choose which inference client services THIS root's MCTS search.
@@ -1508,29 +1709,42 @@ fn play_one_game(
             _ => client,
         };
 
-        // Eval closure: builds graphs on this thread, sends to inference server.
+        // Eval closure: builds graphs (or, with --wire-states, board-state
+        // snapshots) on this thread and sends them to the inference server.
         // Root eval reuses the pre-built graph; leaf evals build fresh.
-        let mut cached_root = Some(root_tensors);
+        // Snapshots capture legal_coords here so response mapping never
+        // rebuilds a graph anywhere.
+        let mut cached_root = root_tensors;
         let mut eval_wait_ns: u128 = 0;
         let mut eval_graph_build_ns: u128 = 0;
         let mut eval = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
             let eval_start = if profile { Some(Instant::now()) } else { None };
-            let graphs = if let Some(gt) = cached_root.take() {
-                debug_assert_eq!(states.len(), 1, "root eval should be single state");
-                vec![gt]
-            } else {
+            let result = if wire_states {
                 let gb = if profile { Some(Instant::now()) } else { None };
-                // Leaf evals: build graphs on this game thread (CPU work)
-                let gs: Vec<_> = states.iter().map(|s| {
-                    match graph_type {
-                        GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges, threat_features, relative_stones)),
-                        GraphType::Hex => GraphTensors::from(game_to_graph_raw_opts(s, threat_features, relative_stones)),
-                    }
-                }).collect();
+                let snaps: Vec<StateSnapshot> = states
+                    .iter()
+                    .map(|s| StateSnapshot::from_game(s, prune_empty_edges))
+                    .collect();
                 if let Some(i) = gb { eval_graph_build_ns += i.elapsed().as_nanos(); }
-                gs
+                active_client.evaluate_states(snaps)
+            } else {
+                let graphs = if let Some(gt) = cached_root.take() {
+                    debug_assert_eq!(states.len(), 1, "root eval should be single state");
+                    vec![gt]
+                } else {
+                    let gb = if profile { Some(Instant::now()) } else { None };
+                    // Leaf evals: build graphs on this game thread (CPU work)
+                    let gs: Vec<_> = states.iter().map(|s| {
+                        match graph_type {
+                            GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges, threat_features, relative_stones)),
+                            GraphType::Hex => GraphTensors::from(game_to_graph_raw_opts(s, threat_features, relative_stones)),
+                        }
+                    }).collect();
+                    if let Some(i) = gb { eval_graph_build_ns += i.elapsed().as_nanos(); }
+                    gs
+                };
+                active_client.evaluate(graphs)
             };
-            let result = active_client.evaluate(graphs);
             if let Some(i) = eval_start { eval_wait_ns += i.elapsed().as_nanos(); }
             result
         };
@@ -1825,6 +2039,28 @@ fn main() {
     let mut relative_stones = false;
     // Emit HX08 records (HX07 + per-move Q head data) instead of HX07.
     let mut emit_q = false;
+    // A3 state-payload wire (MSG_FORWARD_STATES): ship board states instead
+    // of graph tensors to the inference subprocess, which rebuilds/collates
+    // server-side. Default OFF — graph mode stays byte-identical.
+    //
+    // WITHOUT --slot-inference the server serves states via the LEGACY
+    // CPU-rebuild path (per-graph GameState.from_state + axis_states_to_batch
+    // → the same scriptable model as graph mode); this is transport-only and
+    // buys the wire-size win, not the on-device A2 slot forward. Add
+    // --slot-inference (below) for the A2 slot backend.
+    //
+    // ASSUMES A SCHEMA-HOMOGENEOUS CHAMPION POOL (RU2-W2): the wire's
+    // builder_flags/node_dim are fixed for the run, so a pooled checkpoint with
+    // a different schema fails the server's cross-check at reload and aborts
+    // self-play. --pool-fraction >0 emits a loud startup warning; graph mode
+    // guards mixed schemas via node_dim, states mode does not.
+    let mut wire_states = false;
+    // --slot-inference (plan-A3 task 5): serve MSG_FORWARD_STATES via the A2
+    // slot backend (on-device slot build + SlotHeXONet.forward_padded) instead
+    // of the legacy CPU rebuild. Requires --wire-states; emits
+    // `--slot-inference --win-length N` to the server so it converts the
+    // (legacy GINE) checkpoint to the slot model at startup.
+    let mut slot_inference = false;
 
     // Python subprocess inference flags
     let mut python_inference = false;
@@ -1945,6 +2181,8 @@ fn main() {
             "--threat-features" => { threat_features = true; i += 1; }
             "--relative-stones" => { relative_stones = true; i += 1; }
             "--emit-q" => { emit_q = true; i += 1; }
+            "--wire-states" => { wire_states = true; i += 1; }
+            "--slot-inference" => { slot_inference = true; i += 1; }
             "--shape-hist" => { #[allow(unused)] { shape_hist = true; } i += 1; }
             "--playout-cap-divisor" => {
                 playout_cap_divisor = args[i + 1].parse().unwrap();
@@ -2125,6 +2363,89 @@ fn main() {
         std::process::exit(1);
     }
 
+    // --wire-states validation + wire config (A3 state-payload protocol).
+    // The header fields come from the run config — the same config that
+    // produced the checkpoint the server loads, so the server-side
+    // cross-check (checkpoint-derived flags are authoritative) agrees.
+    if slot_inference && !wire_states {
+        eprintln!(
+            "--slot-inference requires --wire-states: the slot backend serves the \
+             MSG_FORWARD_STATES wire; without --wire-states there is no states path."
+        );
+        std::process::exit(1);
+    }
+    let states_cfg: Option<StatesWireConfig> = if wire_states {
+        if !python_inference {
+            eprintln!(
+                "--wire-states requires --python-inference: the in-process torch \
+                 path consumes graph tensors directly (no wire)."
+            );
+            std::process::exit(1);
+        }
+        if inference_bin.is_some() {
+            eprintln!(
+                "--wire-states does not support --inference-bin yet: hexo-infer \
+                 has not implemented MSG_FORWARD_STATES. Drop --inference-bin or \
+                 --wire-states."
+            );
+            std::process::exit(1);
+        }
+        if graph_type != GraphType::Axis {
+            eprintln!(
+                "--wire-states requires --graph-type axis: the server-side state \
+                 rebuild is axis-only, got --graph-type {graph_type_str:?}"
+            );
+            std::process::exit(1);
+        }
+        let placement_radius = match validate_wire_states_radius(radius) {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        };
+        // RU2-W2 (Fix-lite): the states wire carries builder_flags/node_dim
+        // fixed for the run (from THIS config). A champion pool that swaps in a
+        // checkpoint with a DIFFERENT schema (prune/threat/relative/node_dim)
+        // would fail the server's builder-flag cross-check on reload and abort
+        // the run mid-flight. We can't cheaply detect it here, so warn loudly
+        // that --wire-states assumes a schema-homogeneous pool.
+        if pool_fraction > 0.0 {
+            eprintln!(
+                "WARNING: --wire-states + --pool-fraction {pool_fraction}: the states \
+                 wire assumes a SCHEMA-HOMOGENEOUS champion pool. A pooled checkpoint \
+                 whose schema (prune_empty_edges/threat/relative/node_dim) differs from \
+                 this run's would fail the server's builder-flag cross-check at reload \
+                 and abort self-play. Ensure every pooled checkpoint shares this run's \
+                 builder schema (graph mode guards mixed schemas via node_dim; states \
+                 mode does not)."
+            );
+        }
+        if slot_inference {
+            eprintln!(
+                "Wire-states mode: shipping board states (MSG_FORWARD_STATES); \
+                 server serves them via the A2 slot backend (--slot-inference)."
+            );
+        } else {
+            eprintln!(
+                "Wire-states mode: shipping board states (MSG_FORWARD_STATES) instead \
+                 of graph tensors; server rebuilds graphs via the LEGACY CPU path \
+                 (add --slot-inference for the on-device A2 slot forward)."
+            );
+        }
+        Some(StatesWireConfig {
+            win_length,
+            placement_radius,
+            max_moves,
+            builder_flags: (if prune_empty_edges { BUILDER_FLAG_PRUNE } else { 0 })
+                | (if threat_features { BUILDER_FLAG_THREAT } else { 0 })
+                | (if relative_stones { BUILDER_FLAG_RELATIVE } else { 0 }),
+            node_dim: node_dim(threat_features, relative_stones) as u8,
+        })
+    } else {
+        None
+    };
+
     PROFILE_PLAY_ENABLED.store(profile_play, Ordering::Relaxed);
 
     let explore_use_visit_counts = match exploration_distribution.as_str() {
@@ -2227,6 +2548,7 @@ fn main() {
                 padded_inference,
                 model_use_jk, &model_jk_mode,
                 threat_features, relative_stones,
+                slot_inference, win_length,
             );
             eprintln!("Spawning Python inference subprocess...");
             if inference_double_buffer {
@@ -2234,6 +2556,16 @@ fn main() {
             }
             let mut model = SubprocessModel::spawn(&python_bin, inference_bin.as_deref(), ckpt, &model_args)
                 .unwrap_or_else(|e| { eprintln!("Failed to spawn Python: {e}"); std::process::exit(1); });
+
+            // --wire-states capability probe: require the dedicated
+            // PROBE_ACK before any traffic (catches servers predating
+            // MSG_FORWARD_STATES with a clear message).
+            if let Some(cfg) = states_cfg.as_ref() {
+                if let Err(e) = model.probe_states(cfg) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
 
             std::thread::scope(|s| {
                 let running_ref = &running;
@@ -2243,12 +2575,12 @@ fn main() {
                     if double_buffer {
                         inference_server_subprocess_double_buffered(
                             request_rx, model_ref, max_batch, batch_timeout,
-                            running_ref, None,
+                            running_ref, None, states_cfg,
                         );
                     } else {
                         inference_server_subprocess(
                             request_rx, model_ref, max_batch, batch_timeout,
-                            running_ref, None,
+                            running_ref, None, states_cfg,
                         );
                     }
                 });
@@ -2256,7 +2588,7 @@ fn main() {
                 let (results, measured) = run_batch_games_with_warmup(
                     s, client, warmup_games, n_games, n_threads, seed, game_config, &mcts_config,
                     &exploration_atomic, graph_type, prune_empty_edges, threat_features,
-                    relative_stones,
+                    relative_stones, wire_states,
                     playout_cap_fraction, playout_cap_divisor,
                     &running,
                 );
@@ -2298,7 +2630,7 @@ fn main() {
                     let (results, measured) = run_batch_games_with_warmup(
                         s, client, warmup_games, n_games, n_threads, seed, game_config, &mcts_config,
                         &exploration_atomic, graph_type, prune_empty_edges, threat_features,
-                        relative_stones,
+                        relative_stones, wire_states,
                         playout_cap_fraction, playout_cap_divisor,
                         &running,
                     );
@@ -2393,6 +2725,7 @@ fn main() {
                 padded_inference,
                 model_use_jk, &model_jk_mode,
                 threat_features, relative_stones,
+                slot_inference, win_length,
             );
             if n_workers > 1 {
                 let dispatch_label = match inference_dispatch {
@@ -2416,7 +2749,17 @@ fn main() {
                 // this is still `[python w0]`; harmless and explicit.
                 let label = format!("python w{wid}");
                 match SubprocessModel::spawn_labeled(&python_bin, inference_bin.as_deref(), ckpt, &model_args, &label) {
-                    Ok(m) => models.push(m),
+                    Ok(mut m) => {
+                        // --wire-states capability probe per worker (clear
+                        // "server too old" error instead of mid-run garbage).
+                        if let Some(cfg) = states_cfg.as_ref() {
+                            if let Err(e) = m.probe_states(cfg) {
+                                eprintln!("worker {wid}: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                        models.push(m)
+                    }
                     Err(e) => {
                         eprintln!("Failed to spawn Python inference worker {wid}: {e}");
                         std::process::exit(1);
@@ -2439,12 +2782,12 @@ fn main() {
                         if double_buffer {
                             inference_server_subprocess_double_buffered(
                                 rx, model, max_batch, batch_timeout,
-                                running_ref, Some(model_path_ref),
+                                running_ref, Some(model_path_ref), states_cfg,
                             );
                         } else {
                             inference_server_subprocess(
                                 rx, model, max_batch, batch_timeout,
-                                running_ref, Some(model_path_ref),
+                                running_ref, Some(model_path_ref), states_cfg,
                             );
                         }
                     });
@@ -2463,6 +2806,7 @@ fn main() {
                             prx, max_batch, batch_timeout,
                             running_ref, pool_path_rx,
                             &python_bin_clone, inference_bin_clone.as_deref(), &model_args_clone,
+                            states_cfg,
                         );
                     });
 
@@ -2481,7 +2825,7 @@ fn main() {
                 run_continuous_game_threads(
                     s, client, pool_client_opt, n_threads, seed, game_config,
                     &mcts_config, &exploration_atomic, graph_type, prune_empty_edges,
-                    threat_features, relative_stones,
+                    threat_features, relative_stones, wire_states,
                     playout_cap_fraction, playout_cap_divisor, pool_fraction,
                     &pool_disabled, &pool_ready, &running, &game_counter,
                     &rotating_writer, exploration_fraction, &ema_bits,
@@ -2555,7 +2899,7 @@ fn main() {
                     run_continuous_game_threads(
                         s, client, pool_client_opt, n_threads, seed, game_config,
                         &mcts_config, &exploration_atomic, graph_type, prune_empty_edges,
-                        threat_features, relative_stones,
+                        threat_features, relative_stones, wire_states,
                         playout_cap_fraction, playout_cap_divisor, pool_fraction,
                         &pool_disabled, &pool_ready, &running, &game_counter,
                         &rotating_writer, exploration_fraction, &ema_bits,
@@ -2596,6 +2940,8 @@ fn subprocess_model_args(
     jk_mode: &str,
     threat_features: bool,
     relative_stones: bool,
+    slot_inference: bool,
+    win_length: u8,
 ) -> Vec<String> {
     let mut v = vec![
         "--hidden-dim".into(), hidden_dim.to_string(),
@@ -2625,6 +2971,14 @@ fn subprocess_model_args(
     if dim != 8 {
         v.push("--node-dim".into());
         v.push(dim.to_string());
+    }
+    // --slot-inference (plan-A3 task 5): serve MSG_FORWARD_STATES via the A2
+    // slot backend. The server needs the win_length to size the slot model's
+    // edge tables (6*(win_length-1)) and cross-check every states request.
+    if slot_inference {
+        v.push("--slot-inference".into());
+        v.push("--win-length".into());
+        v.push(win_length.to_string());
     }
     v
 }
@@ -2659,6 +3013,7 @@ fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
     prune_empty_edges: bool,
     threat_features: bool,
     relative_stones: bool,
+    wire_states: bool,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
     running: &'env Arc<AtomicBool>,
@@ -2693,7 +3048,7 @@ fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
                     let _ = play_one_game(
                         &client, None, None, game_config, mcts_config,
                         exploration, graph_type, prune_empty_edges, threat_features,
-                        relative_stones, &mut rng,
+                        relative_stones, wire_states, &mut rng,
                         playout_cap_fraction, playout_cap_divisor,
                         &running_thread,
                     );
@@ -2704,7 +3059,7 @@ fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
                     if let Some(game) = play_one_game(
                         &client, None, None, game_config, mcts_config,
                         exploration, graph_type, prune_empty_edges, threat_features,
-                        relative_stones, &mut rng,
+                        relative_stones, wire_states, &mut rng,
                         playout_cap_fraction, playout_cap_divisor,
                         &running_thread,
                     ) {
@@ -2751,6 +3106,7 @@ fn run_continuous_game_threads<'scope, 'env: 'scope>(
     prune_empty_edges: bool,
     threat_features: bool,
     relative_stones: bool,
+    wire_states: bool,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
     pool_fraction: f64,
@@ -2802,7 +3158,7 @@ fn run_continuous_game_threads<'scope, 'env: 'scope>(
                     &client, pool_client_ref, pool_side,
                     game_config, mcts_config,
                     exploration_atomic, graph_type, prune_empty_edges, threat_features,
-                    relative_stones, &mut rng,
+                    relative_stones, wire_states, &mut rng,
                     playout_cap_fraction, playout_cap_divisor,
                     &running,
                 ) {
@@ -2943,7 +3299,25 @@ mod tests {
     fn req_with_graphs(tags: &[usize]) -> (EvalRequest, mpsc::Receiver<EvalResult>) {
         let (tx, rx) = mpsc::channel();
         let graphs = tags.iter().map(|&t| dummy_graph(t)).collect();
-        (EvalRequest { graphs, response_tx: tx }, rx)
+        (EvalRequest { graphs, snapshots: Vec::new(), response_tx: tx }, rx)
+    }
+
+    /// Snapshot-carrying request for --wire-states batching tests. Each
+    /// snapshot's `edge_estimate` doubles as an identity tag.
+    fn req_with_snapshots(edge_tags: &[usize]) -> (EvalRequest, mpsc::Receiver<EvalResult>) {
+        let (tx, rx) = mpsc::channel();
+        let snapshots = edge_tags
+            .iter()
+            .map(|&t| StateSnapshot {
+                p1_keys: vec![],
+                p2_keys: vec![],
+                current_player: 0,
+                moves_remaining: 2,
+                legal_coords: vec![],
+                edge_estimate: t,
+            })
+            .collect();
+        (EvalRequest { graphs: Vec::new(), snapshots, response_tx: tx }, rx)
     }
 
     /// One logit map per state, carrying a single sentinel entry so each
@@ -2978,6 +3352,37 @@ mod tests {
     }
 
     #[test]
+    fn assemble_batch_flattens_snapshots_and_slices_in_order() {
+        let (r0, _rx0) = req_with_snapshots(&[10, 11]);
+        let (r1, _rx1) = req_with_snapshots(&[20]);
+        let (r2, _rx2) = req_with_snapshots(&[30, 31, 32]);
+
+        let batch = assemble_batch(vec![r0, r1, r2]);
+
+        assert!(batch.graphs.is_empty(), "states-mode batch carries no graphs");
+        let tags: Vec<usize> = batch.snapshots.iter().map(|s| s.edge_estimate).collect();
+        assert_eq!(tags, vec![10, 11, 20, 30, 31, 32]);
+        let ranges: Vec<(usize, usize)> =
+            batch.slices.iter().map(|(_, s, e)| (*s, *e)).collect();
+        assert_eq!(ranges, vec![(0, 2), (2, 3), (3, 6)]);
+    }
+
+    #[test]
+    fn req_counts_cover_both_payload_kinds() {
+        // Graph request: exact edge counts, snapshot vec empty.
+        let (mut rg, _rx) = req_with_graphs(&[1, 2]);
+        rg.graphs[0].num_edges = 7;
+        rg.graphs[1].num_edges = 5;
+        assert_eq!(req_item_count(&rg), 2);
+        assert_eq!(req_edge_total(&rg), 12);
+
+        // Snapshot request: precomputed estimates, graph vec empty.
+        let (rs, _rx) = req_with_snapshots(&[100, 250]);
+        assert_eq!(req_item_count(&rs), 2);
+        assert_eq!(req_edge_total(&rs), 350);
+    }
+
+    #[test]
     fn scatter_results_routes_each_slice_to_its_requester() {
         let (r0, rx0) = req_with_graphs(&[1, 1]);
         let (r1, rx1) = req_with_graphs(&[1]);
@@ -2995,6 +3400,9 @@ mod tests {
 
     #[test]
     fn scatter_results_none_sends_correctly_sized_empties() {
+        // The None arm is shutdown-only (see classify_forward_failure): it
+        // unblocks game threads that are mid-recv when the subprocess dies
+        // during an orderly stop. Sizes must still match each request.
         let (r0, rx0) = req_with_graphs(&[1, 1, 1]);
         let (r1, rx1) = req_with_graphs(&[1]);
         let batch = assemble_batch(vec![r0, r1]);
@@ -3008,6 +3416,257 @@ mod tests {
         let (logits1, values1) = rx1.recv().unwrap();
         assert_eq!(values1, vec![0.0]);
         assert_eq!(logits1.len(), 1);
+    }
+
+    // -- Task 9: graph-mode forward-failure policy ---------------------------
+    //
+    // The `Fatal` arm calls `inference_fatal` -> `process::exit(1)` and is
+    // deliberately NOT unit-tested (it would kill the test runner). Manual
+    // reasoning for the exit paths:
+    //
+    //  * `inference_server_subprocess` (serial), the double-buffered compute
+    //    stage, and `pool_inference_server_subprocess` all route graph-batch
+    //    forwards through `forward_batch_and_scatter`. Its Err arm consults
+    //    `classify_forward_failure(running)`; with `running == true` it
+    //    diverges into `inference_fatal` (`-> !`), which eprintlns two FATAL
+    //    lines naming the component and exits 1. No `scatter_results(None)`
+    //    call is reachable mid-run, so game threads can never again receive
+    //    the silent empty-logits unblock while self-play is live.
+    //  * States-mode (`--wire-states`) errors now share the graph-mode
+    //    classifier: fatal via `wire_states_fatal` (a thin wrapper over
+    //    `inference_fatal`) ONLY mid-run; during orderly shutdown they unblock
+    //    with empty results like graph mode (covered by
+    //    `states_forward_failure_during_shutdown_unblocks` below and the
+    //    `forward_batch_and_scatter` FATAL death-test). The mid-run FATAL path
+    //    itself is exercised by `forward_batch_and_scatter_fatal_death_test`.
+    //  * Pool-subprocess spawn failure while `running` is also routed to
+    //    `inference_fatal` (previously: eprintln + silent thread exit,
+    //    which surfaced minutes later as a confusing game-thread panic).
+
+    #[test]
+    fn forward_failure_mid_run_is_fatal() {
+        // running == true: the inference server died mid-run. The batcher
+        // must abort self-play instead of unblocking with empty logits.
+        assert_eq!(classify_forward_failure(true), ForwardFailureAction::Fatal);
+    }
+
+    #[test]
+    fn forward_failure_during_shutdown_unblocks() {
+        // running == false: orderly shutdown. Ctrl-C SIGINTs the whole
+        // foreground process group, so the Python child routinely dies
+        // mid-forward; that is a shutdown artifact, not a server crash.
+        assert_eq!(
+            classify_forward_failure(false),
+            ForwardFailureAction::ShutdownUnblock
+        );
+    }
+
+    /// Spawn a stub "inference server" that prints READY and exits
+    /// immediately, so every forward on it fails — a stand-in for a dead
+    /// subprocess that avoids needing torch or a real model.
+    fn dead_stub_model() -> SubprocessModel {
+        let dir = std::env::temp_dir()
+            .join(format!("hexo_dead_stub_{}_{:?}", std::process::id(), std::thread::current().id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("stub.sh");
+        fs::write(&script, "#!/bin/sh\necho READY >&2\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        SubprocessModel::spawn_labeled("unused-python", Some(&script), "unused.pt", &[], "stub")
+            .expect("stub inference server should reach READY")
+    }
+
+    #[test]
+    fn forward_batch_and_scatter_shutdown_failure_unblocks_with_empties() {
+        // End-to-end shutdown path: dead subprocess + running=false must
+        // unblock each requester with correctly sized empty results (and
+        // must NOT exit the process — this test finishing proves that).
+        let mut model = dead_stub_model();
+        let running = AtomicBool::new(false);
+        // Zero-node dummies keep the wire payload self-consistent in case the
+        // forward races past the is_alive() check before erroring on the pipe.
+        let (r0, rx0) = req_with_graphs(&[0, 0]);
+        let (r1, rx1) = req_with_graphs(&[0]);
+        let batch = assemble_batch(vec![r0, r1]);
+
+        forward_batch_and_scatter(&mut model, batch, None, &running, "test subprocess");
+
+        let (logits0, values0) = rx0.recv().unwrap();
+        assert_eq!(values0, vec![0.0, 0.0]);
+        assert!(logits0.iter().all(|m| m.is_empty()));
+        let (logits1, values1) = rx1.recv().unwrap();
+        assert_eq!(values1, vec![0.0]);
+        assert_eq!(logits1.len(), 1);
+    }
+
+    fn test_states_cfg() -> StatesWireConfig {
+        StatesWireConfig {
+            win_length: 4,
+            placement_radius: 4,
+            max_moves: 50,
+            builder_flags: 0,
+            node_dim: 8,
+        }
+    }
+
+    #[test]
+    fn wire_states_radius_accepts_1_to_64() {
+        assert_eq!(validate_wire_states_radius(1), Ok(1));
+        assert_eq!(validate_wire_states_radius(8), Ok(8));
+        assert_eq!(validate_wire_states_radius(64), Ok(64));
+    }
+
+    #[test]
+    fn wire_states_radius_rejects_out_of_server_bound() {
+        // Above the server's GameConfig bound: fits the u8 wire field but the
+        // server would reject it on the first request. Must be a startup error
+        // whose message names the 1..=64 server bound.
+        for bad in [0, 65, 128, 255, 1000, -3] {
+            let err = validate_wire_states_radius(bad).unwrap_err();
+            assert!(err.contains("1..=64"), "radius {bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn batch_wants_more_respects_graph_cap_and_edge_budget() {
+        // Edge budget disabled (edge_cap == 0): only the graph cap binds.
+        assert!(batch_wants_more_with_cap(0, 999_999, 4, 0));
+        assert!(batch_wants_more_with_cap(3, 999_999, 4, 0));
+        assert!(!batch_wants_more_with_cap(4, 0, 4, 0), "at the graph cap → stop");
+        assert!(!batch_wants_more_with_cap(5, 0, 4, 0));
+
+        // Edge budget set: stop once EITHER cap is reached.
+        assert!(batch_wants_more_with_cap(1, 40_000, 128, 46_000));
+        assert!(!batch_wants_more_with_cap(1, 46_000, 128, 46_000), "at the edge cap → stop");
+        assert!(!batch_wants_more_with_cap(1, 50_000, 128, 46_000));
+        // Graph cap still binds even below the edge budget.
+        assert!(!batch_wants_more_with_cap(128, 1, 128, 46_000));
+    }
+
+    #[test]
+    fn states_forward_failure_during_shutdown_unblocks() {
+        // RU-1: states-mode failures now share the graph-mode classifier — a
+        // dead subprocess during orderly shutdown (running=false) must unblock
+        // waiters with empty results, NOT exit the process. This test finishing
+        // (and receiving empties) proves the shutdown path no longer exits 1.
+        let mut model = dead_stub_model();
+        let running = AtomicBool::new(false);
+        let cfg = test_states_cfg();
+        let (r0, rx0) = req_with_snapshots(&[0, 0]);
+        let (r1, rx1) = req_with_snapshots(&[0]);
+        let batch = assemble_batch(vec![r0, r1]);
+
+        forward_batch_and_scatter(&mut model, batch, Some(&cfg), &running, "test subprocess");
+
+        let (logits0, values0) = rx0.recv().unwrap();
+        assert_eq!(values0, vec![0.0, 0.0]);
+        assert!(logits0.iter().all(|m| m.is_empty()));
+        let (logits1, values1) = rx1.recv().unwrap();
+        assert_eq!(values1, vec![0.0]);
+        assert_eq!(logits1.len(), 1);
+    }
+
+    /// Build a request carrying NEITHER graphs NOR snapshots (an all-empty
+    /// EvalRequest — its slice is [start, start), zero-width).
+    fn empty_req() -> (EvalRequest, mpsc::Receiver<EvalResult>) {
+        let (tx, rx) = mpsc::channel();
+        (EvalRequest { graphs: Vec::new(), snapshots: Vec::new(), response_tx: tx }, rx)
+    }
+
+    #[test]
+    fn forward_batch_and_scatter_empty_batch_skips_wire_both_modes() {
+        // RU2-W1: an all-empty batch must scatter empties WITHOUT any wire call,
+        // even mid-run (running=true). The model is a dead stub: if the guard
+        // were missing, graph mode would forward-then-fatal and states mode
+        // would send a zero-graph PROBE -> PROBE_ACK -> fatal. Reaching the
+        // asserts (and receiving empty results) proves neither happened.
+        for states_cfg in [None, Some(test_states_cfg())] {
+            let mut model = dead_stub_model();
+            let running = AtomicBool::new(true); // mid-run: guard must still hold
+            let (r0, rx0) = empty_req();
+            let (r1, rx1) = empty_req();
+            let batch = assemble_batch(vec![r0, r1]);
+
+            forward_batch_and_scatter(
+                &mut model, batch, states_cfg.as_ref(), &running, "empty-batch test",
+            );
+
+            let (logits0, values0) = rx0.recv().unwrap();
+            assert!(logits0.is_empty() && values0.is_empty());
+            let (logits1, values1) = rx1.recv().unwrap();
+            assert!(logits1.is_empty() && values1.is_empty());
+        }
+    }
+
+    #[test]
+    fn forward_batch_and_scatter_fatal_death_test() {
+        // TQ-W3: the FATAL arm calls process::exit(1), so it cannot be asserted
+        // in-process. Re-invoke THIS test in a child process (gated by an env
+        // var) that drives a mid-run graph-mode forward failure (dead stub +
+        // running=true) through forward_batch_and_scatter, and assert the child
+        // exits 1. No torch needed — the dead stub stands in for a crashed server.
+        const GATE: &str = "HEXO_SELFPLAY_FATAL_DEATH_TEST";
+        if std::env::var_os(GATE).is_some() {
+            let mut model = dead_stub_model();
+            let running = AtomicBool::new(true); // mid-run → Fatal
+            let (r, _rx) = req_with_graphs(&[0]);
+            let batch = assemble_batch(vec![r]);
+            forward_batch_and_scatter(&mut model, batch, None, &running, "death-test");
+            // forward_batch_and_scatter must diverge (-> !) on the Fatal arm; if
+            // it ever returns, exit 0 so the parent's `== 1` assertion fails.
+            std::process::exit(0);
+        }
+        let exe = std::env::current_exe().expect("current test exe");
+        let status = std::process::Command::new(exe)
+            .arg("tests::forward_batch_and_scatter_fatal_death_test")
+            .arg("--exact")
+            .env(GATE, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn child test process");
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "a mid-run forward failure must abort self-play with exit code 1"
+        );
+    }
+
+    #[test]
+    fn forward_batch_and_scatter_states_fatal_death_test() {
+        // TQ2-W2: mirror of the graph-mode FATAL death test for the states-mode
+        // arm (states_cfg=Some + a snapshot-carrying request). A mid-run
+        // (running=true) states forward against the dead stub server must
+        // diverge via wire_states_fatal -> process::exit(1). Re-invoked in a
+        // child process because the FATAL arm exits.
+        const GATE: &str = "HEXO_SELFPLAY_STATES_FATAL_DEATH_TEST";
+        if std::env::var_os(GATE).is_some() {
+            let mut model = dead_stub_model();
+            let running = AtomicBool::new(true); // mid-run → Fatal
+            let cfg = test_states_cfg();
+            let (r, _rx) = req_with_snapshots(&[0]); // one snapshot → non-empty batch
+            let batch = assemble_batch(vec![r]);
+            forward_batch_and_scatter(&mut model, batch, Some(&cfg), &running, "states-death-test");
+            std::process::exit(0); // must be unreachable: Fatal arm diverges
+        }
+        let exe = std::env::current_exe().expect("current test exe");
+        let status = std::process::Command::new(exe)
+            .arg("tests::forward_batch_and_scatter_states_fatal_death_test")
+            .arg("--exact")
+            .env(GATE, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn child test process");
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "a mid-run states forward failure must abort self-play with exit code 1"
+        );
     }
 
     /// Play a few opening moves and return the resulting non-terminal game.
@@ -3202,6 +3861,35 @@ mod tests {
         assert_eq!(node_dim(false, true), 7);
         assert_eq!(node_dim(true, false), 12);
         assert_eq!(node_dim(true, true), 11);
+    }
+
+    #[test]
+    fn subprocess_model_args_omits_slot_flags_by_default() {
+        // PA-1: without --slot-inference the server CLI stays byte-identical to
+        // pre-A3 runs (no --slot-inference / --win-length leaks).
+        let v = subprocess_model_args(
+            256, 3, 8, 128, 128, "axis", "gine", "cpu",
+            false, false, "sum", false, false,
+            /*slot_inference=*/ false, /*win_length=*/ 6,
+        );
+        assert!(!v.iter().any(|a| a == "--slot-inference"));
+        assert!(!v.iter().any(|a| a == "--win-length"));
+    }
+
+    #[test]
+    fn subprocess_model_args_emits_slot_inference_and_win_length() {
+        // PA-1: with --slot-inference the server must be told to use the slot
+        // backend AND the win_length that sizes its edge tables.
+        let v = subprocess_model_args(
+            256, 3, 8, 128, 128, "axis", "gine", "cpu",
+            false, false, "sum", false, false,
+            /*slot_inference=*/ true, /*win_length=*/ 6,
+        );
+        let pos = v.iter().position(|a| a == "--slot-inference").expect("--slot-inference");
+        let wpos = v.iter().position(|a| a == "--win-length").expect("--win-length");
+        assert_eq!(v[wpos + 1], "6", "win_length value forwarded");
+        // Both slot flags are present; win-length pairs with its value.
+        assert!(pos < v.len());
     }
 
     #[test]

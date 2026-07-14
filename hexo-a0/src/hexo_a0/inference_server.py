@@ -12,6 +12,24 @@ Protocol v2 added a ``node_dim: u8`` field to the forward-message body header
 features) survive the wire. The Rust self-play binary spawns this server from
 the same checkout, so no rolling version compat is needed — version mismatch
 is a hard error.
+
+MSG_FORWARD_STATES (0x03) is the A3 state-payload wire: the client sends
+~300 B/graph board-state records instead of collated graph tensors, and the
+server rebuilds the identical batch via hexo_rs (GameState.from_state +
+axis_states_to_batch). Requests answer with a MSG_FORWARD_STATES-typed
+response carrying a status byte and per-graph legal-coord FNV-1a hashes (see
+``_read_forward_states_body`` / ``_write_forward_states_response`` for the
+exact byte layouts). Validation/rebuild failures reply in-band
+(STATES_STATUS_ERROR) — they never kill the server. MSG_FORWARD stays
+byte-identical.
+
+With ``--slot-inference`` (plan-A3 task 5), MSG_FORWARD_STATES is served by
+the A2 slot backend instead: the wire's canonical int32 HexKeys feed the
+batched on-device slot builder directly and a ``slot_model_from_legacy``
+conversion of the SAME checkpoint runs ``forward_padded`` (legacy GINE
+checkpoints only — anything else fails at startup). The wire format and the
+states response layout are unchanged; MSG_FORWARD always stays on the legacy
+model. See the ``--slot-inference`` block near ``_load_slot_model``.
 """
 
 import argparse
@@ -28,10 +46,61 @@ MAGIC = 0x48583034
 VERSION = 2
 MSG_FORWARD = 0x01
 MSG_RELOAD = 0x02
+MSG_FORWARD_STATES = 0x03
 MSG_SHUTDOWN = 0xFF
 
 HEADER_SIZE = 6  # u32 + u8 + u8
 HEADER_FMT = "<IBB"
+
+# --- MSG_FORWARD_STATES (A3 state-payload wire) -----------------------------
+# builder_flags bits (client cross-check against the checkpoint-derived flags)
+BUILDER_FLAG_PRUNE = 0x01
+BUILDER_FLAG_THREAT = 0x02
+BUILDER_FLAG_RELATIVE = 0x04
+
+# Status byte of every MSG_FORWARD_STATES-typed response.
+STATES_STATUS_OK = 0
+STATES_STATUS_ERROR = 1
+STATES_STATUS_PROBE_ACK = 2
+
+_FNV64_OFFSET = 0xCBF29CE484222325
+_FNV64_PRIME = 0x100000001B3
+_U64_MASK = 0xFFFFFFFFFFFFFFFF
+
+
+class StatesRequestError(Exception):
+    """In-band MSG_FORWARD_STATES failure.
+
+    Raised only AFTER the request body has been fully consumed, so the
+    stream framing is intact: the server replies with a STATES_STATUS_ERROR
+    response and keeps serving — states-request errors never kill the server.
+    """
+
+
+def _fnv1a64(data) -> int:
+    """FNV-1a 64-bit over a byte sequence (the legal-coord order guard)."""
+    h = _FNV64_OFFSET
+    for b in data:
+        h = ((h ^ b) * _FNV64_PRIME) & _U64_MASK
+    return h
+
+
+def _unpack_hexkey(key: int) -> "tuple[int, int]":
+    """Decode a canonical HexKey (perf-plan §1) into ``(q, r)``.
+
+    Layout: ``key = (q << 16) | ((r ^ 0x8000) & 0xFFFF)`` as a signed i32 —
+    q stored sign-extended i16 in the high half (NOT biased), ONLY r biased,
+    so signed-i32 key order == lexicographic (q, r) order.
+
+    Decode: ``q = key >> 16`` (arithmetic shift; Python ints are signed, so
+    ``>>`` on the struct-unpacked signed value is exactly that), and
+    ``r`` = i16 reinterpretation of ``(key & 0xFFFF) ^ 0x8000``.
+    """
+    q = key >> 16
+    r = (key & 0xFFFF) ^ 0x8000
+    if r >= 0x8000:
+        r -= 0x10000
+    return q, r
 
 
 def _install_parent_death_watchdog() -> None:
@@ -160,10 +229,13 @@ def _load_model(args) -> torch.nn.Module:
     # CLI flags remain as a fallback for standalone/test invocations.
     emb = ckpt.get("model_config") if isinstance(ckpt, dict) else None
     if isinstance(emb, dict):
+        # prune_empty_edges is not a model-construction knob; it is copied so
+        # the MSG_FORWARD_STATES rebuild derives its builder flags from the
+        # checkpoint (single source of truth — wire flags are a cross-check).
         for _k in ("axis_relational", "axis_window", "compact_stone_onehot",
                    "node_coords", "moves_scope", "relative_stone_encoding",
                    "threat_features", "value_bins", "value_bin_min",
-                   "value_bin_max"):
+                   "value_bin_max", "prune_empty_edges"):
             if _k in emb:
                 setattr(args, _k, emb[_k])
 
@@ -301,6 +373,681 @@ def _read_forward_body(stdin, expected_node_dim: int) -> dict:
         "legal_mask": legal_mask_bytes, "stone_mask": stone_mask_bytes,
         "batch": batch_bytes,
     }
+
+
+def _states_request_frame(stdin) -> tuple:
+    """Read a raw MSG_FORWARD_STATES request BODY (framing only, no
+    validation — see ``_read_forward_states_body`` for the byte layout).
+
+    Returns ``(num_graphs, win_length, placement_radius, max_moves,
+    builder_flags, node_dim, graphs)`` with ``graphs`` a list of
+    ``(p1_keys, p2_keys, current_player, moves_remaining, num_legal)``
+    tuples (keys are sign-decoded int32 HexKeys). Raises ``EOFError`` on a
+    short read — framing lost, fatal like graph mode. After a successful
+    return the body is fully consumed, so every later failure is in-band.
+    """
+    body_header = _read_exact(stdin, 12)
+    (num_graphs, win_length, placement_radius, max_moves,
+     builder_flags, node_dim) = struct.unpack("<IBBIBB", body_header)
+
+    graphs = []
+    for _ in range(num_graphs):
+        gh = _read_exact(stdin, 8)
+        n_p1, n_p2, cur, mr, num_legal = struct.unpack("<HHBBH", gh)
+        key_bytes = _read_exact(stdin, (n_p1 + n_p2) * 4)
+        keys = struct.unpack(f"<{n_p1 + n_p2}i", key_bytes)
+        graphs.append((keys[:n_p1], keys[n_p1:], cur, mr, num_legal))
+
+    return (num_graphs, win_length, placement_radius, max_moves,
+            builder_flags, node_dim, graphs)
+
+
+def _read_forward_states_body(
+    stdin,
+    expected_node_dim: int,
+    *,
+    prune_empty_edges: bool = False,
+    threat_features: bool = False,
+    relative_stones: bool = False,
+) -> "tuple[dict, list[int]] | None":
+    """Read a MSG_FORWARD_STATES request body and rebuild the graph batch.
+
+    Request BODY layout (all little-endian; the 6-byte outer header is
+    consumed by the reader thread before this runs)::
+
+        u32 num_graphs
+        u8  win_length
+        u8  placement_radius
+        u32 max_moves
+        u8  builder_flags   (bit0 prune_empty_edges, bit1 threat_features,
+                             bit2 relative_stones — cross-check only; the
+                             server's checkpoint config is authoritative)
+        u8  node_dim        (schema guard: must equal the server's node dim)
+        per graph:
+            u16 n_p1             (P1 stone count)
+            u16 n_p2             (P2 stone count)
+            u8  current_player   (0 = P1, 1 = P2)
+            u8  moves_remaining  (must be 1 or 2)
+            u16 num_legal        (cross-checked against the rebuilt graph)
+            i32 keys[n_p1]       (P1 stones, canonical HexKeys)
+            i32 keys[n_p2]       (P2 stones, canonical HexKeys)
+
+    Stone coords ride as canonical int32 HexKeys (perf-plan §1):
+    ``key = (q << 16) | ((r ^ 0x8000) & 0xFFFF)`` — q sign-extended i16 in
+    the high half, ONLY r biased (signed-i32 key order == lexicographic
+    (q, r) order); decoded by ``_unpack_hexkey``.
+
+    A zero-graph request is a startup capability probe: it bypasses the
+    rebuild and ALL guards (flags/node_dim may be garbage) and returns
+    ``None`` — the caller replies with a dedicated STATES_STATUS_PROBE_ACK.
+
+    Otherwise returns ``(body, legal_hashes)`` where ``body`` is EXACTLY the
+    dict shape ``_read_forward_body`` produces (so the unmodified
+    ``_prepare_tensors`` consumes it) and ``legal_hashes`` is one u64
+    FNV-1a hash per graph over the rebuilt graph's legal coords in order —
+    hash input is the concatenation of ``(q: i32 LE, r: i32 LE)`` per legal
+    move, in ``legal_moves()`` order (== the graph's legal-node order).
+
+    Raises ``EOFError`` on a short read (framing lost — fatal, like graph
+    mode) and ``StatesRequestError`` for every validation/rebuild failure
+    (body fully consumed — the caller replies in-band and keeps serving).
+    """
+    (num_graphs, win_length, placement_radius, max_moves,
+     builder_flags, node_dim, graphs) = _states_request_frame(stdin)
+
+    # From here on the body is fully consumed — every failure is in-band.
+    if num_graphs == 0:
+        return None  # capability probe: bypass rebuild + guards
+
+    try:
+        return _states_to_forward_body(
+            graphs, win_length, placement_radius, max_moves,
+            builder_flags, node_dim, expected_node_dim,
+            prune_empty_edges=prune_empty_edges,
+            threat_features=threat_features,
+            relative_stones=relative_stones,
+        )
+    except StatesRequestError:
+        raise
+    except Exception as e:
+        # Rebuild machinery failure (from_state, batch builder, ...):
+        # framing is intact, so keep the server alive and report in-band.
+        raise StatesRequestError(f"states rebuild failed: {e}") from e
+
+
+def _states_to_forward_body(
+    graphs: list,
+    win_length: int,
+    placement_radius: int,
+    max_moves: int,
+    builder_flags: int,
+    node_dim: int,
+    expected_node_dim: int,
+    *,
+    prune_empty_edges: bool,
+    threat_features: bool,
+    relative_stones: bool,
+) -> "tuple[dict, list[int]]":
+    """Validate a parsed states request and rebuild the collated axis batch.
+
+    The server's checkpoint-derived builder flags are authoritative; the
+    wire ``builder_flags`` are a cross-check. Emits the exact
+    ``_read_forward_body`` dict shape: the binding's i64 batch vector is
+    converted to the int32 wire dtype, stone_mask is scattered from
+    stone_idx, total_nodes/total_edges are derived from the rebuilt batch,
+    and has_edge_attr/node_dim are synthesized (axis graphs always carry
+    5-dim edge attrs; node_dim = rebuilt n_feat).
+    """
+    import hexo_rs
+    from hexo_a0.graph import axis_states_to_batch
+
+    server_flags = (
+        (BUILDER_FLAG_PRUNE if prune_empty_edges else 0)
+        | (BUILDER_FLAG_THREAT if threat_features else 0)
+        | (BUILDER_FLAG_RELATIVE if relative_stones else 0)
+    )
+    if builder_flags != server_flags:
+        raise StatesRequestError(
+            f"wire builder_flags 0x{builder_flags:02X} != server checkpoint "
+            f"flags 0x{server_flags:02X} (bit0 prune_empty_edges, "
+            f"bit1 threat_features, bit2 relative_stones)"
+        )
+    if node_dim != expected_node_dim:
+        raise StatesRequestError(
+            f"wire node_dim {node_dim} != server node_dim {expected_node_dim}"
+        )
+
+    config = hexo_rs.GameConfig(win_length, placement_radius, max_moves)
+    games = []
+    for i, (p1_keys, p2_keys, cur, mr, _num_legal) in enumerate(graphs):
+        if mr not in (1, 2):
+            raise StatesRequestError(
+                f"graph {i}: moves_remaining {mr} not in {{1, 2}} "
+                f"(0 means the client sent a terminal state)"
+            )
+        if cur not in (0, 1):
+            raise StatesRequestError(f"graph {i}: current_player byte {cur} not in {{0, 1}}")
+        stone_list = [(_unpack_hexkey(k), "P1") for k in p1_keys]
+        stone_list += [(_unpack_hexkey(k), "P2") for k in p2_keys]
+        try:
+            games.append(hexo_rs.GameState.from_state(
+                stone_list, "P1" if cur == 0 else "P2", mr, config
+            ))
+        except ValueError as e:
+            raise StatesRequestError(f"graph {i}: from_state rejected state: {e}") from e
+
+    batch, aux = axis_states_to_batch(
+        games,
+        prune_empty_edges=prune_empty_edges,
+        threat_features=threat_features,
+        relative_stones=relative_stones,
+        device="cpu",
+    )
+
+    legal_counts = aux.legal_counts.tolist()
+    for i, (_p1, _p2, _cur, _mr, num_legal) in enumerate(graphs):
+        if legal_counts[i] != num_legal:
+            raise StatesRequestError(
+                f"graph {i}: wire num_legal {num_legal} != rebuilt legal "
+                f"count {legal_counts[i]} (client/server builder divergence)"
+            )
+
+    n_feat = batch.x.shape[1]
+    if n_feat != expected_node_dim:
+        raise StatesRequestError(
+            f"rebuilt n_feat {n_feat} != model input width {expected_node_dim}"
+        )
+
+    total_nodes = batch.x.shape[0]
+    total_edges = batch.edge_index.shape[1]
+
+    stone_mask = torch.zeros(total_nodes, dtype=torch.uint8)
+    stone_mask[aux.stone_idx] = 1
+
+    # bytearray (writable) so torch.frombuffer in _prepare_tensors behaves
+    # exactly as with the graph-mode _read_exact buffers.
+    body = {
+        "total_nodes": total_nodes, "total_edges": total_edges,
+        "num_graphs": batch.num_graphs, "has_edge_attr": 1,
+        "node_dim": n_feat,
+        "features": bytearray(batch.x.numpy().tobytes()),
+        "edge_src": bytearray(batch.edge_index[0].contiguous().numpy().tobytes()),
+        "edge_dst": bytearray(batch.edge_index[1].contiguous().numpy().tobytes()),
+        "edge_attr": bytearray(batch.edge_attr.numpy().tobytes()),
+        "legal_mask": bytearray(batch.legal_mask.to(torch.uint8).numpy().tobytes()),
+        "stone_mask": bytearray(stone_mask.numpy().tobytes()),
+        # dtype trap: the binding's batch vector is i64; the wire dict is i32.
+        "batch": bytearray(batch.batch.to(torch.int32).numpy().tobytes()),
+    }
+
+    # Per-graph order guard: hash the rebuilt legal coords in graph order
+    # (== legal_moves() order); the client compares against its snapshot.
+    legal_coords = aux.coords[aux.legal_idx].numpy().astype("<i4", copy=False)
+    hashes = []
+    offset = 0
+    for count in legal_counts:
+        hashes.append(_fnv1a64(legal_coords[offset:offset + count].tobytes()))
+        offset += count
+
+    return body, hashes
+
+
+# --- --slot-inference: A2 slot backend for MSG_FORWARD_STATES ---------------
+#
+# With --slot-inference, states requests bypass the legacy graph rebuild
+# entirely: the wire's canonical int32 HexKeys are fed DIRECTLY to the batched
+# on-device slot builder (slot_graph.build_slot_batch_from_keys — no per-stone
+# unpack/repack), the converted SlotHeXONet runs forward_padded, and the [B, N]
+# padded logits are gathered back to the per-graph legal order the states
+# response promises. MSG_FORWARD (graph mode) always stays on the legacy model.
+
+
+def _args_prune_default(args) -> bool:
+    """Single source of truth for the ``prune_empty_edges`` default across the
+    slot path (``_load_slot_model`` / ``_slot_builder_config`` /
+    ``_validate_states_slot``).
+
+    Default is ``False`` — it matches the graph builder's own default (an
+    absent flag means "don't prune"). In production the checkpoint's embedded
+    model_config sets ``prune_empty_edges`` explicitly at load time, so this
+    default only bites standalone/test invocations; keeping ONE helper stops
+    the three call sites from silently disagreeing (they previously split
+    True/False, which could flip the builder-flag cross-check under a
+    schema-less checkpoint)."""
+    return bool(getattr(args, "prune_empty_edges", False))
+
+
+def _slot_builder_config(args, win_length: int, placement_radius: int):
+    """SlotBuilderConfig from the server's checkpoint-derived schema flags
+    (single source of truth — wire flags are only a cross-check) plus the
+    request's game geometry."""
+    from hexo_a0.slot_graph import SlotBuilderConfig
+
+    return SlotBuilderConfig(
+        win_length=win_length,
+        placement_radius=placement_radius,
+        prune_empty_edges=_args_prune_default(args),
+        threat_features=bool(getattr(args, "threat_features", False)),
+        relative_stones=bool(getattr(args, "relative_stone_encoding", False)),
+        node_coords=bool(getattr(args, "node_coords", True)),
+        moves_scope=str(getattr(args, "moves_scope", "node")),
+        compact_stone_onehot=bool(getattr(args, "compact_stone_onehot", False)),
+    )
+
+
+def _states_slot_node_counts(graphs: list, placement_radius: int) -> "list[int]":
+    """EXACT per-graph slot node count (stones + legal), computed cheaply on
+    CPU ints — no torch allocation.
+
+    The slot builder's legal region is the union of hex-disks(placement_radius)
+    around the stones, MINUS the stones (see ``slot_graph.build_slot_batch``);
+    node count = stones + |union \\ stones|. Since the disk includes its centre,
+    every stone is itself in the union, so this is exactly ``|union of disks|``.
+    Deduplicating the union (a Python set of packed keys) captures the disk
+    OVERLAP between nearby stones — the reason the old zero-overlap bound
+    (``stones × disk_cells``) over-reported node counts 50-100x and made the
+    default budget reject ordinary production batches.
+
+    Keys pack as ``q * STRIDE + r`` with ``STRIDE`` larger than any in-range
+    ``|r|`` (i16 coords + radius ≤ 32767 + 64 < 2^19), so the disk deltas add
+    directly onto each stone's base key — the same additive
+    ``(dq << ?, dr)`` arithmetic as ``slot_graph._disk_deltas``, but on Python
+    ints. O(stones × disk_cells) small-int ops per graph.
+    """
+    r = placement_radius
+    STRIDE = 1 << 20  # > any in-range |r| (see docstring)
+    # Disk deltas: all (dq, dr) with hex-distance ≤ r (matches hex_offsets).
+    disk = [
+        dq * STRIDE + dr
+        for dq in range(-r, r + 1)
+        for dr in range(-r, r + 1)
+        if max(abs(dq), abs(dr), abs(dq + dr)) <= r
+    ]
+    counts = []
+    for p1, p2, _cur, _mr, _num_legal in graphs:
+        union = set()
+        for k in list(p1) + list(p2):
+            q, rr = _unpack_hexkey(k)
+            base = q * STRIDE + rr
+            for d in disk:
+                union.add(base + d)
+        counts.append(len(union))
+    return counts
+
+
+def _validate_states_slot(frame: tuple, args, *, bytes_per_elem: int = 4) -> tuple:
+    """Validate a parsed states request for the slot backend (reader thread).
+
+    Mirrors the legacy path's guards (builder-flag cross-check, node_dim,
+    per-graph moves_remaining/current_player) plus two slot-specific ones:
+
+    - win_length must match ``--win-length`` (the slot model's edge tables are
+      built for a fixed slot count ``6 * (win_length - 1)``);
+    - the A2 memory sharp edge: the message-passing activations are DENSE
+      ``[B, N_max, S, H]`` tensors (bf16 on CUDA, f32 on CPU — the loaded slot
+      model's parameter dtype, passed as ``bytes_per_elem``), so a big batch of
+      big graphs can OOM instead of just running slow. The estimate below is
+      computed from the request's geometry (an EXACT node count, before any
+      tensor is allocated) and over-budget requests get an in-band ERROR,
+      never an OOM.
+
+    ``bytes_per_elem`` is the slot model's activation element size (2 for
+    bf16 on CUDA, 4 for f32 on CPU); the caller reads it from the live model.
+
+    Returns ``(win_length, placement_radius, graphs)`` for the main loop.
+    """
+    (num_graphs, win_length, placement_radius, _max_moves,
+     builder_flags, node_dim, graphs) = frame
+
+    server_flags = (
+        (BUILDER_FLAG_PRUNE if _args_prune_default(args) else 0)
+        | (BUILDER_FLAG_THREAT if getattr(args, "threat_features", False) else 0)
+        | (BUILDER_FLAG_RELATIVE if getattr(args, "relative_stone_encoding", False) else 0)
+    )
+    if builder_flags != server_flags:
+        raise StatesRequestError(
+            f"wire builder_flags 0x{builder_flags:02X} != server checkpoint "
+            f"flags 0x{server_flags:02X} (bit0 prune_empty_edges, "
+            f"bit1 threat_features, bit2 relative_stones)"
+        )
+    if node_dim != args.node_dim:
+        raise StatesRequestError(
+            f"wire node_dim {node_dim} != server node_dim {args.node_dim}"
+        )
+    if win_length != args.win_length:
+        raise StatesRequestError(
+            f"wire win_length {win_length} != server --win-length "
+            f"{args.win_length} (the slot model's edge tables are built for a "
+            f"fixed win_length)"
+        )
+    # Range-check placement_radius BEFORE it drives the disk-cell bound below
+    # (and the slot builder's disk meshgrid alloc). Matches hexo_rs.GameConfig's
+    # own 1..=64 bound — an out-of-band radius is an in-band ERROR, never an OOM.
+    if not (1 <= placement_radius <= 64):
+        raise StatesRequestError(
+            f"placement_radius {placement_radius} out of range 1..=64 "
+            f"(matches hexo_rs.GameConfig)"
+        )
+
+    for i, (p1, p2, cur, mr, _num_legal) in enumerate(graphs):
+        if mr not in (1, 2):
+            raise StatesRequestError(
+                f"graph {i}: moves_remaining {mr} not in {{1, 2}} "
+                f"(0 means the client sent a terminal state)"
+            )
+        if cur not in (0, 1):
+            raise StatesRequestError(f"graph {i}: current_player byte {cur} not in {{0, 1}}")
+        if len(p1) + len(p2) == 0:
+            raise StatesRequestError(f"graph {i}: no stones")
+
+    # A2 activation-memory guard. The estimate must NOT trust the wire's
+    # num_legal (unverified — an under-report would slip past the guard and
+    # then OOM in the on-device build). Instead compute the EXACT per-graph node
+    # count server-side from the geometry: the slot builder's legal region is
+    # the union of hex-disks(radius) around the stones minus the stones, so the
+    # node count is |union of stone disks| — computed cheaply via a CPU set of
+    # packed keys (_states_slot_node_counts, O(stones·disk_cells) int ops, no
+    # torch alloc). This captures inter-stone disk OVERLAP, which the old
+    # zero-overlap bound (stones·disk_cells) ignored — over-reporting 50-100x
+    # and rejecting ordinary production batches under the default budget.
+    #
+    # PY2-W1: estimate on the PADDED shape the forward actually allocates.
+    # _handle_states_slot pads B and N to powers of two (_round_pow2) before
+    # forward_padded, and pow2 bucketing can ~4x the dense [B, N, S, H] tensor;
+    # estimating on the raw counts under-reports and could still OOM. Round both
+    # dims exactly as the allocator does (same _round_pow2, same floor=8 on N).
+    #
+    # bytes_per_elem is the slot model's activation dtype size (bf16=2 on CUDA,
+    # f32=4 on CPU). The ×3 covers the handful of dense [B, N, S, H]-shaped
+    # intermediates forward_padded holds live at once (message-passing input +
+    # output + reductions); it also dominates the smaller int64 candidate/
+    # partner index tensors ([B, N, S] × 8 B/elem), which are a factor ~H below
+    # a single H-wide activation and so are amply absorbed by the ×3 margin.
+    num_slots = 6 * (args.win_length - 1)
+    n_max_est = max(_states_slot_node_counts(graphs, placement_radius))
+    b_bucket = _round_pow2(num_graphs)
+    n_bucket = _round_pow2(n_max_est, floor=8)
+    est_bytes = b_bucket * n_bucket * num_slots * args.hidden_dim * bytes_per_elem * 3
+    budget_bytes = args.slot_activation_budget_mb * 1024 * 1024
+    if est_bytes > budget_bytes:
+        raise StatesRequestError(
+            f"slot activation budget exceeded: estimated "
+            f"{est_bytes / 2**20:.0f} MiB (padded {b_bucket} graphs x {n_bucket} "
+            f"max nodes x {num_slots} slots x {args.hidden_dim} hidden x "
+            f"{bytes_per_elem} B x 3; from {num_graphs} graphs x {n_max_est} "
+            f"exact nodes) > --slot-activation-budget-mb "
+            f"{args.slot_activation_budget_mb:g} — send smaller batches"
+        )
+
+    return (win_length, placement_radius, graphs)
+
+
+def _load_slot_model(args, device: torch.device) -> torch.nn.Module:
+    """Build the A2 slot model from the loaded LEGACY GINE checkpoint.
+
+    Raises ``ValueError`` with a clear message for every unsupported
+    architecture (axis_relational, gatv2, lstm-JK, moves_scope != 'node',
+    non-axis graphs) or a checkpoint whose state dict is not HeXONet-format —
+    the caller turns that into a STARTUP exit, never a mid-request failure.
+
+    Must run AFTER ``_load_model`` so the checkpoint's embedded model_config
+    has already been merged into ``args`` (same single source of truth as the
+    legacy states rebuild).
+    """
+    from hexo_a0.config import ModelConfig, node_feature_dim
+    from hexo_a0.model import HeXONet
+    from hexo_a0.model_slots import slot_model_from_legacy
+
+    # Explicit A2 coverage-boundary checks first, for clear startup messages.
+    if getattr(args, "axis_relational", False):
+        raise ValueError(
+            "--slot-inference covers legacy GINE checkpoints only (the A2 "
+            "boundary); this checkpoint is axis_relational"
+        )
+    if args.conv_type != "gine":
+        raise ValueError(
+            "--slot-inference covers conv_type='gine' checkpoints only, "
+            f"got {args.conv_type!r}"
+        )
+    if args.graph_type != "axis":
+        raise ValueError(
+            f"--slot-inference requires graph_type='axis', got {args.graph_type!r}"
+        )
+    if str(getattr(args, "moves_scope", "node")) != "node":
+        raise ValueError(
+            "--slot-inference supports moves_scope='node' only, got "
+            f"{getattr(args, 'moves_scope', 'node')!r}"
+        )
+    if getattr(args, "use_jk", False) and getattr(args, "jk_mode", "sum") == "lstm":
+        raise ValueError("--slot-inference does not support jk_mode='lstm'")
+
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    emb = ckpt.get("model_config") if isinstance(ckpt, dict) else None
+    emb = emb if isinstance(emb, dict) else {}
+
+    config = ModelConfig(
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        conv_type=args.conv_type,
+        pre_norm=not args.no_pre_norm,
+        dropout=0.0,
+        # Not merged into args by _load_model (the scriptable path ignores it),
+        # so read it straight from the embedded config.
+        use_layer_scale=bool(emb.get("use_layer_scale", False)),
+        use_jk=bool(getattr(args, "use_jk", False)),
+        jk_mode=str(getattr(args, "jk_mode", "sum")),
+        policy_hidden=args.policy_hidden,
+        value_hidden=args.value_hidden,
+        value_bins=int(getattr(args, "value_bins", 0) or 0),
+        value_bin_min=float(getattr(args, "value_bin_min", -1.0)),
+        value_bin_max=float(getattr(args, "value_bin_max", 1.0)),
+        graph_type=args.graph_type,
+        prune_empty_edges=_args_prune_default(args),
+        threat_features=bool(getattr(args, "threat_features", False)),
+        relative_stone_encoding=bool(getattr(args, "relative_stone_encoding", False)),
+        compact_stone_onehot=bool(getattr(args, "compact_stone_onehot", False)),
+        node_coords=bool(getattr(args, "node_coords", True)),
+        moves_scope=str(getattr(args, "moves_scope", "node")),
+    )
+    if node_feature_dim(config) != args.node_dim:
+        raise ValueError(
+            f"checkpoint schema implies node width {node_feature_dim(config)} "
+            f"but --node-dim is {args.node_dim}"
+        )
+
+    state_dict = ckpt.get("model_state_dict", ckpt.get("model", ckpt)) if isinstance(ckpt, dict) else ckpt
+    cleaned = {}
+    for k, v in state_dict.items():
+        new_key = k.replace("_orig_mod.", "")
+        # Train-only extras (never used at inference; absent from HeXONet
+        # built with default q_head=False / value_horizons=[]).
+        if new_key.startswith(("q_head.", "horizon_value_heads.")):
+            continue
+        cleaned[new_key] = v
+
+    legacy = HeXONet(config)
+    try:
+        legacy.load_state_dict(cleaned, strict=True)
+    except RuntimeError as e:
+        raise ValueError(
+            "--slot-inference needs a legacy HeXONet-format GINE checkpoint; "
+            f"the state dict did not load into HeXONet({config.conv_type}/"
+            f"{config.graph_type}): {e}"
+        ) from e
+    legacy.eval()
+
+    slot = slot_model_from_legacy(legacy, config, args.win_length)
+    slot.eval()
+    slot = slot.to(device)
+    if device.type == "cuda":
+        slot = slot.to(torch.bfloat16)
+
+    if not args.no_compile:
+        compile_kwargs = {}
+        if getattr(args, "dynamic_compile", False) or os.environ.get("HEXO_DYNAMIC_COMPILE") == "1":
+            compile_kwargs["dynamic"] = True
+        # Same compile policy as the legacy model (eager slot LOSES — the A2
+        # bench showed compile is the point); forward_padded is the static-
+        # shape entry point the server calls.
+        slot.forward_padded = torch.compile(
+            slot.forward_padded, fullgraph=True, **compile_kwargs
+        )
+    return slot
+
+
+def _warmup_slot(slot_model: torch.nn.Module, args, device: torch.device) -> None:
+    """One tiny states->slot forward so schema/shape errors (and the first
+    torch.compile trace) surface before READY, not on the first request."""
+    from hexo_a0.slot_graph import build_slot_batch_from_keys, pack
+
+    origin_key = int(pack(torch.tensor([0]), torch.tensor([0]))[0])
+    config = _slot_builder_config(args, args.win_length, placement_radius=1)
+    batch = build_slot_batch_from_keys([([origin_key], [], 0, 2)], config, device=device)
+    if device.type == "cuda":
+        batch.x = batch.x.to(torch.bfloat16)
+        batch.dummy_x = batch.dummy_x.to(torch.bfloat16)
+    with torch.no_grad():
+        slot_model.forward_padded(batch)
+
+
+def _slot_legal_hashes(aux) -> "list[int]":
+    """Per-graph FNV-1a legal-coord hashes from the slot batch's OWN legal
+    ordering (``SlotBatchAux``) — same hash-input layout as the legacy states
+    path: ``(q: i32 LE, r: i32 LE)`` per legal move, in legal-column order."""
+    from hexo_a0.slot_graph import unpack
+
+    lq, lr = unpack(aux.legal_keys.cpu())
+    coords = torch.stack([lq, lr], dim=1).to(torch.int32).numpy().astype("<i4", copy=False)
+    hashes = []
+    offset = 0
+    for count in aux.legal_counts.tolist():
+        hashes.append(_fnv1a64(coords[offset:offset + count].tobytes()))
+        offset += count
+    return hashes
+
+
+def _round_pow2(n: int, floor: int = 1) -> int:
+    """Smallest power of two >= max(n, floor). The slot forward runs under
+    torch.compile(dynamic=False), so every distinct [B, N] shape triggers a
+    fresh trace; rounding B and N to powers of two collapses nearby request
+    sizes onto a handful of shapes (few recompiles) at a bounded pad cost."""
+    n = max(int(n), floor, 1)
+    return 1 << (n - 1).bit_length()
+
+
+def _pad_slot_batch(batch, b_to: int, n_to: int):
+    """Pad a :class:`SlotBatch`'s graph (B) and node (N) dims up to bucket sizes
+    so the compiled ``forward_padded`` sees a small fixed set of shapes.
+
+    Padding graphs/nodes carry ``node_mask``/``filled``/masks all False, so they
+    contribute no legal columns: ``logits[legal_mask]`` excludes them and the
+    real-graph legal ordering (hence the FNV order guard and legal_counts, taken
+    from the UNPADDED ``SlotBatchAux``) is unchanged. The caller slices the
+    ghost graphs off ``values``."""
+    from hexo_a0.slot_graph import SlotBatch
+
+    b, n = batch.node_mask.shape
+    if b_to == b and n_to == n:
+        return batch
+    if b_to < b or n_to < n:
+        raise RuntimeError(
+            f"_pad_slot_batch: target ({b_to}, {n_to}) smaller than batch ({b}, {n})"
+        )
+    s = batch.partner.shape[2]
+    f = batch.x.shape[2]
+    dev = batch.x.device
+
+    def _mk(shape, dtype):
+        return torch.zeros(shape, dtype=dtype, device=dev)
+
+    x = _mk((b_to, n_to, f), batch.x.dtype); x[:b, :n] = batch.x
+    dummy_x = _mk((b_to, f), batch.dummy_x.dtype); dummy_x[:b] = batch.dummy_x
+    partner = _mk((b_to, n_to, s), batch.partner.dtype); partner[:b, :n] = batch.partner
+    filled = _mk((b_to, n_to, s), batch.filled.dtype); filled[:b, :n] = batch.filled
+    src_player = _mk((b_to, n_to), batch.src_player.dtype); src_player[:b, :n] = batch.src_player
+    node_mask = _mk((b_to, n_to), batch.node_mask.dtype); node_mask[:b, :n] = batch.node_mask
+    stone_mask = _mk((b_to, n_to), batch.stone_mask.dtype); stone_mask[:b, :n] = batch.stone_mask
+    legal_mask = _mk((b_to, n_to), batch.legal_mask.dtype); legal_mask[:b, :n] = batch.legal_mask
+    return SlotBatch(
+        x=x, dummy_x=dummy_x, partner=partner, filled=filled,
+        src_player=src_player, node_mask=node_mask,
+        stone_mask=stone_mask, legal_mask=legal_mask,
+    )
+
+
+def _write_forward_states_response(
+    stream, logits: Tensor, legal_counts: Tensor, values: Tensor,
+    legal_hashes: "list[int]",
+) -> None:
+    """Write a MSG_FORWARD_STATES OK response.
+
+    Layout (little-endian)::
+
+        u32 magic | u8 version | u8 msg_type = MSG_FORWARD_STATES (0x03)
+        u8  status = STATES_STATUS_OK (0)
+        u32 total_legal
+        u32 num_graphs
+        f32[total_legal]  logits        (same layout as _write_forward_response)
+        i32[num_graphs]   legal_counts  (same layout as _write_forward_response)
+        f32[num_graphs]   values        (same layout as _write_forward_response)
+        u64[num_graphs]   legal-coord FNV-1a hashes (order guard; see
+                          _read_forward_states_body for the hash input layout)
+    """
+    total_legal = logits.shape[0]
+    num_graphs = values.shape[0]
+    if len(legal_hashes) != num_graphs:
+        raise RuntimeError(
+            f"_write_forward_states_response: legal_hashes length "
+            f"{len(legal_hashes)} != num_graphs {num_graphs} (per-graph order "
+            f"guard would be misaligned)"
+        )
+
+    buf = bytearray()
+    buf.extend(struct.pack(HEADER_FMT, MAGIC, VERSION, MSG_FORWARD_STATES))
+    buf.append(STATES_STATUS_OK)
+    buf.extend(struct.pack("<II", total_legal, num_graphs))
+    buf.extend(logits.cpu().float().numpy().tobytes())
+    buf.extend(legal_counts.cpu().int().numpy().tobytes())
+    buf.extend(values.cpu().float().numpy().tobytes())
+    buf.extend(struct.pack(f"<{num_graphs}Q", *legal_hashes))
+    stream.write(bytes(buf))
+    stream.flush()
+
+
+def _write_states_error(stream, message: str) -> None:
+    """Write a MSG_FORWARD_STATES in-band ERROR response.
+
+    Layout (little-endian)::
+
+        u32 magic | u8 version | u8 msg_type = MSG_FORWARD_STATES (0x03)
+        u8  status = STATES_STATUS_ERROR (1)
+        u32 msg_len
+        u8[msg_len] utf-8 error message
+    """
+    msg = message.encode("utf-8")
+    buf = bytearray()
+    buf.extend(struct.pack(HEADER_FMT, MAGIC, VERSION, MSG_FORWARD_STATES))
+    buf.append(STATES_STATUS_ERROR)
+    buf.extend(struct.pack("<I", len(msg)))
+    buf.extend(msg)
+    stream.write(bytes(buf))
+    stream.flush()
+
+
+def _write_states_probe_ack(stream) -> None:
+    """Write the dedicated capability-probe ACK for a zero-graph request.
+
+    Layout (little-endian)::
+
+        u32 magic | u8 version | u8 msg_type = MSG_FORWARD_STATES (0x03)
+        u8  status = STATES_STATUS_PROBE_ACK (2)
+    """
+    buf = bytearray()
+    buf.extend(struct.pack(HEADER_FMT, MAGIC, VERSION, MSG_FORWARD_STATES))
+    buf.append(STATES_STATUS_PROBE_ACK)
+    stream.write(bytes(buf))
+    stream.flush()
 
 
 # Static buckets ported verbatim from hexo-rs/hexo-mcts/src/inference.rs as a
@@ -640,6 +1387,47 @@ def _forward_and_dispatch(
     )
 
 
+def _forward_and_dispatch_states(
+    tensors: tuple, model: torch.nn.Module,
+    transfer_stream: "torch.cuda.Stream | None",
+    writer_queue: "queue.Queue",
+    real_num_graphs: int,
+    legal_hashes: "list[int]",
+) -> tuple[float, float, float]:
+    """States-mode mirror of ``_forward_and_dispatch`` (which stays untouched
+    for the live graph path): identical forward/ghost-slice logic, but the
+    writer item carries the per-graph legal-coord hashes and is written as a
+    MSG_FORWARD_STATES-typed response by the writer thread.
+    """
+    on_cuda = transfer_stream is not None
+
+    t_sync_start = _time.perf_counter()
+    if on_cuda:
+        torch.cuda.current_stream().wait_stream(transfer_stream)
+    t_sync_end = _time.perf_counter()
+
+    with torch.no_grad():
+        all_logits, legal_counts, values = model(*tensors)
+
+    if legal_counts.shape[0] != real_num_graphs:
+        legal_counts = legal_counts[:real_num_graphs]
+        values = values[:real_num_graphs]
+
+    event = torch.cuda.Event() if on_cuda else None
+    if event is not None:
+        event.record()
+    t_launch_end = _time.perf_counter()
+
+    writer_queue.put(
+        ("forward_states", event, all_logits, legal_counts, values, legal_hashes)
+    )
+    t_dispatch_end = _time.perf_counter()
+
+    return (
+        (t_sync_end - t_sync_start) * 1000.0,
+        (t_launch_end - t_sync_end) * 1000.0,
+        (t_dispatch_end - t_launch_end) * 1000.0,
+    )
 
 
 def main() -> None:
@@ -784,6 +1572,32 @@ def main() -> None:
              "overflow rate exceeds --bucket-relock-threshold, so under-sizing "
              "is self-correcting. Use 1 in tests.",
     )
+    # --- --slot-inference: A2 slot backend for MSG_FORWARD_STATES ---
+    parser.add_argument(
+        "--slot-inference", action="store_true",
+        help="Serve MSG_FORWARD_STATES via the A2 slot model (batched "
+             "on-device slot build from the wire's int32 HexKeys + "
+             "SlotHeXONet.forward_padded) instead of the legacy graph "
+             "rebuild. MSG_FORWARD (graph mode) always stays on the legacy "
+             "model. Legacy GINE checkpoints only — unsupported architectures "
+             "(axis_relational, gatv2, lstm-JK, moves_scope='graph') fail at "
+             "startup. Requires --win-length.",
+    )
+    parser.add_argument(
+        "--win-length", type=int, default=None,
+        help="Game win_length (only with --slot-inference): fixes the slot "
+             "model's edge-table size 6*(win_length-1); cross-checked against "
+             "every states request.",
+    )
+    parser.add_argument(
+        "--slot-activation-budget-mb", type=float, default=4096.0,
+        help="A2 memory guard (only with --slot-inference): cap in MiB on the "
+             "estimated dense [B, N, slots, hidden] message-passing activation "
+             "of one states request (bf16 on CUDA / f32 on CPU, padded to the "
+             "pow2 [B, N] the forward allocates, from an exact server-computed "
+             "node count — never any allocation). Over-budget requests get an "
+             "in-band ERROR instead of an OOM.",
+    )
     parser.add_argument(
         "--bucket-relock-threshold", type=float, default=0.10,
         help="Adaptive bucketizer: fraction of post-lock batches that must "
@@ -792,6 +1606,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.slot_inference and (args.win_length is None or args.win_length < 2):
+        parser.error("--slot-inference requires --win-length >= 2")
+
     device = torch.device(args.device)
 
     # Load model
@@ -799,6 +1616,24 @@ def main() -> None:
 
     # Warmup
     _warmup(model, device, args.graph_type, args.node_dim)
+
+    # --slot-inference: also build the A2 slot model from the same checkpoint.
+    # Unsupported architectures are a clear STARTUP failure (exit code 2),
+    # never a mid-request one. (_load_model above already merged the
+    # checkpoint's embedded model_config into args.)
+    slot_model = None
+    if args.slot_inference:
+        try:
+            slot_model = _load_slot_model(args, device)
+            _warmup_slot(slot_model, args, device)
+        except Exception as e:
+            # ANY startup failure (unsupported arch ValueError, a bf16/dtype
+            # RuntimeError in the warmup forward, a torch.compile trace error,
+            # ...) must produce the clean FATAL line + exit(2), never a raw
+            # traceback that the supervisor can't distinguish from a crash.
+            sys.stderr.write(f"FATAL: --slot-inference startup check failed: {e}\n")
+            sys.stderr.flush()
+            sys.exit(2)
 
     # Redirect text-mode stdout to stderr so that any stray print(),
     # library warning, or unhandled traceback goes to the log pipe
@@ -848,6 +1683,23 @@ def main() -> None:
                     writer_perf["total_ms"] += (t_done - t0) * 1000.0
             elif kind == "reload_ack":
                 _write_reload_ack(stdout, success=item[1])
+            elif kind == "forward_states":
+                _, event, logits, legal_counts, values, hashes = item
+                if event is not None:
+                    event.synchronize()
+                t_synced = _time.perf_counter()
+                _write_forward_states_response(
+                    stdout, logits, legal_counts, values, hashes
+                )
+                t_done = _time.perf_counter()
+                with writer_perf_lock:
+                    writer_perf["count"] += 1
+                    writer_perf["wait_ms"] += (t_synced - t0) * 1000.0
+                    writer_perf["total_ms"] += (t_done - t0) * 1000.0
+            elif kind == "states_error":
+                _write_states_error(stdout, item[1])
+            elif kind == "states_probe":
+                _write_states_probe_ack(stdout)
             else:
                 sys.stderr.write(f"Unknown writer queue item: {kind!r}\n")
 
@@ -881,6 +1733,59 @@ def main() -> None:
                     request_queue.put(None)
                     return
                 request_queue.put(("forward", body))
+            elif msg_type == MSG_FORWARD_STATES and args.slot_inference:
+                # Slot backend: framing + validation only here (cheap); the
+                # on-device slot build + forward run in the main loop.
+                try:
+                    frame = _states_request_frame(stdin)
+                except EOFError:
+                    request_queue.put(None)
+                    return
+                if frame[0] == 0:  # zero-graph capability probe
+                    request_queue.put(("states_probe",))
+                else:
+                    # Activation dtype size (bf16=2 on CUDA, f32=4 on CPU) read
+                    # straight from the live slot model's parameters so the
+                    # budget estimate matches the tensors forward_padded builds.
+                    bpe = next(slot_model.parameters()).element_size()
+                    try:
+                        payload = _validate_states_slot(
+                            frame, args, bytes_per_elem=bpe
+                        )
+                    except StatesRequestError as e:
+                        sys.stderr.write(f"states request error: {e}\n")
+                        sys.stderr.flush()
+                        request_queue.put(("states_error", str(e)))
+                    else:
+                        request_queue.put(("forward_states_slot", payload))
+            elif msg_type == MSG_FORWARD_STATES:
+                # Rebuild runs HERE on the reader thread so it overlaps GPU
+                # compute exactly like graph-mode body reads + H2D staging.
+                try:
+                    parsed = _read_forward_states_body(
+                        stdin, args.node_dim,
+                        prune_empty_edges=bool(getattr(args, "prune_empty_edges", False)),
+                        threat_features=bool(getattr(args, "threat_features", False)),
+                        relative_stones=bool(getattr(args, "relative_stone_encoding", False)),
+                    )
+                except StatesRequestError as e:
+                    # Body fully consumed — framing intact. Reply in-band and
+                    # keep serving; the CLIENT hard-fails on the error.
+                    sys.stderr.write(f"states request error: {e}\n")
+                    sys.stderr.flush()
+                    request_queue.put(("states_error", str(e)))
+                except EOFError:
+                    request_queue.put(None)
+                    return
+                else:
+                    if parsed is None:
+                        request_queue.put(("states_probe",))
+                    else:
+                        states_body, states_hashes = parsed
+                        # Private key: _prepare_tensors ignores it; the main
+                        # loop uses it to pick the states-typed response.
+                        states_body["_states_hashes"] = states_hashes
+                        request_queue.put(("forward_states", states_body))
             elif msg_type == MSG_RELOAD:
                 path_len = struct.unpack("<I", _read_exact(stdin, 4))[0]
                 path_bytes = _read_exact(stdin, path_len)
@@ -954,17 +1859,110 @@ def main() -> None:
         node_bucketizer = None
         edge_bucketizer = None
 
+    # Attributes _load_model mutates in place on `args` (checkpoint path + the
+    # schema flags it merges from the new checkpoint's embedded model_config).
+    # A NACKed reload must leave `args` consistent with the STILL-LIVE models,
+    # so we snapshot and restore them if the rebuild fails partway.
+    _RELOAD_MUTATED_ATTRS = (
+        "checkpoint", "axis_relational", "axis_window", "compact_stone_onehot",
+        "node_coords", "moves_scope", "relative_stone_encoding",
+        "threat_features", "value_bins", "value_bin_min", "value_bin_max",
+        "prune_empty_edges",
+    )
+
     def _handle_reload(path: str) -> None:
-        nonlocal model
+        nonlocal model, slot_model
+        _sentinel = object()
+        saved = {k: getattr(args, k, _sentinel) for k in _RELOAD_MUTATED_ATTRS}
         try:
             args.checkpoint = path
-            model = _load_model(args)
-            _warmup(model, device, args.graph_type, args.node_dim)
+            new_model = _load_model(args)
+            _warmup(new_model, device, args.graph_type, args.node_dim)
+            new_slot = None
+            if args.slot_inference:
+                new_slot = _load_slot_model(args, device)
+                _warmup_slot(new_slot, args, device)
+            model = new_model
+            slot_model = new_slot if args.slot_inference else slot_model
             print(f"Model reloaded from {path}", file=sys.stderr, flush=True)
             writer_queue.put(("reload_ack", True))
         except Exception as e:
+            # Roll back every args mutation so the flags the live models rely on
+            # (builder-flag cross-check, node dim, slot schema) stay consistent.
+            for k, v in saved.items():
+                if v is _sentinel:
+                    if hasattr(args, k):
+                        delattr(args, k)
+                else:
+                    setattr(args, k, v)
             print(f"Reload failed: {e}", file=sys.stderr, flush=True)
             writer_queue.put(("reload_ack", False))
+
+    def _handle_states_slot(payload: tuple) -> None:
+        """Slot-backend states request (--slot-inference): keys -> on-device
+        slot batch -> forward_padded -> per-graph legal-order response.
+
+        Every failure past the reader's validation is still in-band: the
+        server replies STATES_STATUS_ERROR and keeps serving. The [B, N]
+        padded logits are flattened with ``logits[legal_mask]`` — row-major,
+        so per graph in the batch's legal-column order, which is ascending
+        HexKey == (q, r)-lexicographic == ``legal_moves()`` order; the FNV
+        hashes are recomputed from that same ordering (SlotBatchAux) so the
+        client-side order guard stays honest.
+        """
+        from hexo_a0.slot_graph import build_slot_batch_from_keys
+
+        win_length, placement_radius, graphs = payload
+        try:
+            builder_config = _slot_builder_config(args, win_length, placement_radius)
+            states = [(p1, p2, cur, mr) for (p1, p2, cur, mr, _nl) in graphs]
+            batch, aux = build_slot_batch_from_keys(
+                states, builder_config, device=device, return_aux=True
+            )
+            rebuilt_counts = aux.legal_counts.cpu().tolist()
+            for i, (_p1, _p2, _c, _m, num_legal) in enumerate(graphs):
+                if rebuilt_counts[i] != num_legal:
+                    raise StatesRequestError(
+                        f"graph {i}: wire num_legal {num_legal} != rebuilt "
+                        f"legal count {rebuilt_counts[i]} (client/server "
+                        f"builder divergence)"
+                    )
+            # Bucket B and N to powers of two so compile(dynamic=False) sees a
+            # small fixed set of forward_padded shapes. aux (legal ordering,
+            # counts) comes from the UNPADDED build, so the response contract is
+            # unaffected; ghost graphs/nodes are inert (masks False) and their
+            # values are sliced off below.
+            real_b = batch.num_graphs
+            bucket_b = _round_pow2(real_b)
+            bucket_n = _round_pow2(batch.node_mask.shape[1], floor=8)
+            batch = _pad_slot_batch(batch, bucket_b, bucket_n)
+            if device.type == "cuda":
+                batch.x = batch.x.to(torch.bfloat16)
+                batch.dummy_x = batch.dummy_x.to(torch.bfloat16)
+
+            with torch.no_grad():
+                logits, values = slot_model.forward_padded(batch)
+            flat_logits = logits[batch.legal_mask]  # per-graph legal order
+            values = values[:real_b]  # drop ghost-graph values
+            legal_counts = aux.legal_counts.to(torch.int32)
+            hashes = _slot_legal_hashes(aux)
+
+            event = torch.cuda.Event() if device.type == "cuda" else None
+            if event is not None:
+                event.record()
+            writer_queue.put(
+                ("forward_states", event, flat_logits, legal_counts, values, hashes)
+            )
+        except StatesRequestError as e:
+            sys.stderr.write(f"states request error: {e}\n")
+            sys.stderr.flush()
+            writer_queue.put(("states_error", str(e)))
+        except Exception as e:
+            # Builder/forward machinery failure: framing is intact (the body
+            # was consumed by the reader), so reply in-band and keep serving.
+            sys.stderr.write(f"states request error: slot forward failed: {e}\n")
+            sys.stderr.flush()
+            writer_queue.put(("states_error", f"slot forward failed: {e}"))
 
     def _next_forward_body():
         """Block until we get a forward request, handling reloads inline."""
@@ -975,7 +1973,21 @@ def main() -> None:
             if item[0] == "reload":
                 _handle_reload(item[1])
                 continue
-            return item[1]  # forward body
+            if item[0] == "states_error":
+                # In-band error for a MSG_FORWARD_STATES request; routed
+                # through the request queue so response order is preserved.
+                writer_queue.put(("states_error", item[1]))
+                continue
+            if item[0] == "states_probe":
+                writer_queue.put(("states_probe",))
+                continue
+            if item[0] == "forward_states_slot":
+                # Slot backend (--slot-inference): handled inline, in request
+                # order, outside the legacy double-buffered prepare path
+                # (_prepare_tensors never sees these).
+                _handle_states_slot(item[1])
+                continue
+            return item[1]  # forward body (graph-mode or rebuilt states-mode)
 
     # State for double-buffering: when not None, tensors for the next
     # batch have already been prepared on the transfer stream.
@@ -1016,9 +2028,18 @@ def main() -> None:
 
         # Launch forward on the default stream and hand the outputs off
         # to the writer thread (which event-waits + writes to stdout).
-        sync_ms, fwd_ms, write_ms = _forward_and_dispatch(
-            tensors, model, transfer_stream, writer_queue, real_n,
-        )
+        # States-mode bodies carry the per-graph legal-coord hashes and get
+        # the MSG_FORWARD_STATES-typed response; graph mode is unchanged.
+        states_hashes = body.get("_states_hashes")
+        if states_hashes is None:
+            sync_ms, fwd_ms, write_ms = _forward_and_dispatch(
+                tensors, model, transfer_stream, writer_queue, real_n,
+            )
+        else:
+            sync_ms, fwd_ms, write_ms = _forward_and_dispatch_states(
+                tensors, model, transfer_stream, writer_queue, real_n,
+                states_hashes,
+            )
 
         # Drop our local refs; the writer thread holds its own refs until
         # it's done with these tensors.

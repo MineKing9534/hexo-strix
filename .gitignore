@@ -29,6 +29,11 @@ docs/research/*
 !docs/research/2026-07-14-solver-zobrist-collision-and-wl4-guard.md
 *.pt             # model checkpoints
 *.bin
+# ...EXCEPT the committed A3 wire-states golden fixtures (cross-language pin;
+# whitelist cascade like docs/ above). Without this negation `*.bin` swallows
+# them, the golden pin never lands in VCS, and the fixture tests would only
+# ever compare a file against itself. See hexo-a0/tests/test_wire_states_fixture.py.
+!hexo-a0/tests/fixtures/*.bin
 *.tfevents.*
 benchmark.txt
 trajectories.json

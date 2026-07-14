@@ -1,8 +1,8 @@
 import json
 
-p = 'runs/gine-mini/4l-128p32v-jkcat-rel2/s4-6-8/sprt_state.json'
+p = 'runs/gine-mini/4l-128p32v-lean-d6-qhead/s3-6-6/sprt_state.json'
 d = json.load(open(p)); s = d['state']; o = s['outcomes']
-KEEP = 3000
+KEEP = len(o) // 2
 drop = len(o) - KEEP; drop -= drop % 2      # drop an even count from the FRONT
 o = o[drop:]                                 # keeps (P1,P2) pair phase aligned
 sc = {'W': 1.0, 'D': 0.5, 'L': 0.0}

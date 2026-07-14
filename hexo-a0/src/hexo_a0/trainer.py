@@ -842,9 +842,11 @@ def _compute_horizon_targets(
 ) -> list[list[float]]:
     """Short-horizon value targets for one game's positions, in play order.
 
-    For the position at index ``i`` in a game of ``n`` recorded positions,
-    ``plies_to_end = n - 1 - i`` is its distance (in placements) to the final
-    recorded position. The horizon-``k`` target is the position's OWN
+    Positions are recorded immediately before each played move, including the
+    final move that makes the game terminal. For the position at index ``i`` in
+    a game of ``n`` recorded positions, ``plies_to_end = n - i`` is therefore
+    its distance (in placements) to termination. The horizon-``k`` target is
+    the position's OWN
     side-to-move outcome ``values[i]`` when the game resolves within the
     horizon (``plies_to_end <= k``), else ``0.0`` (neutral — not yet decided
     within ``k``). This is the dense "about to resolve, and how" signal the
@@ -861,9 +863,79 @@ def _compute_horizon_targets(
         return [[] for _ in range(n)]
     out: list[list[float]] = []
     for i in range(n):
-        plies_to_end = n - 1 - i
+        plies_to_end = n - i
         out.append([values[i] if plies_to_end <= k else 0.0 for k in horizons])
     return out
+
+
+def _microbatch_population_scales(
+    micro_batches: list[list[tuple]],
+) -> tuple[list[float], list[float], list[float]]:
+    """Return full-batch-equivalent scales for accumulated micro-batches.
+
+    ``_forward_and_loss`` contains objectives with different populations:
+
+    * policy/value/horizon are means over examples, weighted by sample_weight;
+    * Q is a mean over *visited legal moves*, also weighted by sample_weight;
+    * Q coverage is a mean over all legal moves.
+
+    Averaging every micro-batch equally changes those objectives whenever the
+    edge budget produces unequal micro-batches. These scales make the sum of
+    independently-normalised micro-batch losses/diagnostics equal the result
+    from one unsplit batch. A population absent from the whole batch falls back
+    to the example scales; its corresponding loss is inactive/zero anyway.
+    """
+
+    if not micro_batches:
+        return [], [], []
+
+    example_mass: list[float] = []
+    q_visited_mass: list[float] = []
+    q_legal_mass: list[float] = []
+    for mb in micro_batches:
+        ex_mass = 0.0
+        visited_mass = 0.0
+        legal_mass = 0.0
+        for ex in mb:
+            sw = float(ex[5]) if len(ex) >= 6 else 1.0
+            sw = max(sw, 0.0)
+            ex_mass += sw
+
+            n_legal = int(ex[1].shape[0])
+            legal_mass += sw * n_legal
+
+            q_visits = ex[8] if len(ex) >= 9 else None
+            if q_visits is not None:
+                visited_mass += sw * sum(float(v) > 0.0 for v in q_visits)
+
+        example_mass.append(ex_mass)
+        q_visited_mass.append(visited_mass)
+        q_legal_mass.append(legal_mass)
+
+    def _normalise(mass: list[float], fallback: list[float] | None = None) -> list[float]:
+        total = sum(mass)
+        if total > 0.0:
+            return [m / total for m in mass]
+        if fallback is not None:
+            return fallback.copy()
+        # Degenerate all-zero sample weights: preserve a finite, uniform
+        # accumulation rather than dividing by zero.
+        return [1.0 / len(mass)] * len(mass)
+
+    example_scales = _normalise(example_mass)
+    return (
+        example_scales,
+        _normalise(q_visited_mass, example_scales),
+        _normalise(q_legal_mass, example_scales),
+    )
+
+
+def _next_self_play_restart_backoff(previous: float, uptime: float) -> float:
+    """Exponential restart delay, reset after two healthy minutes."""
+
+    if uptime > 120.0:
+        previous = 0.0
+    return min(max(previous * 2.0, 5.0), 60.0)
 
 
 def _forward_and_loss(
@@ -872,6 +944,7 @@ def _forward_and_loss(
     device: torch.device,
     use_fp16: bool = False,
     loss_scale: float = 1.0,
+    q_loss_scale: float | None = None,
     pc_loss_weight: float = 0.0,
     horizon_loss_weight: float = 0.0,
     q_loss_weight: float = 0.0,
@@ -883,8 +956,11 @@ def _forward_and_loss(
     optimizer.step() after the last.
 
     Args:
-        loss_scale: Multiply loss by this before backward (1/N for N
-                    gradient-accumulation micro-batches).
+        loss_scale: Scale the per-example policy/value/horizon objectives before
+                    backward. For accumulation this is the micro-batch's share
+                    of the full batch's sample-weight mass.
+        q_loss_scale: Scale the per-visited-move Q objective before backward.
+                      Defaults to ``loss_scale`` outside accumulation.
         pc_loss_weight: Weight for path consistency loss (0 = disabled).
 
     Returns:
@@ -1083,6 +1159,11 @@ def _forward_and_loss(
 
         total_loss = mean_policy + mean_value
 
+    # The backward objective is assembled separately from ``total_loss`` so
+    # gradient accumulation can scale example-normalised and visited-move-
+    # normalised components by their own full-batch population shares.
+    backward_loss = total_loss * loss_scale
+
     # Distributional value-head diagnostics (train-only, no gradient): mean
     # predicted bin-distribution entropy (confidence — high early, drops as
     # the head commits) and the sign-agreement rate with the outcome over
@@ -1138,6 +1219,7 @@ def _forward_and_loss(
             per_j_cov[j] = ((nonneutral[:, j] * sw).sum() / sw_sum).detach()
         hz_loss = hz_loss / n_h
         total_loss = total_loss + horizon_loss_weight * hz_loss
+        backward_loss = backward_loss + horizon_loss_weight * hz_loss * loss_scale
         horizon_loss_val = hz_loss.detach()
         per_horizon_loss_t = per_j_loss
         per_horizon_cov_t = per_j_cov
@@ -1187,6 +1269,8 @@ def _forward_and_loss(
         q_sq = (q_pred - q_tgt).pow(2) * weighted_mask
         q_loss = q_sq.sum() / wm_sum
         total_loss = total_loss + q_loss_weight * q_loss
+        effective_q_scale = loss_scale if q_loss_scale is None else q_loss_scale
+        backward_loss = backward_loss + q_loss_weight * q_loss * effective_q_scale
         q_loss_val = q_loss.detach()
         q_mae_val = ((q_pred - q_tgt).abs() * weighted_mask).sum().detach() / wm_sum
         q_coverage_val = (weighted_mask.sum().detach()
@@ -1255,12 +1339,16 @@ def _forward_and_loss(
         if pc_losses:
             pc_loss = torch.stack(pc_losses).mean()
             total_loss = total_loss + pc_loss_weight * pc_loss
+            # PCZero is disabled in current production configs. Until its
+            # trajectory population is carried across edge-split batches, use
+            # the per-example mass (strictly better than equal micro means).
+            backward_loss = backward_loss + pc_loss_weight * pc_loss * loss_scale
             pc_loss_val = pc_loss.detach()
 
     # NB: NaN/Inf guard moved to caller (single .item() sync per step).
     # Calling backward() on a NaN loss is harmless as long as the caller
     # then skips optimizer.step() and zeros the grads.
-    (total_loss * loss_scale).backward()
+    backward_loss.backward()
 
     # Staleness instrumentation: stratify per-graph policy KL by sample age.
     # When ages are present, return per-quartile sums and counts so the
@@ -1634,6 +1722,13 @@ class Trainer:
         from concurrent.futures import ThreadPoolExecutor
 
         self._sp_stop = threading.Event()
+        # Set while the producer is down. The optimizer checks this before
+        # every step and waits until a restarted producer has ingested fresh
+        # games, preventing silent training on a frozen replay buffer.
+        self._sp_recovering = threading.Event()
+        self._sp_restart_backoff_s = 0.0
+        self._sp_restart_count = 0
+        self._sp_last_ingest_t = time.time()
         self._sp_games = 0
         # Per-game training-example counts (number of full-search positions
         # written per game). With playout cap randomization this differs
@@ -1652,6 +1747,86 @@ class Trainer:
         self._sp_lock = threading.Lock()
         self._sp_pool = ThreadPoolExecutor(max_workers=1)
         self._sp_pool.submit(self._rust_self_play_worker, rust_binary)
+
+    def _launch_rust_self_play_process(
+        self,
+        cmd: list[str],
+        env: dict[str, str],
+        *,
+        actor_host: bool,
+        log_path: Path,
+        append: bool,
+    ) -> None:
+        """Launch (or relaunch) Rust self-play with correct log routing."""
+
+        old_log = getattr(self, "_sp_stderr_file", None)
+        if old_log is not None:
+            try:
+                old_log.close()
+            except Exception:
+                pass
+
+        log_fh = open(log_path, "a" if append else "w")
+        stdout = log_fh if actor_host else subprocess.DEVNULL
+        stderr = subprocess.STDOUT if actor_host else log_fh
+        try:
+            process = subprocess.Popen(
+                cmd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        except Exception:
+            log_fh.close()
+            raise
+
+        self._sp_stderr_file = log_fh
+        self._sp_process = process
+        self._sp_launch_t = time.time()
+
+    def _wait_for_self_play_recovery(self) -> bool:
+        """Pause optimizer progress until restarted self-play yields fresh data."""
+
+        recovering = getattr(self, "_sp_recovering", None)
+        if recovering is None or not recovering.is_set():
+            return False
+
+        logger.warning(
+            "Self-play producer is recovering; pausing optimizer steps until "
+            "fresh games are ingested"
+        )
+        last_status = time.time()
+        while recovering.is_set():
+            stop = getattr(self, "_sp_stop", None)
+            if stop is not None and stop.wait(0.5):
+                raise RuntimeError(
+                    "Self-play stopped while trainer was waiting for producer recovery"
+                )
+            if time.time() - last_status >= 60.0:
+                logger.warning(
+                    "Still waiting for fresh self-play data after producer restart attempts"
+                )
+                last_status = time.time()
+
+        logger.info("Fresh self-play data available; resuming optimizer steps")
+        return True
+
+    def _confirm_self_play_recovery(self, n_examples: int, n_games: int) -> None:
+        """Unblock training after a relaunched producer writes valid games."""
+
+        recovering = getattr(self, "_sp_recovering", None)
+        if n_examples <= 0 or recovering is None or not recovering.is_set():
+            return
+        # Reset the retry curve only after the relaunched producer proves it
+        # can write valid, ingestible games.
+        self._sp_restart_backoff_s = 0.0
+        recovering.clear()
+        logger.info(
+            "Self-play recovery confirmed: ingested %d fresh examples from %d games",
+            n_examples,
+            n_games,
+        )
 
     def _find_self_play_binary(self) -> str | None:
         """Find the compiled self_play binary."""
@@ -2001,11 +2176,44 @@ class Trainer:
             self._sp_stop.wait(backoff)
 
     def _rust_self_play_worker(self, binary_path: str) -> None:
-        """Background worker: run Rust self-play binary, read trajectories."""
-        try:
-            self._rust_self_play_worker_inner(binary_path)
-        except Exception:
-            logger.exception("Self-play worker crashed")
+        """Supervise Rust self-play and its trajectory-ingestion loop."""
+
+        while not self._sp_stop.is_set():
+            try:
+                self._rust_self_play_worker_inner(binary_path)
+            except Exception:
+                logger.exception("Self-play supervision worker crashed")
+
+            if self._sp_stop.is_set():
+                break
+
+            # An unexpected return/exception must fail closed just like a Rust
+            # child exit. Stop any orphaned child, pause training, and rebuild
+            # the whole command/watcher state with capped retry backoff.
+            self._sp_recovering.set()
+            process = getattr(self, "_sp_process", None)
+            if process is not None and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                except OSError:
+                    pass
+
+            uptime = time.time() - getattr(self, "_sp_launch_t", 0.0)
+            backoff = _next_self_play_restart_backoff(
+                getattr(self, "_sp_restart_backoff_s", 0.0), uptime
+            )
+            self._sp_restart_backoff_s = backoff
+            self._sp_restart_count += 1
+            logger.error(
+                "Self-play supervisor stopped unexpectedly; full restart #%d in %.0fs",
+                self._sp_restart_count,
+                backoff,
+            )
+            if self._sp_stop.wait(backoff):
+                break
 
     def _rust_self_play_worker_inner(self, binary_path: str) -> None:
         import json
@@ -2269,30 +2477,22 @@ class Trainer:
 
         # Launch the binary — stderr goes to a log file to avoid pipe buffer deadlock
         sp_stderr_path = sp_dir / "self_play.log"
-        self._sp_stderr_file = open(sp_stderr_path, "w")
         # stdin=DEVNULL matters in actor mode: the command is `ssh -tt …`, and an
         # ssh with a controlling tty on its stdin would put THIS terminal into raw
         # mode (dropping ONLCR), cascade-indenting the trainer/SPRT status lines.
         # Detaching stdin keeps ssh off the local terminal while -tt still allocates
         # the REMOTE pty for SIGHUP-on-disconnect cleanup.
         #
-        # Output routing differs by mode. The pty that -tt allocates has NO separate
-        # stderr channel, so ssh sends the remote process's COMBINED stdout+stderr
-        # back on the local ssh's *stdout*. So in actor mode the log must capture
-        # stdout (else self_play.log stays blank); locally only the binary's stderr
-        # carries the [perf] log (its stdout is unused — games are written to files).
-        if actor.host:
-            sp_stdout = self._sp_stderr_file
-            sp_stderr = subprocess.STDOUT
-        else:
-            sp_stdout = subprocess.DEVNULL
-            sp_stderr = self._sp_stderr_file
-        self._sp_process = subprocess.Popen(
-            cmd, env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=sp_stdout, stderr=sp_stderr,
+        # In actor mode the remote pty merges stdout/stderr, so capture stdout;
+        # locally only stderr carries logs. The helper preserves this routing on
+        # automatic restarts too.
+        self._launch_rust_self_play_process(
+            cmd,
+            env,
+            actor_host=bool(actor.host),
+            log_path=sp_stderr_path,
+            append=False,
         )
-        self._sp_launch_t = time.time()
 
         # Tail all game files in batches dir and ingest games as they appear.
         # Supports .msgpack (length-prefixed binary) and .jsonl (text) files.
@@ -2326,44 +2526,52 @@ class Trainer:
                     tail = (sp_dir / "self_play.log").read_text()[-400:]
                 except Exception:
                     tail = ""
-                if actor.host and not self._sp_stop.is_set():
-                    # Remote actor died — almost always a transient bazzite/Tailscale
-                    # drop (ssh exits 255), NOT a real crash. Auto-restart with capped
-                    # backoff so the run self-heals instead of silently starving the
-                    # buffer (reuse -> 0). Reset backoff if it had been healthy a while.
-                    if time.time() - getattr(self, "_sp_launch_t", 0) > 120:
-                        self._actor_backoff_s = 0
-                    backoff = min(max(getattr(self, "_actor_backoff_s", 0) * 2, 5), 60)
-                    self._actor_backoff_s = backoff
-                    logger.warning(
-                        "Remote self-play (actor %s) exited code %d; restarting in %ds. Tail: %s",
-                        actor.host, rc, backoff, tail or "(no output)",
-                    )
-                    if self._sp_stop.wait(backoff):
-                        break
-                    try:
-                        self._actor_push_model(actor, sp_dir)
-                        try:
-                            self._sp_stderr_file.close()
-                        except Exception:
-                            pass
-                        self._sp_stderr_file = open(sp_dir / "self_play.log", "a")
-                        self._sp_process = subprocess.Popen(
-                            cmd, env=env, stdin=subprocess.DEVNULL,
-                            stdout=self._sp_stderr_file, stderr=subprocess.STDOUT,
-                        )
-                        self._sp_launch_t = time.time()
-                        logger.info("Remote self-play restarted on %s", actor.host)
-                    except Exception as e:
-                        logger.warning("Remote self-play restart failed (%s); will retry", e)
-                    continue
-                # Local mode, or shutting down: terminal.
+                if self._sp_stop.is_set():
+                    break
+
+                # Both local and remote producers are supervised. Mark the
+                # producer unavailable before waiting/relaunching so the main
+                # training loop stops taking optimizer steps immediately.
+                self._sp_recovering.set()
+                uptime = time.time() - getattr(self, "_sp_launch_t", 0.0)
+                backoff = _next_self_play_restart_backoff(
+                    getattr(self, "_sp_restart_backoff_s", 0.0), uptime
+                )
+                self._sp_restart_backoff_s = backoff
+                self._sp_restart_count += 1
+                location = f"remote actor {actor.host}" if actor.host else "local"
+                logger.error(
+                    "Rust self-play (%s) exited code %d; restart #%d in %.0fs. Tail: %s",
+                    location,
+                    rc,
+                    self._sp_restart_count,
+                    backoff,
+                    tail or "(no output)",
+                )
+                if self._sp_stop.wait(backoff):
+                    break
+
                 try:
-                    self._sp_stderr_file.close()
-                except Exception:
-                    pass
-                logger.error("Rust self-play process exited with code %d: %s", rc, tail or "(no output)")
-                break
+                    if actor.host:
+                        self._actor_push_model(actor, sp_dir)
+                    if self._sp_stop.is_set():
+                        break
+                    self._launch_rust_self_play_process(
+                        cmd,
+                        env,
+                        actor_host=bool(actor.host),
+                        log_path=sp_stderr_path,
+                        append=True,
+                    )
+                    logger.info("Rust self-play restarted (%s)", location)
+                except Exception as e:
+                    # Leave the dead process object in place; the next loop
+                    # iteration observes it as exited and retries with a larger
+                    # capped backoff. Training remains paused throughout.
+                    logger.warning(
+                        "Rust self-play restart failed (%s); will retry", e
+                    )
+                continue
 
             # Discover new files (.bin or .jsonl)
             for pattern in ("*.bin", "*.jsonl"):
@@ -2411,6 +2619,7 @@ class Trainer:
                     examples = self._trajectories_to_examples(batch)
                     entropies, top1s, values = _example_histogram_stats(examples)
                     self.buffer.add_many(examples)
+                    self._sp_last_ingest_t = time.time()
                     with self._sp_lock:
                         self._sp_games += len(batch)
                         self._sp_policy_entropies.extend(entropies)
@@ -2443,6 +2652,7 @@ class Trainer:
                                     ws.get("mass_removed_sum"),
                                     ws.get("acted_deficit_sum"),
                                 )
+                    self._confirm_self_play_recovery(len(examples), len(batch))
             except Exception as e:
                 logger.error("Self-play ingestion error: %s", e, exc_info=True)
 
@@ -3246,9 +3456,14 @@ class Trainer:
                     name="hexo-prefetch",
                     daemon=True,
                 )
-                prefetch_thread.start()
+            prefetch_thread.start()
 
             for step_i in range(steps):
+                # Fail closed when background self-play dies. The worker
+                # automatically restarts the producer; optimization resumes
+                # only after that process has written valid new games.
+                self._wait_for_self_play_recovery()
+
                 # Update display every 5 steps (no TensorBoard writes).
                 # We sync the running tensors here — one sync per 5 steps.
                 if step_i % 5 == 0 and step_i > 0:
@@ -3371,7 +3586,11 @@ class Trainer:
                         micro_batches.append(current_mb)
 
                     if grad_accum:
-                        n_micro = len(micro_batches)
+                        (
+                            example_scales,
+                            q_visited_scales,
+                            q_legal_scales,
+                        ) = _microbatch_population_scales(micro_batches)
                         # GPU-tensor accumulators for the micro-batches.
                         step_total_t = torch.zeros((), device=self.device)
                         step_policy_t = torch.zeros((), device=self.device)
@@ -3389,38 +3608,55 @@ class Trainer:
                         step_q_corr_sums = torch.zeros(6, device=self.device)
                         step_value_entropy_t = torch.zeros((), device=self.device)
                         step_value_sign_acc_t = torch.zeros((), device=self.device)
-                        for mb in micro_batches:
+                        for mb, ex_scale, q_scale, q_legal_scale in zip(
+                            micro_batches,
+                            example_scales,
+                            q_visited_scales,
+                            q_legal_scales,
+                        ):
                             mb_losses = _forward_and_loss(
                                 self.model, mb, self.device, use_fp16,
-                                loss_scale=1.0 / n_micro,
+                                loss_scale=ex_scale,
+                                q_loss_scale=q_scale,
                                 pc_loss_weight=pc_weight,
                                 horizon_loss_weight=horizon_weight,
                                 q_loss_weight=q_weight,
                             )
                             mb_diag = _extract_step_diagnostics(mb_losses, _n_hz, self.device)
-                            step_total_t = step_total_t + mb_losses["total_loss"] / n_micro
-                            step_policy_t = step_policy_t + mb_losses["policy_loss"] / n_micro
-                            step_value_t = step_value_t + mb_losses["value_loss"] / n_micro
-                            step_value_mse_t = step_value_mse_t + mb_losses["value_mse"] / n_micro
-                            step_cross_entropy_t = step_cross_entropy_t + mb_losses["cross_entropy"] / n_micro
-                            step_target_entropy_t = step_target_entropy_t + mb_losses["target_entropy"] / n_micro
+                            # Reconstruct the full-batch objective with the same
+                            # population-specific scales used for backward.
+                            step_total_t = step_total_t + (
+                                (mb_losses["policy_loss"] + mb_losses["value_loss"])
+                                * ex_scale
+                            )
+                            step_policy_t = step_policy_t + mb_losses["policy_loss"] * ex_scale
+                            step_value_t = step_value_t + mb_losses["value_loss"] * ex_scale
+                            step_value_mse_t = step_value_mse_t + mb_losses["value_mse"] * ex_scale
+                            step_cross_entropy_t = step_cross_entropy_t + mb_losses["cross_entropy"] * ex_scale
+                            step_target_entropy_t = step_target_entropy_t + mb_losses["target_entropy"] * ex_scale
                             if torch.is_tensor(mb_losses["horizon_loss"]):
-                                step_horizon_t = step_horizon_t + mb_losses["horizon_loss"] / n_micro
+                                step_horizon_t = step_horizon_t + mb_losses["horizon_loss"] * ex_scale
+                                step_total_t = step_total_t + (
+                                    horizon_weight * mb_losses["horizon_loss"] * ex_scale
+                                )
                             if torch.is_tensor(mb_losses["q_loss"]):
-                                step_q_t = step_q_t + mb_losses["q_loss"] / n_micro
+                                step_q_t = step_q_t + mb_losses["q_loss"] * q_scale
+                                step_total_t = step_total_t + (
+                                    q_weight * mb_losses["q_loss"] * q_scale
+                                )
                             if torch.is_tensor(mb_losses["pc_loss"]):
-                                step_pc_t = step_pc_t + mb_losses["pc_loss"] / n_micro
-                            # Per-head diagnostics: mean-of-means for the loss
-                            # populations (÷n_micro, matching the loss accum
-                            # above); q_corr_sums is a raw population sum (no
-                            # division) so the Pearson r is computed over all
-                            # visited moves in the report block, not per micro.
-                            step_per_horizon_loss_t = step_per_horizon_loss_t + mb_diag["per_horizon_loss"] / n_micro
-                            step_per_horizon_cov_t = step_per_horizon_cov_t + mb_diag["per_horizon_cov"] / n_micro
-                            step_q_mae_t = step_q_mae_t + mb_diag["q_mae"] / n_micro
-                            step_q_coverage_t = step_q_coverage_t + mb_diag["q_coverage"] / n_micro
-                            step_value_entropy_t = step_value_entropy_t + mb_diag["value_entropy"] / n_micro
-                            step_value_sign_acc_t = step_value_sign_acc_t + mb_diag["value_sign_acc"] / n_micro
+                                step_pc_t = step_pc_t + mb_losses["pc_loss"] * ex_scale
+                                step_total_t = step_total_t + (
+                                    pc_weight * mb_losses["pc_loss"] * ex_scale
+                                )
+                            # q_corr_sums is a raw population sum so Pearson r
+                            # is computed over all visited moves, not per micro.
+                            step_per_horizon_loss_t = step_per_horizon_loss_t + mb_diag["per_horizon_loss"] * ex_scale
+                            step_per_horizon_cov_t = step_per_horizon_cov_t + mb_diag["per_horizon_cov"] * ex_scale
+                            step_q_mae_t = step_q_mae_t + mb_diag["q_mae"] * q_scale
+                            step_q_coverage_t = step_q_coverage_t + mb_diag["q_coverage"] * q_legal_scale
+                            step_value_entropy_t = step_value_entropy_t + mb_diag["value_entropy"] * ex_scale
+                            step_value_sign_acc_t = step_value_sign_acc_t + mb_diag["value_sign_acc"] * ex_scale
                             step_q_corr_sums = step_q_corr_sums + mb_diag["q_corr_sums"]
                             if mb_losses.get("staleness_kl_q_sum") is not None:
                                 running_staleness_kl_q_sum = running_staleness_kl_q_sum + mb_losses["staleness_kl_q_sum"]

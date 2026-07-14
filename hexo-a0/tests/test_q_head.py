@@ -153,6 +153,55 @@ class TestTrainerQLoss:
         assert out["q_corr_sums"].shape == (6,)
         assert out["q_corr_sums"][0].item() == 7.0  # 4 + 3 visited moves
 
+    def test_uneven_microbatch_gradients_match_unsplit_batch(self):
+        """Edge-budget accumulation must preserve every loss population."""
+        from hexo_a0.trainer import (
+            _forward_and_loss,
+            _microbatch_population_scales,
+        )
+
+        torch.manual_seed(7)
+        full = HeXONet(_cfg(q_head=True))
+        split = HeXONet(_cfg(q_head=True))
+        split.load_state_dict(full.state_dict())
+
+        examples = [
+            _example9(10, 4, value=1.0, visits=[8, 4, 0, 0]),
+            _example9(9, 3, value=-1.0, visits=[2, 0, 0]),
+            _example9(8, 2, value=1.0, visits=[6, 3]),
+            _example9(12, 5, value=-1.0, visits=[1, 1, 1, 0, 0]),
+        ]
+        # PCR-style weights make both example and visited-Q populations uneven.
+        weights = [1.0, 0.25, 1.0, 0.5]
+        examples = [ex[:5] + (sw,) + ex[6:] for ex, sw in zip(examples, weights)]
+
+        full.zero_grad(set_to_none=True)
+        _forward_and_loss(
+            full, examples, torch.device("cpu"), q_loss_weight=0.5
+        )
+
+        micro_batches = [examples[:3], examples[3:]]
+        ex_scales, q_scales, _ = _microbatch_population_scales(micro_batches)
+        split.zero_grad(set_to_none=True)
+        for mb, ex_scale, q_scale in zip(micro_batches, ex_scales, q_scales):
+            _forward_and_loss(
+                split,
+                mb,
+                torch.device("cpu"),
+                loss_scale=ex_scale,
+                q_loss_scale=q_scale,
+                q_loss_weight=0.5,
+            )
+
+        full_grads = dict(full.named_parameters())
+        for name, param in split.named_parameters():
+            expected = full_grads[name].grad
+            assert expected is not None and param.grad is not None
+            assert torch.allclose(param.grad, expected, atol=2e-5, rtol=2e-5), (
+                f"accumulated gradient mismatch for {name}: "
+                f"max diff={(param.grad - expected).abs().max().item():.3g}"
+            )
+
     def test_q_coverage_reflects_unvisited_moves(self):
         from hexo_a0.trainer import _forward_and_loss
         net = HeXONet(_cfg(q_head=True))

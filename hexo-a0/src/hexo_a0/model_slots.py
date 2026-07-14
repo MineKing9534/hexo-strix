@@ -32,8 +32,6 @@ CUDA-graph friendliness via ``torch.compile(mode="reduce-overhead")``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
-
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -42,92 +40,10 @@ from hexo_a0.config import node_feature_dim
 from hexo_a0.loss import decode_binned_value, value_bin_centers
 from hexo_a0.model import PolicyHead, ValueHead
 
-# kind codes (slot_graph convention): 0 = P1 stone, 1 = P2 stone, 2 = empty.
-_KIND_P1, _KIND_P2 = 0, 1
-
-
-# --------------------------------------------------------------------------
-# Padded batch container + collate
-# --------------------------------------------------------------------------
-@dataclass
-class SlotBatch:
-    """Padded static-shape batch of slot graphs.
-
-    ``N`` is the padded real-node count (excludes the dummy node, which is
-    carried separately as a per-graph row), ``S = 3 * 2 * W`` the flattened
-    slot count. Padded rows have ``node_mask=False``, ``filled=False``
-    everywhere, zero features, and are excluded from the heads via the masks.
-    """
-
-    x: Tensor            # [B, N, F] float32 — real-node features
-    dummy_x: Tensor      # [B, F]    float32 — dummy-node features
-    partner: Tensor      # [B, N, S] int64   — source node index per slot
-    filled: Tensor       # [B, N, S] bool    — slot carries an edge
-    src_player: Tensor   # [B, N]    float32 — +1 P1 stone / -1 P2 stone / 0 empty
-    node_mask: Tensor    # [B, N]    bool    — real (non-padding) node
-    stone_mask: Tensor   # [B, N]    bool
-    legal_mask: Tensor   # [B, N]    bool
-
-    def to(self, device) -> "SlotBatch":
-        return SlotBatch(**{
-            f.name: getattr(self, f.name).to(device) for f in fields(self)
-        })
-
-    @property
-    def num_graphs(self) -> int:
-        return self.x.shape[0]
-
-
-def collate_slot_graphs(graphs: list[dict], pad_to: int | None = None) -> SlotBatch:
-    """Collate ``build_slot_graph`` outputs into a padded :class:`SlotBatch`.
-
-    ``pad_to`` fixes the padded node count (for shape bucketing /
-    ``torch.compile`` static shapes); default is the batch max. All graphs
-    must share the same slot count (same ``win_length``) and feature width.
-    """
-    if not graphs:
-        raise ValueError("collate_slot_graphs: empty graph list")
-    device = graphs[0]["features"].device
-    sizes = [g["features"].shape[0] - 1 for g in graphs]  # real nodes (dummy is last row)
-    n_max = max(sizes)
-    if pad_to is not None:
-        if pad_to < n_max:
-            raise ValueError(
-                f"pad_to={pad_to} smaller than largest graph ({n_max} real nodes)"
-            )
-        n_max = pad_to
-    b = len(graphs)
-    fdim = graphs[0]["features"].shape[1]
-    s = graphs[0]["filled"].shape[1] * graphs[0]["filled"].shape[2] * graphs[0]["filled"].shape[3]
-
-    x = torch.zeros((b, n_max, fdim), dtype=torch.float32, device=device)
-    dummy_x = torch.zeros((b, fdim), dtype=torch.float32, device=device)
-    partner = torch.zeros((b, n_max, s), dtype=torch.int64, device=device)
-    filled = torch.zeros((b, n_max, s), dtype=torch.bool, device=device)
-    src_player = torch.zeros((b, n_max), dtype=torch.float32, device=device)
-    node_mask = torch.zeros((b, n_max), dtype=torch.bool, device=device)
-    stone_mask = torch.zeros((b, n_max), dtype=torch.bool, device=device)
-    legal_mask = torch.zeros((b, n_max), dtype=torch.bool, device=device)
-
-    for i, g in enumerate(graphs):
-        n = sizes[i]
-        if g["features"].shape[1] != fdim or g["filled"].reshape(g["filled"].shape[0], -1).shape[1] != s:
-            raise ValueError("collate_slot_graphs: inconsistent feature/slot shapes across graphs")
-        x[i, :n] = g["features"][:-1]
-        dummy_x[i] = g["features"][-1]
-        partner[i, :n] = g["partner"].reshape(n, -1)
-        filled[i, :n] = g["filled"].reshape(n, -1)
-        kinds = g["kinds"]
-        src_player[i, :n] = (kinds == _KIND_P1).float() - (kinds == _KIND_P2).float()
-        node_mask[i, :n] = True
-        stone_mask[i, :n] = g["stone_mask"][:-1]
-        legal_mask[i, :n] = g["legal_mask"][:-1]
-
-    return SlotBatch(
-        x=x, dummy_x=dummy_x, partner=partner, filled=filled,
-        src_player=src_player, node_mask=node_mask,
-        stone_mask=stone_mask, legal_mask=legal_mask,
-    )
+# Batch container + collate moved to slot_graph.py (so the batched state->
+# SlotBatch builder can emit them without a PyG import); re-exported here for
+# backwards compatibility.
+from hexo_a0.slot_graph import SlotBatch, collate_slot_graphs  # noqa: F401
 
 
 # --------------------------------------------------------------------------
@@ -233,14 +149,31 @@ class SlotRepresentationNetwork(nn.Module):
                 f"{s} — graph builder and model disagree on win_length"
             )
 
-        x = self.input_proj(batch.x)          # [B, N, H]
-        xd = self.input_proj(batch.dummy_x)   # [B, H]
+        # Self-defend against a dtype mismatch between the batch and the module
+        # weights: the server casts a bf16-parameter model but the collated
+        # SlotBatch is float32, and a float32 `src_player` silently promotes the
+        # `sp * src_vecs` product back to float32, which then hits a bf16 Linear
+        # (RuntimeError). Coerce all float inputs to the parameter dtype here so
+        # the forward is robust regardless of what the caller pre-cast.
+        p_dtype = self.input_proj.weight.dtype
+        batch_x = batch.x if batch.x.dtype == p_dtype else batch.x.to(p_dtype)
+        batch_dummy_x = (
+            batch.dummy_x if batch.dummy_x.dtype == p_dtype else batch.dummy_x.to(p_dtype)
+        )
+        src_player = (
+            batch.src_player
+            if batch.src_player.dtype == p_dtype
+            else batch.src_player.to(p_dtype)
+        )
+
+        x = self.input_proj(batch_x)          # [B, N, H]
+        xd = self.input_proj(batch_dummy_x)   # [B, H]
 
         nm = batch.node_mask.unsqueeze(-1).to(x.dtype)      # [B, N, 1]
         fl = batch.filled.unsqueeze(-1).to(x.dtype)         # [B, N, S, 1]
         partner_flat = batch.partner.reshape(b, n * s)      # [B, N*S]
         # src_player of each slot's SOURCE node (a static node property).
-        sp = torch.gather(batch.src_player, 1, partner_flat)
+        sp = torch.gather(src_player, 1, partner_flat)
         sp = sp.reshape(b, n, s, 1)
 
         hs: list[Tensor] = []

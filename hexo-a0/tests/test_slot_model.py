@@ -320,6 +320,61 @@ def test_slot_conversion_on_gpu_matches_legacy():
     torch.testing.assert_close(values.cpu(), expected[1], atol=1e-3, rtol=1e-3)
 
 
+def _tiny_slot_batch(slot, cfg, games):
+    flags = _graph_flags(cfg)
+    outs = [
+        sg.build_slot_graph(
+            g.placed_stones(), g.legal_moves(), g.current_player(),
+            g.moves_remaining_this_turn(), WIN_LENGTH, **flags,
+        )
+        for g in games
+    ]
+    return collate_slot_graphs(outs)
+
+
+def test_forward_padded_bf16_module_f32_batch_cpu():
+    """A bf16-cast module must accept a float32 SlotBatch on CPU.
+
+    The server casts the slot model to bfloat16 (CUDA) but the collated
+    SlotBatch stays float32; a float32 ``src_player`` silently promotes the
+    ``sp * src_vecs`` product back to float32, which then hits a bf16 Linear and
+    raises a dtype-mismatch RuntimeError unless the model coerces its float
+    inputs to the parameter dtype at entry. bf16 runs on CPU for these ops, so
+    the regression reproduces without a GPU."""
+    cfg = CONFIGS["base-prenorm"]
+    _, slot = _make_pair(cfg)
+    slot = slot.to(torch.bfloat16)
+    games = [_random_game(0, 2), _random_game(1, 12)]
+    batch = _tiny_slot_batch(slot, cfg, games)
+    assert batch.x.dtype == torch.float32  # the server hands the model f32
+    assert batch.src_player.dtype == torch.float32
+    with torch.no_grad():
+        logits, values = slot.forward_padded(batch)
+    assert logits.dtype == torch.bfloat16
+    assert values.dtype == torch.bfloat16
+    assert torch.isfinite(logits[batch.legal_mask]).all()
+    assert torch.isfinite(values).all()
+
+
+def test_forward_padded_bf16_gpu_finite():
+    """The live CUDA path: a bf16 module + f32 SlotBatch forward_padded must
+    produce finite logits/values (kept minuscule — the GPU is contended by live
+    training). Regresses the same dtype-promotion crash on-device."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    cfg = CONFIGS["base-prenorm"]
+    _, slot = _make_pair(cfg)
+    slot = slot.cuda().to(torch.bfloat16)
+    games = [_random_game(0, 2), _random_game(1, 2)]  # 2 radius-2-ish graphs
+    batch = _tiny_slot_batch(slot, cfg, games).to(torch.device("cuda"))
+    assert batch.x.dtype == torch.float32
+    with torch.no_grad():
+        logits, values = slot.forward_padded(batch)
+    assert logits.dtype == torch.bfloat16
+    assert torch.isfinite(logits[batch.legal_mask]).all()
+    assert torch.isfinite(values).all()
+
+
 def test_stoneless_board_inv_dist_matches_rust_semantics():
     """Rust's builder gives every legal node inv_dist = 1.0 when there are no
     stones (min_d.unwrap_or(1)); the torch port must match. Unreachable from a
