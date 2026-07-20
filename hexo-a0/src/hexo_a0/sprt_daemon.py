@@ -1,9 +1,10 @@
 """Continuous SPRT evaluation daemon.
 
-Runs as a long-lived subprocess alongside training. Watches a checkpoint
-directory for the latest trainee and a fixed champion path. Plays games
-one at a time (alternating trainee side), updates a JSON state file, and
-resets statistics on champion change.
+Runs as a long-lived subprocess alongside training. When idle, leases the
+newest trainee checkpoint as an immutable candidate for one round against a
+fixed champion. Training can continue producing checkpoints without changing
+the tested population. The daemon updates a JSON state file and resets
+statistics on champion change.
 
 Phase 2a scope: standalone daemon that can be launched manually to watch
 a live training run without any trainer modifications. Phase 2b will
@@ -20,6 +21,7 @@ Usage (manual, while training runs):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import multiprocessing as mp
@@ -79,7 +81,6 @@ from hexo_a0.sprt_eval import (
     checkpoint_step,
     restore_decision,
     sample_pair_variance,
-    swap_decision,
 )
 from hexo_a0.sprt_parallel import PairCoordinator
 
@@ -130,11 +131,43 @@ def _load_model(path: Path, fallback_mc: ModelConfig, device: torch.device) -> t
 
 
 def _latest_checkpoint(trainee_dir: Path) -> Path | None:
-    """Return the most recently modified checkpoint_*.pt, or None."""
-    candidates = sorted(trainee_dir.glob("checkpoint_*.pt"))
+    """Return the highest-step complete checkpoint, falling back to mtime."""
+    candidates = list(trainee_dir.glob("checkpoint_*.pt"))
     if not candidates:
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return max(
+        candidates,
+        key=lambda p: (
+            checkpoint_step(p) is not None,
+            checkpoint_step(p) if checkpoint_step(p) is not None else -1,
+            p.stat().st_mtime_ns,
+        ),
+    )
+
+
+def _file_identity(path: Path) -> dict[str, int]:
+    """Stable identity for an atomically-replaced checkpoint file."""
+    st = path.stat()
+    return {
+        "device": st.st_dev,
+        "inode": st.st_ino,
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+    }
+
+
+def _test_spec_id(spec: dict) -> str:
+    """Return a compact deterministic fingerprint for restore compatibility."""
+    encoded = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _candidate_is_newer(path: Path, minimum_step: int | None) -> bool:
+    """Whether ``path`` is eligible after the previously completed candidate."""
+    if minimum_step is None:
+        return True
+    step = checkpoint_step(path)
+    return step is not None and step >= minimum_step
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -179,9 +212,10 @@ def _pair_worker(
 ) -> None:
     """Worker process: play whole (P1, P2) pairs against the champion.
 
-    Each task is ``(pair_id, trainee_path, champion_path, epoch)``. The worker
+    Each task is ``(pair_id, trainee_path, champion_path, champion_epoch,
+    candidate_epoch)``. The worker
     plays the trainee as P1 then as P2 — a complete pentanomial pair — and
-    returns ``(pair_id, epoch, p1_outcome, p2_outcome, total_moves)``. Models
+    returns both epochs with the outcomes. Models
     are cached: the trainee by path (checkpoint filenames carry the step), the
     champion by epoch (its path is fixed and overwritten in place on promotion).
 
@@ -221,9 +255,9 @@ def _pair_worker(
         task = task_q.get()
         if task is None:
             return
-        pair_id, trainee_path, champion_path, epoch = task
+        pair_id, trainee_path, champion_path, champion_epoch, candidate_epoch = task
         trainee, tmc = _trainee(trainee_path)
-        champion, cmc = _champion(champion_path, epoch)
+        champion, cmc = _champion(champion_path, champion_epoch)
         opening = _maybe_sample_opening(
             opening_generator, pair_id, (trainee, tmc), (champion, cmc),
             game_config, device, opening_plies, opening_temperature)
@@ -240,7 +274,10 @@ def _pair_worker(
             winner = result["winner"]
             outcomes.append("D" if winner is None else "W" if winner == side else "L")
             total_moves += result["moves"]
-        result_q.put((pair_id, epoch, outcomes[0], outcomes[1], total_moves))
+        result_q.put((
+            pair_id, champion_epoch, candidate_epoch,
+            outcomes[0], outcomes[1], total_moves,
+        ))
 
 
 class _EvalPool:
@@ -301,15 +338,34 @@ class _EvalPool:
         p.start()
         return p
 
-    def _dispatch(self, pair_id: int, trainee_path, champion_path, epoch: int, now: float) -> None:
+    def _dispatch(
+        self,
+        pair_id: int,
+        trainee_path,
+        champion_path,
+        champion_epoch: int,
+        candidate_epoch: int,
+        now: float,
+    ) -> None:
         wid = self._rr % len(self.task_qs)
         self._rr += 1
-        self.task_qs[wid].put((pair_id, str(trainee_path), str(champion_path), epoch))
-        self.coord.on_dispatch(pair_id, wid, epoch, now)
+        self.task_qs[wid].put((
+            pair_id, str(trainee_path), str(champion_path),
+            champion_epoch, candidate_epoch,
+        ))
+        self.coord.on_dispatch(
+            pair_id, wid, champion_epoch, candidate_epoch, now,
+        )
 
-    def pump(self, trainee_path, champion_path, epoch, decision) -> list:
-        """One service cycle. Returns completed, epoch-current (side, outcome,
-        moves) units to record — empty if nothing finished this cycle."""
+    def pump(
+        self,
+        trainee_path,
+        champion_path,
+        champion_epoch,
+        candidate_epoch,
+        decision,
+    ) -> list:
+        """Return completed units for the active champion/candidate epochs."""
         now = time.time()
 
         # 1. Reclaim dead workers; respawn their slots and re-dispatch their
@@ -339,11 +395,17 @@ class _EvalPool:
         # 2. Reclaim silently-stuck pairs (worker alive but wedged in a native call).
         reissue += self.coord.reclaim_timed_out(now)
         for pair_id in reissue:
-            self._dispatch(pair_id, trainee_path, champion_path, epoch, now)
+            self._dispatch(
+                pair_id, trainee_path, champion_path,
+                champion_epoch, candidate_epoch, now,
+            )
 
         # 3. Top up to target (gated: no new work once decided).
         for _ in range(self.coord.dispatch_quota(decision)):
-            self._dispatch(self._next_pair_id, trainee_path, champion_path, epoch, now)
+            self._dispatch(
+                self._next_pair_id, trainee_path, champion_path,
+                champion_epoch, candidate_epoch, now,
+            )
             self._next_pair_id += 1
 
         # 4. Drain: block up to poll_interval for the first result, then sweep
@@ -354,8 +416,14 @@ class _EvalPool:
         except queue.Empty:
             return units
         while True:
-            pair_id, played_epoch, o1, o2, moves = msg
-            if self.coord.on_result(pair_id, played_epoch, epoch):
+            pair_id, played_champion_epoch, played_candidate_epoch, o1, o2, moves = msg
+            if self.coord.on_result(
+                pair_id,
+                played_champion_epoch,
+                played_candidate_epoch,
+                champion_epoch,
+                candidate_epoch,
+            ):
                 units.append(("P1", o1, moves))
                 units.append(("P2", o2, moves))
             try:
@@ -398,6 +466,7 @@ def run_daemon(
     opening_plies: int = 0,
     opening_temperature: float = 0.5,
     opening_generator: str = "alternate",
+    candidate_max_games: int = 4000,
 ) -> None:
     import hexo_rs  # noqa: F401 — lazy import, same pattern as evaluate.py
 
@@ -407,11 +476,57 @@ def run_daemon(
     game_config = hexo_rs.GameConfig(win_length, radius, max_moves)
     device = torch.device(device_str)
 
+    if sprt_cfg.window_size is not None:
+        logger.warning(
+            "Fixed-candidate SPRT ignores finite window_size=%d; using unbounded "
+            "evidence so the LLR cannot dead-band below a Wald boundary",
+            sprt_cfg.window_size,
+        )
+        sprt_cfg.window_size = None
+    if candidate_max_games < 0:
+        raise ValueError("candidate_max_games must be >= 0")
+    if sprt_cfg.pentanomial and candidate_max_games % 2:
+        raise ValueError("candidate_max_games must be even in pentanomial mode")
+
+    test_spec = {
+        "stage_index": stage_index,
+        "game": {
+            "win_length": win_length,
+            "placement_radius": radius,
+            "max_moves": max_moves,
+        },
+        "sprt": {
+            "s0": sprt_cfg.s0,
+            "s1": sprt_cfg.s1,
+            "alpha": sprt_cfg.alpha,
+            "beta": sprt_cfg.beta,
+            "variance": sprt_cfg.variance,
+            "pair_variance": sprt_cfg.pair_variance,
+            "pentanomial": sprt_cfg.pentanomial,
+            "window_size": sprt_cfg.window_size,
+            "adaptive_pair_variance": sprt_cfg.adaptive_pair_variance,
+            "adaptive_pair_variance_floor": sprt_cfg.adaptive_pair_variance_floor,
+            "adaptive_pair_variance_ceil": sprt_cfg.adaptive_pair_variance_ceil,
+            "adaptive_pair_variance_ema_alpha": sprt_cfg.adaptive_pair_variance_ema_alpha,
+        },
+        "search": {"sims": mcts_sims, "m_actions": mcts_m_actions},
+        "openings": {
+            "plies": opening_plies,
+            "temperature": opening_temperature,
+            "generator": opening_generator,
+        },
+        "candidate_max_games": candidate_max_games,
+        "candidate_mode": "fixed_round",
+    }
+    test_spec_id = _test_spec_id(test_spec)
+
     logger.info("SPRT daemon starting")
     logger.info("Config: %s  stage_index=%d  game: L=%d r=%d moves=%d",
                 config_path, stage_index, win_length, radius, max_moves)
     logger.info("SPRT: s0=%.3f s1=%.3f alpha=%.3f beta=%.3f",
                 sprt_cfg.s0, sprt_cfg.s1, sprt_cfg.alpha, sprt_cfg.beta)
+    logger.info("Fixed-candidate gate: max_games=%s spec=%s",
+                candidate_max_games or "unbounded", test_spec_id)
     logger.info("MCTS sims=%d device=%s", mcts_sims, device_str)
     if opening_plies > 0:
         logger.info("Openings: noise-OFF, plies=%d T=%.2g generator=%s",
@@ -439,67 +554,127 @@ def run_daemon(
     # state file so a daemon restart mid-stage doesn't wipe accumulated
     # history. Requires the watcher to NOT unlink the state file on start.
     peak_history: list[int] = []
-    # Lifetime game counter for side alternation and log identity. Distinct
-    # from state.games, which is window-scoped and can shrink when the
-    # sliding window drops old games. Resets on champion change and after
-    # reject_h1 (matches state.reset() semantics).
+    # Round game counter for serial side alternation and log identity. Distinct
+    # from state.games for compatibility with the generic SPRTState window.
+    # Resets whenever the fixed candidate round ends.
     lifetime_games = 0
+    # A candidate is leased for an entire round. Training may create newer
+    # checkpoints, but none of them can enter this state's evidence stream.
+    round_id = 0
+    candidate_epoch = 0
+    candidate_path: Path | None = None
+    candidate_step: int | None = None
+    last_completed_candidate_step: int | None = None
+    # After a terminal/inconclusive round, never immediately test the same
+    # checkpoint again. Wait until training publishes a strictly newer one.
+    minimum_candidate_step: int | None = None
+    restored_terminal_accept = False
+    initial_pair_variance = sprt_cfg.pair_variance
+    ema_pair_variance: float | None = None
+    current_champion_identity = _file_identity(champion_path)
+
     if state_file.exists():
         try:
             prior = json.loads(state_file.read_text())
-            ph = prior.get("peak_history")
-            if isinstance(ph, list) and all(isinstance(x, int) for x in ph):
-                peak_history = list(ph)
-                logger.info("Restored peak_history from prior state file: %s", peak_history)
-
-            # Restore in-flight round state when the prior daemon was
-            # shut down mid-round against the same champion. Gates live in
-            # restore_decision() (sprt_eval.py, unit-tested): same champion,
-            # decision still "continue", and trainee staleness measured in
-            # training steps — NOT wall-clock, which a stalled round erodes
-            # before shutdown and a paused run trips spuriously.
             prior_state = prior.get("state") or {}
-            prior_decision = prior_state.get("decision", "continue")
-            prior_champion_mtime = prior.get("champion_mtime")
-            current_champion_mtime = (
-                champion_path.stat().st_mtime if champion_path.exists() else None
+            prior_round_status = prior.get("round_status", "running")
+            prior_decision = (
+                prior_state.get("decision", "continue")
+                if prior_round_status == "running"
+                else prior_round_status
             )
-            same_champion = (
-                prior_champion_mtime is not None
-                and current_champion_mtime is not None
-                and abs(prior_champion_mtime - current_champion_mtime) < 1.0
-            )
+            prior_identity = prior.get("champion_identity")
+            same_champion = prior_identity == current_champion_identity
+            same_test_spec = prior.get("test_spec_id") == test_spec_id
+            prior_candidate_raw = prior.get("candidate_path")
+            prior_candidate = Path(prior_candidate_raw) if prior_candidate_raw else None
+            candidate_exists = prior_candidate is not None and prior_candidate.exists()
             latest_ckpt = _latest_checkpoint(trainee_dir)
-            restore_ok, skip_reasons = restore_decision(
-                prior_decision=prior_decision,
-                same_champion=same_champion,
-                prior_trainee_step=checkpoint_step(prior.get("trainee_path", "")),
-                latest_trainee_step=(
-                    checkpoint_step(latest_ckpt) if latest_ckpt is not None else None
-                ),
+            restore_accepted = (
+                prior_decision == "accept_h1"
+                and same_champion
+                and same_test_spec
+                and candidate_exists
+                and prior_state.get("games", 0) > 0
             )
-            if restore_ok and prior_state.get("games", 0) > 0:
+            if restore_accepted:
                 state = SPRTState.from_dict(prior_state)
                 reject_count = int(prior.get("reject_count", 0))
+                candidate_path = prior_candidate
+                candidate_step = checkpoint_step(candidate_path or "")
+                round_id = max(1, int(prior.get("round_id", 1)))
+                candidate_epoch = round_id
+                last_completed_candidate_step = candidate_step
+                restored_terminal_accept = True
+                ph = prior.get("peak_history")
+                if isinstance(ph, list) and all(isinstance(x, int) for x in ph):
+                    peak_history = list(ph)
+                logger.info(
+                    "Restored terminal accept for fixed candidate round=%d step=%s; "
+                    "will heartbeat until the trainer promotes it",
+                    round_id, candidate_step,
+                )
+                restore_ok, skip_reasons = True, []
+            else:
+                restore_ok, skip_reasons = restore_decision(
+                    prior_decision=prior_decision,
+                    same_champion=same_champion,
+                    prior_trainee_step=checkpoint_step(prior_candidate or ""),
+                    latest_trainee_step=(
+                        checkpoint_step(latest_ckpt) if latest_ckpt is not None else None
+                    ),
+                    fixed_candidate=True,
+                    same_test_spec=same_test_spec,
+                    candidate_exists=candidate_exists,
+                )
+            if restore_ok and prior_state.get("games", 0) > 0 and not restore_accepted:
+                state = SPRTState.from_dict(prior_state)
+                reject_count = int(prior.get("reject_count", 0))
+                ph = prior.get("peak_history")
+                if isinstance(ph, list) and all(isinstance(x, int) for x in ph):
+                    peak_history = list(ph)
+                candidate_path = prior_candidate
+                candidate_step = checkpoint_step(candidate_path or "")
+                completed_step = prior.get("last_completed_candidate_step")
+                if completed_step is not None:
+                    last_completed_candidate_step = int(completed_step)
+                round_id = max(1, int(prior.get("round_id", 1)))
+                candidate_epoch = round_id
+                prior_pair_variance = (prior.get("sprt_config") or {}).get(
+                    "pair_variance"
+                )
+                if prior_pair_variance is not None:
+                    sprt_cfg.pair_variance = float(prior_pair_variance)
                 # Use the post-restore count: from_dict may drop a trailing odd
                 # outcome, so the serialized games value can be one too high —
                 # which would flip the serial side-alternation parity.
                 lifetime_games = state.games
                 logger.info(
-                    "Restored mid-round state: games=%d wins=%d draws=%d losses=%d "
-                    "llr=%.3f reject_count=%d (same champion, trainee current)",
+                    "Restored fixed-candidate round %d (%s): games=%d wins=%d "
+                    "draws=%d losses=%d llr=%.3f reject_count=%d",
+                    round_id, candidate_path,
                     state.games, state.wins, state.draws, state.losses, state.llr,
                     reject_count,
                 )
-            elif same_champion and prior.get("reject_count", 0) > 0:
+            elif same_champion and same_test_spec:
                 # Even if we don't restore the in-flight round (e.g. prior
                 # decision was terminal, or games=0), reject_count is still
-                # valid as long as the champion hasn't changed.
+                # valid under the same champion and statistical test.
                 reject_count = int(prior.get("reject_count", 0))
+                round_id = int(prior.get("round_id", 0))
+                completed_step = prior.get("last_completed_candidate_step")
+                if completed_step is None and prior_decision != "continue":
+                    completed_step = checkpoint_step(prior_candidate or "")
+                if completed_step is not None:
+                    last_completed_candidate_step = int(completed_step)
+                    minimum_candidate_step = int(completed_step) + 1
+                ph = prior.get("peak_history")
+                if isinstance(ph, list) and all(isinstance(x, int) for x in ph):
+                    peak_history = list(ph)
                 logger.info(
-                    "Restored reject_count=%d against current champion (prior round "
-                    "decision=%s, not restoring round state)",
-                    reject_count, prior_decision,
+                    "Restored fixed-gate counters: reject_count=%d round_id=%d "
+                    "next_candidate_step>=%s",
+                    reject_count, round_id, minimum_candidate_step,
                 )
             elif prior_state.get("games", 0) > 0:
                 # A mid-round state existed but failed a restore gate. Say
@@ -514,12 +689,9 @@ def run_daemon(
                 )
         except (json.JSONDecodeError, OSError, KeyError, ValueError) as e:
             logger.warning("Could not restore from %s: %s — starting fresh", state_file, e)
-    # Adaptive pair variance state: original cfg value to restore on champion
-    # change, plus running EMA estimate. None ema means "no rounds completed
-    # since last reset, still using initial pair_variance".
-    initial_pair_variance = sprt_cfg.pair_variance
-    ema_pair_variance: float | None = None
+
     champion_mtime: float | None = None
+    champion_identity: dict[str, int] | None = None
     # Monotonic champion generation. Bumped on every champion change so parallel
     # workers can tag each pair with the champion it was played against; pairs
     # that come back after a swap (stale epoch) are discarded rather than scored
@@ -527,38 +699,12 @@ def run_daemon(
     champion_epoch = 0
     champion = None
     champion_mc: ModelConfig | None = None
-    trainee_path: Path | None = None
     trainee = None
     trainee_mc: ModelConfig | None = None
 
     lower, upper = sprt_cfg.bounds()
     logger.info("Wald bounds: reject_h1 if LLR<=%.3f, accept_h1 if LLR>=%.3f", lower, upper)
 
-    # Trainee-swap freeze zone: once a converging-toward-accept round
-    # crosses LLR >= swap_freeze_fraction * upper (0.9 by default), stop
-    # loading new trainee checkpoints until the round closes (accept_h1 /
-    # reject_h1) or LLR drifts back below the threshold. Prevents a
-    # near-promoting round from being diluted by a weaker mid-training
-    # snapshot when the trainee oscillates across an offensive-breakthrough
-    # boundary. The narrow 0.9 fraction keeps the freeze close to the accept
-    # bound so the daemon keeps swapping in fresh checkpoints for a current
-    # view of the network until a round is genuinely about to close.
-    #
-    # Asymmetric: we do NOT freeze on the lower-bound side. Approaching
-    # reject is something the patience layer wants resolved quickly, and
-    # letting a potentially-stronger newer trainee swap in mid-descent
-    # may either avert the reject or hit it faster — both fine outcomes.
-    #
-    # Unfreeze-on-stall: a round can plateau in the freeze zone just below
-    # the accept bound (the residual dead band) and never close. To avoid a
-    # permanent stall, `frozen_games` counts consecutive games spent in the
-    # freeze zone; once it reaches a full window the swap is force-allowed so
-    # a fresher (possibly clearly-stronger) checkpoint can replace the stuck
-    # trainee. swap_decision() encapsulates this logic (tested in
-    # test_sprt_eval.py).
-    swap_freeze_upper = sprt_cfg.swap_freeze_threshold()
-    swap_frozen_logged = False
-    frozen_games = 0
     current_opening = None  # serial path: shared opening cached across a pair
 
     state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -589,22 +735,33 @@ def run_daemon(
 
     while not stop:
         # --- Champion sync ---
+        current_identity = _file_identity(champion_path)
         current_mtime = champion_path.stat().st_mtime
-        if champion_mtime is None or current_mtime != champion_mtime:
-            if champion_mtime is not None:
+        if champion_identity is None or current_identity != champion_identity:
+            if champion_identity is not None:
                 # The reject_count value at champion-change time is the
                 # peak of the just-completed cycle. Record it for the
                 # curriculum's auto-calibrated plateau detector.
                 # (Persisted via the next _atomic_write_json below.)
                 peak_history.append(reject_count)
-                logger.info("Champion changed (mtime %.0f → %.0f), resetting SPRT state "
-                            "(prior reject_count=%d, peak_history=%s)",
-                            champion_mtime, current_mtime, reject_count, peak_history)
+                logger.info(
+                    "Champion changed, resetting fixed-candidate SPRT state "
+                    "(prior reject_count=%d, peak_history=%s)",
+                    reject_count, peak_history,
+                )
+                completed_step = candidate_step
+                if completed_step is not None:
+                    last_completed_candidate_step = completed_step
                 state.reset()
                 reject_count = 0
                 lifetime_games = 0
-                swap_frozen_logged = False
-                frozen_games = 0
+                candidate_path = None
+                candidate_step = None
+                trainee = None
+                trainee_mc = None
+                candidate_epoch = round_id + 1  # invalidate in-flight old-round pairs
+                if completed_step is not None:
+                    minimum_candidate_step = completed_step + 1
                 # Reset adaptive pair variance to its initial config value;
                 # new champion = new dynamics, prior empirical estimates are stale.
                 if sprt_cfg.adaptive_pair_variance:
@@ -616,61 +773,60 @@ def run_daemon(
                     )
             champion, champion_mc = _load_model(champion_path, mc_fallback, device)
             champion_mtime = current_mtime
+            champion_identity = current_identity
             champion_epoch += 1
             logger.info("Loaded champion: %s (epoch %d)", champion_path, champion_epoch)
 
-        # --- Trainee sync (don't reset state on swap) ---
-        # Freeze swaps in the upper near-decision zone so a converging
-        # round isn't diluted by a weaker mid-training snapshot.
-        # The freeze is about preventing mid-round swaps to a DIFFERENT
-        # trainee — it must not block the initial load on daemon startup
-        # or resume, otherwise we deadlock with `trainee is None` forever
-        # if the restored LLR is already in the freeze zone.
-        freeze_active, stall_unfreeze = swap_decision(state.llr, frozen_games, sprt_cfg)
-        if trainee is None:
+        if restored_terminal_accept and state.decision == "accept_h1":
+            # Preserve an accepted exact candidate across a daemon/trainer
+            # restart. Do not replace it with a newer unvalidated checkpoint.
+            logger.info(
+                "Terminal accept still pending for round=%d step=%s; waiting for "
+                "champion promotion",
+                round_id, candidate_step,
+            )
+            last_heartbeat = 0.0
+            while not stop and _file_identity(champion_path) == champion_identity:
+                if time.time() - last_heartbeat >= 60.0:
+                    try:
+                        payload = json.loads(state_file.read_text())
+                        payload["timestamp"] = time.time()
+                        _atomic_write_json(state_file, payload)
+                    except (json.JSONDecodeError, OSError) as e:
+                        logger.warning("Could not heartbeat accepted state: %s", e)
+                    last_heartbeat = time.time()
+                time.sleep(poll_interval)
+            restored_terminal_accept = False
+            continue
+
+        # --- Fixed candidate lease ---
+        # Training remains free-running, but the promotion population is one
+        # immutable checkpoint for the whole round. After a terminal or
+        # inconclusive result, skip all queued intermediates and lease only the
+        # newest checkpoint once it is strictly newer than the completed one.
+        if candidate_path is None:
             latest = _latest_checkpoint(trainee_dir)
-            if latest is not None:
+            if latest is not None and _candidate_is_newer(latest, minimum_candidate_step):
+                round_id += 1
+                candidate_epoch = round_id
+                candidate_path = latest
+                candidate_step = checkpoint_step(latest)
                 trainee, trainee_mc = _load_model(latest, mc_fallback, device)
-                trainee_path = latest
-                if freeze_active:
-                    logger.info(
-                        "Initial trainee load (LLR=%.3f in freeze zone but no "
-                        "trainee yet, bypassing): %s",
-                        state.llr, trainee_path,
-                    )
-                    swap_frozen_logged = True
-                else:
-                    logger.info("Loaded trainee: %s", trainee_path)
-        elif freeze_active:
-            if not swap_frozen_logged:
                 logger.info(
-                    "Trainee-swap frozen: LLR=%.3f >= %.3f "
-                    "(near-accept zone); current trainee %s held until round closes",
-                    state.llr, swap_freeze_upper, trainee_path,
+                    "Leased fixed candidate round=%d epoch=%d step=%s path=%s",
+                    round_id, candidate_epoch, candidate_step, candidate_path,
                 )
-                swap_frozen_logged = True
-        else:
-            if swap_frozen_logged:
-                if stall_unfreeze:
-                    logger.info(
-                        "Trainee-swap stall-unfreeze: LLR=%.3f held %d games "
-                        "(>= window) in freeze zone without closing; allowing swap "
-                        "to a fresher checkpoint",
-                        state.llr, frozen_games,
-                    )
-                else:
-                    logger.info(
-                        "Trainee-swap unfrozen: LLR=%.3f back below %.3f",
-                        state.llr, swap_freeze_upper,
-                    )
-                swap_frozen_logged = False
-            latest = _latest_checkpoint(trainee_dir)
-            if latest is not None and latest != trainee_path:
-                trainee, trainee_mc = _load_model(latest, mc_fallback, device)
-                trainee_path = latest
-                # Fresh trainee gets a full window before another stall check.
-                frozen_games = 0
-                logger.info("Loaded trainee: %s", trainee_path)
+            else:
+                time.sleep(poll_interval)
+                continue
+        elif trainee is None:
+            # Restored in-flight round: load the exact leased checkpoint, not
+            # whatever training has produced most recently.
+            trainee, trainee_mc = _load_model(candidate_path, mc_fallback, device)
+            logger.info(
+                "Loaded restored fixed candidate round=%d step=%s path=%s",
+                round_id, candidate_step, candidate_path,
+            )
 
         if trainee is None or champion is None:
             time.sleep(poll_interval)
@@ -706,8 +862,10 @@ def run_daemon(
             pending = [(side, outcome, result["moves"])]
         else:
             pending = pool.pump(
-                trainee_path=trainee_path, champion_path=champion_path,
-                epoch=champion_epoch, decision=state.decision,
+                trainee_path=candidate_path, champion_path=champion_path,
+                champion_epoch=champion_epoch,
+                candidate_epoch=candidate_epoch,
+                decision=state.decision,
             )
             if not pending:
                 continue
@@ -716,18 +874,50 @@ def run_daemon(
             lifetime_games += 1
             state.record(outcome, sprt_cfg)
 
-            # Track consecutive games in the swap-freeze zone for unfreeze-on-stall.
-            if state.llr >= swap_freeze_upper:
-                frozen_games += 1
-            else:
-                frozen_games = 0
+            max_games_reached = (
+                candidate_max_games > 0
+                and state.games >= candidate_max_games
+                and (not sprt_cfg.pentanomial or state.games % 2 == 0)
+                and state.decision == "continue"
+            )
+            round_status = (
+                "inconclusive" if max_games_reached
+                else state.decision if state.decision != "continue"
+                else "running"
+            )
+            round_finished = state.decision != "continue" or max_games_reached
+            if state.decision == "reject_h1":
+                reject_count += 1
+            latest_available = _latest_checkpoint(trainee_dir)
+            latest_available_step = checkpoint_step(latest_available or "")
 
             # --- Emit state ---
             payload = {
                 "timestamp": time.time(),
-                "trainee_path": str(trainee_path),
+                # trainee_path is retained as a compatibility alias for the
+                # trainer-side watcher. It is now always the exact fixed
+                # candidate that earned every game in this state.
+                "trainee_path": str(candidate_path),
+                "candidate_path": str(candidate_path),
+                "candidate_step": candidate_step,
+                "latest_available_step": latest_available_step,
+                "candidate_lag_steps": (
+                    latest_available_step - candidate_step
+                    if latest_available_step is not None and candidate_step is not None
+                    else None
+                ),
+                "round_id": round_id,
+                "candidate_epoch": candidate_epoch,
+                "candidate_mode": "fixed_round",
+                "round_status": round_status,
+                "last_completed_candidate_step": (
+                    candidate_step if round_finished else last_completed_candidate_step
+                ),
                 "champion_path": str(champion_path),
                 "champion_mtime": champion_mtime,
+                "champion_identity": champion_identity,
+                "test_spec_id": test_spec_id,
+                "test_spec": test_spec,
                 "sprt_config": {
                     "s0": sprt_cfg.s0, "s1": sprt_cfg.s1,
                     "alpha": sprt_cfg.alpha, "beta": sprt_cfg.beta,
@@ -747,18 +937,21 @@ def run_daemon(
             }
             _atomic_write_json(state_file, payload)
 
-            logger.info("game=%d side=%s %s  window W-D-L=%d-%d-%d  score=%.3f  LLR=%.3f  %s",
-                        lifetime_games, side, outcome, state.wins, state.draws, state.losses,
-                        state.score, state.llr, state.decision)
+            logger.info(
+                "round=%d candidate_step=%s game=%d side=%s %s  "
+                "W-D-L=%d-%d-%d  score=%.3f  LLR=%.3f  %s",
+                round_id, candidate_step, lifetime_games, side, outcome,
+                state.wins, state.draws, state.losses,
+                state.score, state.llr, round_status,
+            )
 
-            # accept_h1: idle until champion changes (trainer promotes → fresh
-            # round against new champion). reject_h1: log, increment counter,
-            # reset state, and immediately start a new round against the same
-            # champion — the trainer uses reject_count for patience-gated stage
-            # advance rather than treating a single reject as terminal.
+            # accept_h1: idle until the trainer promotes this exact candidate.
+            # reject_h1/inconclusive: retain the terminal payload for the
+            # watcher, invalidate old worker results, and wait for a strictly
+            # newer checkpoint before starting another fixed round.
             if sprt_cfg.pentanomial:
                 emp_var = sample_pair_variance(state._outcomes)
-                if emp_var is not None and state.decision != "continue":
+                if emp_var is not None and round_finished:
                     logger.info(
                         "Empirical pair variance: %.3f (configured pair_variance=%.3f; "
                         "lower empirical → could lower config for faster convergence)",
@@ -784,14 +977,20 @@ def run_daemon(
                         sprt_cfg.pair_variance = clamped
 
             if state.decision == "accept_h1":
-                logger.info("Decision accept_h1 reached — idling until champion changes")
+                last_completed_candidate_step = candidate_step
+                payload["last_completed_candidate_step"] = last_completed_candidate_step
+                _atomic_write_json(state_file, payload)
+                logger.info(
+                    "Decision accept_h1 reached for fixed candidate round=%d step=%s "
+                    "— idling until champion changes",
+                    round_id, candidate_step,
+                )
                 # Heartbeat the state file every ~60s while idle so the trainer's
                 # staleness check (if strict) doesn't misinterpret idle as dead.
                 last_heartbeat = time.time()
                 while not stop:
                     time.sleep(poll_interval)
-                    current_mtime = champion_path.stat().st_mtime
-                    if current_mtime != champion_mtime:
+                    if _file_identity(champion_path) != champion_identity:
                         break
                     if time.time() - last_heartbeat > 60.0:
                         payload["timestamp"] = time.time()
@@ -802,17 +1001,43 @@ def run_daemon(
                 # round — and let the outer loop re-sync + reset.
                 break
             elif state.decision == "reject_h1":
-                reject_count += 1
+                last_completed_candidate_step = candidate_step
                 logger.info(
-                    "Decision reject_h1 reached (round %d, final score=%.3f LLR=%.3f "
-                    "over %d games) — resetting SPRT state and starting new round",
-                    reject_count, state.score, state.llr, state.games,
+                    "Decision reject_h1 reached (candidate round=%d, rejection=%d, "
+                    "step=%s, final score=%.3f LLR=%.3f over %d games) — waiting "
+                    "for a newer checkpoint",
+                    round_id, reject_count, candidate_step,
+                    state.score, state.llr, state.games,
+                )
+                minimum_candidate_step = (
+                    candidate_step + 1 if candidate_step is not None else None
                 )
                 state.reset()
                 lifetime_games = 0
-                swap_frozen_logged = False
-                frozen_games = 0
+                candidate_path = None
+                candidate_step = None
+                trainee = None
+                trainee_mc = None
+                candidate_epoch = round_id + 1
                 # Drop the rest of this batch so a fresh round starts clean.
+                break
+            elif max_games_reached:
+                last_completed_candidate_step = candidate_step
+                logger.info(
+                    "Fixed candidate round=%d step=%s inconclusive after %d games "
+                    "(score=%.3f LLR=%.3f) — waiting for a newer checkpoint",
+                    round_id, candidate_step, state.games, state.score, state.llr,
+                )
+                minimum_candidate_step = (
+                    candidate_step + 1 if candidate_step is not None else None
+                )
+                state.reset()
+                lifetime_games = 0
+                candidate_path = None
+                candidate_step = None
+                trainee = None
+                trainee_mc = None
+                candidate_epoch = round_id + 1
                 break
 
     logger.info("SPRT daemon exiting after %d games (final LLR=%.3f, decision=%s)",
@@ -864,6 +1089,12 @@ def main() -> None:
                     choices=["alternate", "champion", "trainee"],
                     help="Which model samples the pair's opening ('alternate' = "
                          "trainee on even pairs, champion on odd).")
+    ap.add_argument(
+        "--candidate-max-games", type=int, default=4000,
+        help="Predetermined per-candidate inconclusive horizon. The candidate "
+             "is fixed for the round; at this many games with no Wald decision, "
+             "wait for and lease the newest strictly newer checkpoint. 0 = unbounded.",
+    )
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--eval-workers", type=int, default=1,
                     help="Parallel pair-eval worker processes. 1 = inline serial. "
@@ -916,6 +1147,7 @@ def main() -> None:
         opening_plies=args.opening_plies,
         opening_temperature=args.opening_temperature,
         opening_generator=args.opening_generator,
+        candidate_max_games=args.candidate_max_games,
     )
 
 

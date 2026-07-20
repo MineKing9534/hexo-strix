@@ -12,14 +12,10 @@ approximation. Wald's bounds give early-stopping:
   reject H1 when LLR <= log(beta/(1-alpha))
   (alpha=beta=0.05 → bounds ≈ ±2.944)
 
-Trainee-swap assumption: the daemon reloads the trainee when newer checkpoints
-appear but does NOT reset SPRT state on a swap. Under monotonic improvement
-this is conservative (old games with weaker trainee underestimate H1). To
-guard against the degradation case — where stale high-win games could
-spuriously inflate LLR — SPRTState maintains a sliding window of the last N
-outcomes. Older games are dropped as new ones arrive, bounding how much
-history a single (possibly bad) trainee can influence. Set window_size=None
-for unbounded accumulation.
+Fixed-candidate assumption: one immutable trainee checkpoint is leased for an
+entire SPRT round. Newer training checkpoints cannot enter the evidence stream.
+This restores the stationary-population assumption needed to associate a Wald
+decision with the exact checkpoint that is promoted.
 
 Pentanomial: when enabled (default), games are grouped into consecutive pairs
 (trainee-as-P1 followed by trainee-as-P2 against the same opponent), and the
@@ -68,23 +64,14 @@ class SPRTConfig:
     # In pentanomial mode, pairs are formed from consecutive games within the
     # current window. None = unbounded accumulation.
     #
-    # Sizing constraint: the window is also the averaging horizon for a moving
-    # (swapped) trainee, so it must exceed the natural decision horizon for the
-    # H1 effect size. At s1=0.55 the per-pair LLR drift is
+    # Legacy sizing constraint: any finite window must exceed the natural
+    # decision horizon for the H1 effect size. At s1=0.55 the per-pair LLR drift is
     # 2(s1-s0)/pair_variance * (2*s1 - (s0+s1)) ≈ 0.0143, so accept needs
     # ~U/0.0143 ≈ 206 pairs = ~412 games. A window below that plateaus a
     # genuinely-stronger trainee below the accept bound forever (the "dead
     # band"). 1000 (≈2.5× the horizon) gives full power at s1 while still
     # bounding staleness to a few hundred recent games. See docs/research/.
     window_size: int | None = 1000
-    # Trainee-swap freeze: the SPRT daemon stops loading newer trainee
-    # checkpoints once LLR climbs into the near-accept zone, so a converging
-    # round isn't diluted by a weaker mid-training snapshot. Expressed as a
-    # fraction of the accept (upper) bound. 0.9 keeps the freeze narrow — it
-    # only fires when a round is genuinely about to close — which avoids a
-    # deadlock sliver just below the accept threshold and lets the daemon keep
-    # swapping in fresh checkpoints for a current view of the network.
-    swap_freeze_fraction: float = 0.9
     # Pentanomial mode: group consecutive games into pairs (trainee-as-P1
     # then trainee-as-P2) and use pair scores as the statistical unit.
     # Cancels out first-player advantage. False = classic per-game trinomial.
@@ -103,12 +90,6 @@ class SPRTConfig:
         lower = math.log(self.beta / (1.0 - self.alpha))
         upper = math.log((1.0 - self.beta) / self.alpha)
         return lower, upper
-
-    def swap_freeze_threshold(self) -> float:
-        """LLR at/above which trainee swaps are frozen (fraction of the accept bound)."""
-        _, upper = self.bounds()
-        return self.swap_freeze_fraction * upper
-
 
 @dataclass
 class SPRTState:
@@ -320,32 +301,6 @@ def classify(llr: float, cfg: SPRTConfig) -> Decision:
     return "continue"
 
 
-def swap_decision(
-    llr: float,
-    frozen_games: int,
-    cfg: SPRTConfig,
-    *,
-    stall_fallback: int = 1000,
-) -> tuple[bool, bool]:
-    """Decide whether to hold (freeze) the current trainee or allow a swap.
-
-    Returns (freeze_active, stall_unfreeze):
-      - freeze_active: hold the current trainee, don't load newer checkpoints.
-      - stall_unfreeze: the round has stayed frozen for a full window of games
-        without closing (likely stuck at a sub-accept plateau in the residual
-        dead band), so force-allow a swap to a fresher checkpoint.
-
-    `frozen_games` is the count of consecutive games played while LLR was in
-    the freeze zone. `stall_fallback` is used as the stall limit when the
-    window is unbounded (window_size is None).
-    """
-    in_zone = llr >= cfg.swap_freeze_threshold()
-    limit = cfg.window_size if cfg.window_size is not None else stall_fallback
-    stall_unfreeze = in_zone and frozen_games >= limit
-    freeze_active = in_zone and not stall_unfreeze
-    return freeze_active, stall_unfreeze
-
-
 def checkpoint_step(path: str | Path) -> int | None:
     """Step number embedded in a checkpoint_<step>.pt filename, or None."""
     m = re.match(r"checkpoint_(\d+)", Path(path).name)
@@ -359,6 +314,9 @@ def restore_decision(
     latest_trainee_step: int | None,
     *,
     max_trainee_lag: int = 5000,
+    fixed_candidate: bool = False,
+    same_test_spec: bool = True,
+    candidate_exists: bool = True,
 ) -> tuple[bool, list[str]]:
     """Decide whether a saved mid-round SPRT state may be restored on start.
 
@@ -371,7 +329,11 @@ def restore_decision(
       - terminal decision: terminal rounds are handled by the daemon's normal
         post-game flow; restoring one directly would re-trigger that handling
         without a matching game record.
-      - trainee staleness, measured in TRAINING STEPS, not wall-clock: a
+      - test identity: changed hypotheses/search/opening settings invalidate
+        the old LLR.
+      - leased-candidate existence in fixed-candidate mode.
+      - trainee staleness in legacy moving-trainee mode, measured in TRAINING
+        STEPS, not wall-clock: a
         round whose games were earned more than max_trainee_lag steps behind
         the current latest checkpoint describes an obsolete network — under
         non-monotonic improvement its evidence could promote a regressed
@@ -389,8 +351,13 @@ def restore_decision(
         reasons.append("champion file changed since state was written")
     if prior_decision != "continue":
         reasons.append(f"prior round already decided ({prior_decision})")
+    if not same_test_spec:
+        reasons.append("SPRT test specification changed since state was written")
+    if fixed_candidate and not candidate_exists:
+        reasons.append("leased candidate checkpoint no longer exists")
     if (
-        prior_trainee_step is not None
+        not fixed_candidate
+        and prior_trainee_step is not None
         and latest_trainee_step is not None
         and latest_trainee_step - prior_trainee_step > max_trainee_lag
     ):

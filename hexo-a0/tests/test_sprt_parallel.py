@@ -17,10 +17,10 @@ from hexo_a0.sprt_parallel import PairCoordinator
 
 def test_dead_worker_pairs_are_reclaimed_and_inflight_corrected():
     coord = PairCoordinator(n_workers=2, target_inflight=4)
-    coord.on_dispatch(pair_id=0, worker_id="A", epoch=1, now=0.0)
-    coord.on_dispatch(pair_id=1, worker_id="A", epoch=1, now=0.0)
-    coord.on_dispatch(pair_id=2, worker_id="B", epoch=1, now=0.0)
-    coord.on_dispatch(pair_id=3, worker_id="B", epoch=1, now=0.0)
+    coord.on_dispatch(0, "A", champion_epoch=1, candidate_epoch=10, now=0.0)
+    coord.on_dispatch(1, "A", champion_epoch=1, candidate_epoch=10, now=0.0)
+    coord.on_dispatch(2, "B", champion_epoch=1, candidate_epoch=10, now=0.0)
+    coord.on_dispatch(3, "B", champion_epoch=1, candidate_epoch=10, now=0.0)
     assert coord.inflight_count() == 4
 
     reissue = coord.reclaim_dead({"A"})
@@ -32,14 +32,14 @@ def test_dead_worker_pairs_are_reclaimed_and_inflight_corrected():
 
 def test_result_for_current_epoch_is_recorded_stale_is_discarded():
     coord = PairCoordinator(n_workers=2, target_inflight=4)
-    coord.on_dispatch(pair_id=0, worker_id="A", epoch=1, now=0.0)
-    coord.on_dispatch(pair_id=1, worker_id="A", epoch=1, now=0.0)
+    coord.on_dispatch(0, "A", champion_epoch=1, candidate_epoch=10, now=0.0)
+    coord.on_dispatch(1, "A", champion_epoch=1, candidate_epoch=10, now=0.0)
 
     # pair 0 was played under epoch 1; champion is still epoch 1 -> record it.
-    assert coord.on_result(pair_id=0, played_epoch=1, current_epoch=1) is True
+    assert coord.on_result(0, 1, 10, 1, 10) is True
     # pair 1 was played under epoch 1 but champion has since swapped to epoch 2
     # -> discard, it is evidence against the wrong opponent.
-    assert coord.on_result(pair_id=1, played_epoch=1, current_epoch=2) is False
+    assert coord.on_result(1, 1, 10, 2, 10) is False
 
     # both leave inflight regardless of record/discard.
     assert coord.inflight_count() == 0
@@ -51,37 +51,40 @@ def test_result_for_already_retired_pair_is_discarded():
     longer in flight and must be discarded — otherwise it double-counts into
     the SPRT stream and mis-phases the pentanomial pairing."""
     coord = PairCoordinator(n_workers=2, target_inflight=4)
-    coord.on_dispatch(pair_id=7, worker_id="A", epoch=1, now=0.0)
+    coord.on_dispatch(7, "A", champion_epoch=1, candidate_epoch=10, now=0.0)
 
     # first completion records it and retires the pair_id
-    assert coord.on_result(pair_id=7, played_epoch=1, current_epoch=1) is True
+    assert coord.on_result(7, 1, 10, 1, 10) is True
     # a duplicate completion (same epoch, same id) is no longer in flight
-    assert coord.on_result(pair_id=7, played_epoch=1, current_epoch=1) is False
+    assert coord.on_result(7, 1, 10, 1, 10) is False
+
+
+def test_result_for_completed_candidate_round_is_discarded():
+    """A pair from candidate A must never become evidence for candidate B."""
+    coord = PairCoordinator(n_workers=2, target_inflight=4)
+    coord.on_dispatch(8, "A", champion_epoch=1, candidate_epoch=10, now=0.0)
+
+    assert coord.on_result(8, 1, 10, 1, 11) is False
+    assert coord.inflight_count() == 0
 
 
 def test_reclaimed_pair_late_result_is_discarded():
     """reclaim_dead/timed_out retires the pair_id for re-dispatch; if the
     original worker's lost-then-found result shows up later it must not count."""
     coord = PairCoordinator(n_workers=2, target_inflight=4, pair_timeout=30.0)
-    coord.on_dispatch(pair_id=3, worker_id="A", epoch=1, now=0.0)
+    coord.on_dispatch(3, "A", champion_epoch=1, candidate_epoch=10, now=0.0)
     assert coord.reclaim_timed_out(now=100.0) == [3]
     # late result for the timed-out original — already retired, discard.
-    assert coord.on_result(pair_id=3, played_epoch=1, current_epoch=1) is False
+    assert coord.on_result(3, 1, 10, 1, 10) is False
 
 
 def test_dispatch_fills_to_target_only_while_continuing():
-    """Dispatch gates ONLY on the decision, never on the trainee-swap freeze.
-
-    The freeze can only exit via played games (LLR moving off the bound, or
-    frozen_games reaching a full window for stall-unfreeze), so gating
-    dispatch on it deadlocks the round: inflight pairs drain, no new pairs,
-    LLR never moves, freeze never lifts. Hit live 2026-06-11 (s1-6-2 wedged
-    at LLR=4.432, one pair short of accept, for 22 minutes)."""
+    """Dispatch runs only while the fixed candidate's decision is continuing."""
     coord = PairCoordinator(n_workers=2, target_inflight=4)
     # empty pool, continuing -> top up to target.
     assert coord.dispatch_quota(decision="continue") == 4
 
-    coord.on_dispatch(pair_id=0, worker_id="A", epoch=1, now=0.0)
+    coord.on_dispatch(0, "A", champion_epoch=1, candidate_epoch=10, now=0.0)
     assert coord.dispatch_quota(decision="continue") == 3
 
     # a terminal decision halts new dispatch (drain-only).
@@ -91,8 +94,8 @@ def test_dispatch_fills_to_target_only_while_continuing():
 
 def test_timed_out_pairs_are_reclaimed_for_reissue():
     coord = PairCoordinator(n_workers=2, target_inflight=4, pair_timeout=30.0)
-    coord.on_dispatch(pair_id=0, worker_id="A", epoch=1, now=0.0)
-    coord.on_dispatch(pair_id=1, worker_id="A", epoch=1, now=100.0)
+    coord.on_dispatch(0, "A", champion_epoch=1, candidate_epoch=10, now=0.0)
+    coord.on_dispatch(1, "A", champion_epoch=1, candidate_epoch=10, now=100.0)
 
     # at t=40, pair 0 (dispatched t=0) is >30s old; pair 1 (t=100) is not.
     stuck = coord.reclaim_timed_out(now=40.0)

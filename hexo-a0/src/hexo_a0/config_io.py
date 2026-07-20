@@ -267,6 +267,33 @@ def _validate_config(cfg: FullConfig) -> None:
                 "inference_server (which uses the actor's CUDA torch venv)."
             )
 
+    # Fixed-candidate SPRT gate invariants.
+    cc = cfg.curriculum
+    if cc is not None:
+        if cc.sprt_candidate_max_games < 0:
+            raise ValueError(
+                "[curriculum] sprt_candidate_max_games must be >= 0."
+            )
+        if (
+            cc.sprt_pentanomial
+            and cc.sprt_candidate_max_games % 2 != 0
+        ):
+            raise ValueError(
+                "[curriculum] sprt_candidate_max_games must be even when "
+                "sprt_pentanomial=true."
+            )
+        if cc.sprt_opening_plies < 0:
+            raise ValueError("[curriculum] sprt_opening_plies must be >= 0.")
+        if cc.sprt_opening_temperature <= 0:
+            raise ValueError(
+                "[curriculum] sprt_opening_temperature must be > 0."
+            )
+        if cc.sprt_opening_generator not in ("alternate", "champion", "trainee"):
+            raise ValueError(
+                "[curriculum] sprt_opening_generator must be 'alternate', "
+                "'champion', or 'trainee'."
+            )
+
 
 # ---------------------------------------------------------------------------
 # Save

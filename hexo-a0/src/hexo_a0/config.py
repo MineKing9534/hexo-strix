@@ -422,8 +422,8 @@ class CurriculumConfig:
     # --- Mode: champion ---
     champion_threshold: float = _f(0.55, "Win rate vs champion to promote trainee to new champion. If mean win rate stays below this for `patience` evals, stage is considered plateaued and auto-advances (mode=champion).", group="Mode: champion")
     # --- Mode: sprt ---
-    # Continuous SPRT daemon runs a separate eval subprocess that plays games
-    # between the latest trainee checkpoint and the current champion, tests
+    # Continuous SPRT daemon runs a separate eval subprocess that leases one
+    # immutable trainee checkpoint per round against the current champion, tests
     # H0 (score = sprt_s0) vs H1 (score = sprt_s1) via Wald's SPRT, and
     # promotes on `accept_h1` / advances the stage on `reject_h1`.
     sprt_s0: float = _f(0.50, "Null hypothesis (trainee not stronger than champion) per-game score (mode=sprt).", group="Mode: sprt")
@@ -432,12 +432,16 @@ class CurriculumConfig:
     sprt_beta: float = _f(0.05, "Per-round SPRT type-II error rate — probability of failing to promote when trainee is actually stronger (mode=sprt). Ignored if sprt_beta_stage > 0.", group="Mode: sprt")
     sprt_alpha_stage: float = _f(0.0, "Desired stage-level false-promotion rate across sprt_reject_patience rounds. When > 0, overrides sprt_alpha with 1 - (1 - sprt_alpha_stage)^(1/patience). Example: sprt_alpha_stage=0.05 with patience=3 → sprt_alpha ≈ 0.017 per round (mode=sprt).", group="Mode: sprt")
     sprt_beta_stage: float = _f(0.0, "Desired stage-level false-plateau rate across sprt_reject_patience rounds. When > 0, overrides sprt_beta with sprt_beta_stage^(1/patience). Example: sprt_beta_stage=0.05 with patience=3 → sprt_beta ≈ 0.368 per round (mode=sprt).", group="Mode: sprt")
-    sprt_window_size: int = _f(1000, "Sliding window of recent games for SPRT state; older games are dropped. Must exceed the ~412-game accept horizon at s1, else a stronger trainee plateaus below the accept bound forever (dead band); 1000 ≈ 2.5× that horizon. 0 = unbounded accumulation (mode=sprt).", group="Mode: sprt")
+    sprt_window_size: int = _f(0, "SPRT outcome window. Fixed-candidate rounds should use 0 (unbounded) so Wald evidence accumulates normally; a finite value is retained only for legacy experiments and can create a dead band below the accept bound (mode=sprt).", group="Mode: sprt")
+    sprt_candidate_max_games: int = _f(4000, "Predetermined inconclusive horizon for one fixed candidate. If neither Wald bound is reached, discard the round and wait for the newest strictly newer checkpoint. Must be even in pentanomial mode. 0 = unbounded (mode=sprt).", group="Mode: sprt")
     sprt_mcts_sims: int = _f(16, "MCTS simulations per placement during SPRT eval games. 0 = raw policy (deterministic; breaks SPRT) (mode=sprt).", group="Mode: sprt")
     sprt_mcts_m_actions: int = _f(16, "Root candidate actions for SPRT eval MCTS (mode=sprt).", group="Mode: sprt")
     sprt_device: str = _f("cpu", "Device for SPRT daemon inference. 'cpu' keeps the daemon off the training GPU (mode=sprt).", group="Mode: sprt")
     sprt_eval_workers: int = _f(1, "Parallel SPRT pair-eval worker processes. 1 = inline serial play (unchanged). >1 spawns CPU workers that each play a whole P1+P2 pair concurrently, exploiting cores freed when self-play moves to a remote actor. Clamped to 1 unless sprt_device='cpu' (>1 on GPU = the occupancy-contention disaster) (mode=sprt).", group="Mode: sprt")
     sprt_poll_interval: float = _f(2.0, "Seconds between SPRT state-file polls by the trainer (mode=sprt).", group="Mode: sprt")
+    sprt_opening_plies: int = _f(8, "Noise-off paired-opening length for the SPRT gate. One sampled opening is replayed into both side-swapped games; 0 restores legacy noise-on evaluation (mode=sprt).", group="Mode: sprt")
+    sprt_opening_temperature: float = _f(0.5, "Sampling temperature for paired SPRT openings (mode=sprt).", group="Mode: sprt")
+    sprt_opening_generator: str = _f("alternate", "Model used to sample paired SPRT openings: 'alternate', 'champion', or 'trainee' (mode=sprt).", group="Mode: sprt")
     sprt_reject_patience: int = _f(3, "Consecutive SPRT rounds terminating in reject_h1 (since current champion was promoted) before declaring stage plateau and advancing. Each reject resets SPRT state and starts a new round against the same champion, so this controls how many independent rejections constitute plateau. Also the bootstrap floor for the auto-calibrated warn/decl thresholds and the round count N in the sprt_alpha_stage/sprt_beta_stage derivation. <= 0 disables the reject-patience plateau detector entirely (reject counts are still tracked for the CLI display and TB; prefer this over the old 9999 idiom) (mode=sprt).", group="Mode: sprt")
     sprt_promotion_grace_steps: int = _f(1000, "Training steps after a champion promotion (or stage start) during which reject_h1 rounds do not count toward sprt_reject_patience. Gives the trainee time to pull ahead of the just-promoted champion (which IS the trainee from a moment ago) before plateau is declared. 0 = no grace period (mode=sprt).", group="Mode: sprt")
     sprt_pentanomial: bool = _f(True, "Pair consecutive P1/P2 games and use 5-bucket pair scores as the statistical unit. Cancels first-player advantage — useful for games with significant side asymmetry like HeXO. False = classic per-game trinomial SPRT (mode=sprt).", group="Mode: sprt")

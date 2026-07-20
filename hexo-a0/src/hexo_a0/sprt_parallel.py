@@ -6,8 +6,9 @@ worker processes. This module holds the process-free coordination logic so the
 tricky invariants are unit-testable without real subprocesses:
 
   - inflight accounting that survives worker death (reclaim + re-dispatch),
-  - champion-epoch staleness (discard pairs played against a swapped-out
-    champion before they pollute the fresh round),
+  - champion/candidate-epoch staleness (discard pairs played against a
+    swapped-out champion or a completed candidate round before they pollute
+    the fresh round),
   - dispatch gating (no new work once a decision is reached),
   - per-pair timeout (reissue a silently-stuck pair).
 
@@ -23,7 +24,8 @@ from dataclasses import dataclass
 @dataclass
 class _Inflight:
     worker_id: object
-    epoch: int
+    champion_epoch: int
+    candidate_epoch: int
     dispatched_at: float
 
 
@@ -44,8 +46,17 @@ class PairCoordinator:
     def inflight_count(self) -> int:
         return len(self._inflight)
 
-    def on_dispatch(self, pair_id: int, worker_id: object, epoch: int, now: float) -> None:
-        self._inflight[pair_id] = _Inflight(worker_id, epoch, now)
+    def on_dispatch(
+        self,
+        pair_id: int,
+        worker_id: object,
+        champion_epoch: int,
+        candidate_epoch: int,
+        now: float,
+    ) -> None:
+        self._inflight[pair_id] = _Inflight(
+            worker_id, champion_epoch, candidate_epoch, now,
+        )
 
     def reclaim_dead(self, dead_worker_ids: set) -> list[int]:
         """Remove and return pair_ids assigned to dead workers for re-dispatch."""
@@ -56,7 +67,14 @@ class PairCoordinator:
             del self._inflight[pid]
         return reclaimed
 
-    def on_result(self, pair_id: int, played_epoch: int, current_epoch: int) -> bool:
+    def on_result(
+        self,
+        pair_id: int,
+        played_champion_epoch: int,
+        played_candidate_epoch: int,
+        current_champion_epoch: int,
+        current_candidate_epoch: int,
+    ) -> bool:
         """Retire an inflight pair. Return True if it should be recorded.
 
         Discarded (return False, no record) when:
@@ -64,12 +82,15 @@ class PairCoordinator:
             prior result, or reclaimed (dead/timed-out worker) and re-dispatched.
             Both the original and the reissue can complete; only the first to
             arrive counts, else the pair double-counts and mis-phases pairing.
-          - the pair was played against a since-swapped champion (played_epoch
-            != current_epoch): stale evidence for the fresh round.
+          - the pair was played against a since-swapped champion or under a
+            completed candidate round: stale evidence for the fresh round.
         """
         if self._inflight.pop(pair_id, None) is None:
             return False  # already retired (duplicate / reissued original)
-        return played_epoch == current_epoch
+        return (
+            played_champion_epoch == current_champion_epoch
+            and played_candidate_epoch == current_candidate_epoch
+        )
 
     def reclaim_timed_out(self, now: float) -> list[int]:
         """Remove and return pair_ids in flight longer than pair_timeout.
@@ -90,12 +111,6 @@ class PairCoordinator:
         """How many new pairs to dispatch this cycle.
 
         Zero once a decision is reached (drain-only until the round resets).
-
-        Deliberately NOT gated on the trainee-swap freeze: the freeze only
-        exits via played games (LLR moving past a bound, or frozen_games
-        reaching a window for stall-unfreeze), so halting dispatch while
-        frozen deadlocks the round once the inflight pairs drain. The held
-        trainee snapshot is exactly what the frozen round must keep playing.
         """
         if decision != "continue":
             return 0

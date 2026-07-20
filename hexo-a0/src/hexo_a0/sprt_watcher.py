@@ -56,6 +56,11 @@ class SPRTDecision:
     pairs: int  # completed pentanomial pairs (0 in trinomial mode)
     empirical_pair_variance: float | None  # sample variance of pair scores in current window
     peak_history: list[int] = dataclasses.field(default_factory=list)  # reject_count peaks at each prior promotion in stage
+    round_id: int = 0
+    round_status: str = "running"
+    candidate_step: int | None = None
+    latest_available_step: int | None = None
+    candidate_lag_steps: int | None = None
 
 
 class SPRTWatcher:
@@ -93,6 +98,10 @@ class SPRTWatcher:
         adaptive_pair_variance_floor: float = 0.20,
         adaptive_pair_variance_ceil: float = 0.50,
         adaptive_pair_variance_ema_alpha: float = 0.30,
+        candidate_max_games: int = 4000,
+        opening_plies: int = 8,
+        opening_temperature: float = 0.5,
+        opening_generator: str = "alternate",
         stale_after: float = 300.0,
     ) -> None:
         self.config_path = config_path
@@ -116,9 +125,14 @@ class SPRTWatcher:
         self.adaptive_pair_variance_floor = adaptive_pair_variance_floor
         self.adaptive_pair_variance_ceil = adaptive_pair_variance_ceil
         self.adaptive_pair_variance_ema_alpha = adaptive_pair_variance_ema_alpha
+        self.candidate_max_games = candidate_max_games
+        self.opening_plies = opening_plies
+        self.opening_temperature = opening_temperature
+        self.opening_generator = opening_generator
         self.stale_after = stale_after
         self._proc: subprocess.Popen | None = None
         self._log_fh = None
+        self._started_at: float | None = None
 
     def start(self) -> None:
         """Launch the daemon subprocess.
@@ -158,6 +172,10 @@ class SPRTWatcher:
             "--eval-workers", str(self.eval_workers),
             "--poll-interval", str(self.poll_interval),
             "--pair-variance", str(self.pair_variance),
+            "--candidate-max-games", str(self.candidate_max_games),
+            "--opening-plies", str(self.opening_plies),
+            "--opening-temperature", str(self.opening_temperature),
+            "--opening-generator", self.opening_generator,
             "--pentanomial" if self.pentanomial else "--trinomial",
         ]
         if self.adaptive_pair_variance:
@@ -170,6 +188,7 @@ class SPRTWatcher:
         log_path = self.state_file.parent / "sprt_daemon.log"
         logger.info("Starting SPRT daemon (log: %s)", log_path)
         self._log_fh = open(log_path, "a", buffering=1)
+        self._started_at = time.time()
         self._proc = subprocess.Popen(
             cmd,
             start_new_session=True,
@@ -223,6 +242,13 @@ class SPRTWatcher:
         ts = payload.get("timestamp", 0.0)
         age = time.time() - ts
 
+        # The state file intentionally survives restarts, but an old terminal
+        # decision must not race the freshly-started daemon's restore/spec
+        # compatibility checks. Wait until this daemon instance has rewritten
+        # or heartbeated the state at least once.
+        if self._started_at is not None and ts < self._started_at:
+            return None
+
         # Staleness only matters when the daemon is supposed to be making
         # progress (decision == "continue"). Terminal decisions (accept_h1,
         # reject_h1) are idle-by-design: the daemon stops writing while
@@ -252,4 +278,9 @@ class SPRTWatcher:
             pairs=int(state.get("pairs", 0)),
             empirical_pair_variance=payload.get("empirical_pair_variance"),
             peak_history=[int(x) for x in ph if isinstance(x, int)],
+            round_id=int(payload.get("round_id", 0)),
+            round_status=str(payload.get("round_status", "running")),
+            candidate_step=payload.get("candidate_step"),
+            latest_available_step=payload.get("latest_available_step"),
+            candidate_lag_steps=payload.get("candidate_lag_steps"),
         )

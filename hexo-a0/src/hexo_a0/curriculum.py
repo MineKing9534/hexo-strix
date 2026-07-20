@@ -655,11 +655,15 @@ def run_curriculum(
         sprt_alpha = stage.get("sprt_alpha", cfg.curriculum.sprt_alpha)
         sprt_beta = stage.get("sprt_beta", cfg.curriculum.sprt_beta)
         sprt_window_size = stage.get("sprt_window_size", cfg.curriculum.sprt_window_size)
+        sprt_candidate_max_games = stage.get("sprt_candidate_max_games", cfg.curriculum.sprt_candidate_max_games)
         sprt_mcts_sims = stage.get("sprt_mcts_sims", cfg.curriculum.sprt_mcts_sims)
         sprt_mcts_m_actions = stage.get("sprt_mcts_m_actions", cfg.curriculum.sprt_mcts_m_actions)
         sprt_device = stage.get("sprt_device", cfg.curriculum.sprt_device)
         sprt_eval_workers = stage.get("sprt_eval_workers", cfg.curriculum.sprt_eval_workers)
         sprt_poll_interval = stage.get("sprt_poll_interval", cfg.curriculum.sprt_poll_interval)
+        sprt_opening_plies = stage.get("sprt_opening_plies", cfg.curriculum.sprt_opening_plies)
+        sprt_opening_temperature = stage.get("sprt_opening_temperature", cfg.curriculum.sprt_opening_temperature)
+        sprt_opening_generator = stage.get("sprt_opening_generator", cfg.curriculum.sprt_opening_generator)
         sprt_reject_patience = stage.get("sprt_reject_patience", cfg.curriculum.sprt_reject_patience)
         sprt_promotion_grace_steps = stage.get("sprt_promotion_grace_steps", cfg.curriculum.sprt_promotion_grace_steps)
         sprt_pentanomial = stage.get("sprt_pentanomial", cfg.curriculum.sprt_pentanomial)
@@ -1079,6 +1083,10 @@ def run_curriculum(
                 adaptive_pair_variance_floor=sprt_adaptive_pv_floor,
                 adaptive_pair_variance_ceil=sprt_adaptive_pv_ceil,
                 adaptive_pair_variance_ema_alpha=sprt_adaptive_pv_ema_alpha,
+                candidate_max_games=sprt_candidate_max_games,
+                opening_plies=sprt_opening_plies,
+                opening_temperature=sprt_opening_temperature,
+                opening_generator=sprt_opening_generator,
             )
             sprt_watcher.start()
             logger.info("SPRT daemon launched; state file at %s", sprt_watcher.state_file)
@@ -1268,6 +1276,17 @@ def run_curriculum(
                                 trainer.writer.add_scalar("sprt/loss_rate", dec.losses / dec.games, step)
                             trainer.writer.add_scalar("sprt/reject_count", dec.reject_count, step)
                             trainer.writer.add_scalar("sprt/pairs", dec.pairs, step)
+                            trainer.writer.add_scalar("sprt/round_id", dec.round_id, step)
+                            if dec.candidate_step is not None:
+                                trainer.writer.add_scalar(
+                                    "sprt/candidate_step", dec.candidate_step, step,
+                                )
+                            if dec.candidate_lag_steps is not None:
+                                trainer.writer.add_scalar(
+                                    "sprt/candidate_lag_steps",
+                                    dec.candidate_lag_steps,
+                                    step,
+                                )
                             if dec.empirical_pair_variance is not None:
                                 trainer.writer.add_scalar(
                                     "sprt/empirical_pair_variance",

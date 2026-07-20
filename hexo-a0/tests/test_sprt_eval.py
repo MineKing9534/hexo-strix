@@ -1,4 +1,4 @@
-"""Tests for SPRT decision math, sliding-window sizing, and swap-freeze logic.
+"""Tests for SPRT decision math, window sizing, and fixed-round restore logic.
 
 These lock in the 2026-06-04 sizing decision: the sliding window must exceed
 the natural decision horizon for the H1 effect size (~412 games at s1=0.55),
@@ -13,7 +13,6 @@ from hexo_a0.sprt_eval import (
     SPRTState,
     checkpoint_step,
     restore_decision,
-    swap_decision,
 )
 
 
@@ -59,51 +58,6 @@ def test_sustained_s1_stream_stalls_under_narrow_window():
     _, upper = cfg.bounds()
     assert state.decision == "continue"
     assert state.llr < upper
-
-
-def test_swap_freeze_threshold_is_fraction_of_upper():
-    cfg = SPRTConfig()
-    _, upper = cfg.bounds()
-    assert cfg.swap_freeze_fraction == 0.9
-    assert cfg.swap_freeze_threshold() == 0.9 * upper
-
-
-def test_swap_not_frozen_below_threshold():
-    cfg = SPRTConfig()
-    freeze_active, stall = swap_decision(
-        llr=cfg.swap_freeze_threshold() - 0.01, frozen_games=0, cfg=cfg
-    )
-    assert freeze_active is False
-    assert stall is False
-
-
-def test_swap_frozen_in_zone_before_stall():
-    cfg = SPRTConfig()  # window 1000
-    freeze_active, stall = swap_decision(
-        llr=cfg.swap_freeze_threshold() + 0.01, frozen_games=500, cfg=cfg
-    )
-    assert freeze_active is True
-    assert stall is False
-
-
-def test_swap_stall_unfreezes_after_full_window_frozen():
-    cfg = SPRTConfig()  # window 1000
-    freeze_active, stall = swap_decision(
-        llr=cfg.swap_freeze_threshold() + 0.01, frozen_games=1000, cfg=cfg
-    )
-    assert freeze_active is False
-    assert stall is True
-
-
-def test_swap_stall_uses_fallback_limit_when_unbounded():
-    cfg = SPRTConfig(window_size=None)
-    high = cfg.swap_freeze_threshold() + 0.01
-    # Below fallback → still frozen
-    fa_lo, st_lo = swap_decision(llr=high, frozen_games=999, cfg=cfg, stall_fallback=1000)
-    assert (fa_lo, st_lo) == (True, False)
-    # At/above fallback → stall-unfreeze
-    fa_hi, st_hi = swap_decision(llr=high, frozen_games=1000, cfg=cfg, stall_fallback=1000)
-    assert (fa_hi, st_hi) == (False, True)
 
 
 def test_from_dict_drops_trailing_odd_outcome_to_keep_pairs_aligned():
@@ -174,6 +128,28 @@ def test_restore_decision_blocks_obsolete_trainee_evidence():
         prior_trainee_step=10000, latest_trainee_step=15000,
     )
     assert ok is True
+
+
+def test_fixed_candidate_restore_ignores_newer_training_checkpoints():
+    """A leased candidate remains the tested population even if training races ahead."""
+    ok, reasons = restore_decision(
+        prior_decision="continue", same_champion=True,
+        prior_trainee_step=10000, latest_trainee_step=50000,
+        fixed_candidate=True, same_test_spec=True, candidate_exists=True,
+    )
+    assert ok is True
+    assert reasons == []
+
+
+def test_fixed_candidate_restore_requires_same_spec_and_candidate_file():
+    ok, reasons = restore_decision(
+        prior_decision="continue", same_champion=True,
+        prior_trainee_step=10000, latest_trainee_step=10000,
+        fixed_candidate=True, same_test_spec=False, candidate_exists=False,
+    )
+    assert ok is False
+    assert any("specification" in r for r in reasons)
+    assert any("candidate" in r for r in reasons)
 
 
 def test_restore_decision_unknown_steps_do_not_block():

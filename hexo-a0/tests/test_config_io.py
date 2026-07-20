@@ -407,6 +407,37 @@ graft_threat_features = true
         assert cfg.training.graft_threat_features is True
 
 
+class TestFixedCandidateSPRTConfig:
+    def test_explicit_gate_settings_load(self):
+        cfg = load_config(_write_tmp("""
+[curriculum]
+sprt_candidate_max_games = 4000
+sprt_opening_plies = 8
+sprt_opening_temperature = 0.5
+sprt_opening_generator = "champion"
+"""))
+        assert cfg.curriculum is not None
+        assert cfg.curriculum.sprt_candidate_max_games == 4000
+        assert cfg.curriculum.sprt_opening_plies == 8
+        assert cfg.curriculum.sprt_opening_temperature == pytest.approx(0.5)
+        assert cfg.curriculum.sprt_opening_generator == "champion"
+
+    def test_odd_pentanomial_horizon_rejected(self):
+        with pytest.raises(ValueError, match="must be even"):
+            load_config(_write_tmp("""
+[curriculum]
+sprt_pentanomial = true
+sprt_candidate_max_games = 3999
+"""))
+
+    def test_unknown_opening_generator_rejected(self):
+        with pytest.raises(ValueError, match="sprt_opening_generator"):
+            load_config(_write_tmp("""
+[curriculum]
+sprt_opening_generator = "latest"
+"""))
+
+
 class TestExports:
     def test_exported(self):
         import hexo_a0
