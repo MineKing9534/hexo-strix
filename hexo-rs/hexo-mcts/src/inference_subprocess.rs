@@ -71,6 +71,20 @@ const FNV64_PRIME: u64 = 0x0000_0100_0000_01B3;
 /// peer, so we reject it instead of allocating an arbitrarily large buffer.
 const MAX_STATES_ERROR_LEN: usize = 1 << 20; // 1 MiB
 
+/// One FNV-1a step folding a `(q, r)` coord (each as i32 little-endian) into an
+/// accumulator. Shared by `legal_coords_fnv1a64` and `fnv1a64_qr_hashes` so the
+/// two hashers cannot drift from `_fnv1a64`'s byte stream.
+#[inline]
+fn fnv1a_step_qr(mut h: u64, q: i32, r: i32) -> u64 {
+    for b in q.to_le_bytes() {
+        h = (h ^ b as u64).wrapping_mul(FNV64_PRIME);
+    }
+    for b in r.to_le_bytes() {
+        h = (h ^ b as u64).wrapping_mul(FNV64_PRIME);
+    }
+    h
+}
+
 /// FNV-1a 64 over the legal-move coords, hashed as `(q: i32 LE, r: i32 LE)`
 /// per move, in `legal_moves()` order. Must stay bit-identical to
 /// `_fnv1a64` over the server's rebuilt legal coords (the order guard:
@@ -78,14 +92,39 @@ const MAX_STATES_ERROR_LEN: usize = 1 << 20; // 1 MiB
 pub fn legal_coords_fnv1a64(coords: &[Coord]) -> u64 {
     let mut h = FNV64_OFFSET;
     for &(q, r) in coords {
-        for b in q.to_le_bytes() {
-            h = (h ^ b as u64).wrapping_mul(FNV64_PRIME);
-        }
-        for b in r.to_le_bytes() {
-            h = (h ^ b as u64).wrapping_mul(FNV64_PRIME);
-        }
+        h = fnv1a_step_qr(h, q, r);
     }
     h
+}
+
+/// Per-graph FNV-1a legal-coord hashes over a batched, interleaved coord
+/// stream — the Rust core of the `fnv1a64_qr_hashes` pyfunction (the server's
+/// hot-path replacement for the pure-Python hash loop, ~6 ms/batch at b=8).
+///
+/// `flat_qr` is `[q0, r0, q1, r1, ...]` (each i32); `counts[i]` is graph `i`'s
+/// coord count, so graph `i` consumes `2 * counts[i]` entries. Returns one u64
+/// per graph, byte-identical to `legal_coords_fnv1a64` / Python `_fnv1a64`.
+/// Pure (no Python) so it is unit-testable directly.
+pub fn fnv1a64_qr_hashes(flat_qr: &[i32], counts: &[usize]) -> Result<Vec<u64>, String> {
+    let total: usize = counts.iter().sum();
+    if flat_qr.len() != total * 2 {
+        return Err(format!(
+            "flat_qr length {} != 2 * sum(counts) {} (interleaved q,r stream)",
+            flat_qr.len(),
+            total * 2
+        ));
+    }
+    let mut out = Vec::with_capacity(counts.len());
+    let mut pos = 0usize;
+    for &count in counts {
+        let mut h = FNV64_OFFSET;
+        for _ in 0..count {
+            h = fnv1a_step_qr(h, flat_qr[pos], flat_qr[pos + 1]);
+            pos += 2;
+        }
+        out.push(h);
+    }
+    Ok(out)
 }
 
 /// Canonical int32 HexKey (perf-plan §1): `(q << 16) | ((r ^ 0x8000) & 0xFFFF)`
@@ -1050,6 +1089,35 @@ mod wire_states_tests {
             legal_coords_fnv1a64(&[(3, 4), (1, -2)]),
             "the legal hash is an ORDER guard; permutations must not collide"
         );
+    }
+
+    #[test]
+    fn fnv_qr_hashes_batch_matches_per_graph() {
+        // Interleaved [q,r,...] with per-graph counts; each graph's hash must
+        // equal legal_coords_fnv1a64 (hence Python _fnv1a64) on the same coords.
+        let flat = [0i32, 0, 1, -2, 3, 4, 5, -6];
+        let counts = [1usize, 2, 1]; // graphs: [(0,0)], [(1,-2),(3,4)], [(5,-6)]
+        let got = fnv1a64_qr_hashes(&flat, &counts).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], legal_coords_fnv1a64(&[(0, 0)]));
+        assert_eq!(got[1], legal_coords_fnv1a64(&[(1, -2), (3, 4)]));
+        assert_eq!(got[2], legal_coords_fnv1a64(&[(5, -6)]));
+        // Pinned known vectors (== Python server _fnv1a64).
+        assert_eq!(got[0], 0xA8C7_F832_281A_39C5);
+        assert_eq!(got[1], 0x2443_889E_E246_9E16);
+    }
+
+    #[test]
+    fn fnv_qr_hashes_empty_graph_is_offset_basis() {
+        // A zero-count graph consumes no coords and hashes to the FNV basis.
+        let got = fnv1a64_qr_hashes(&[1, 2], &[0, 1]).unwrap();
+        assert_eq!(got, vec![0xCBF2_9CE4_8422_2325, legal_coords_fnv1a64(&[(1, 2)])]);
+    }
+
+    #[test]
+    fn fnv_qr_hashes_rejects_length_mismatch() {
+        // flat_qr must hold exactly 2 * sum(counts) entries.
+        assert!(fnv1a64_qr_hashes(&[0, 0, 1], &[1, 1]).is_err());
     }
 
     // --- pack_hexkey -------------------------------------------------------

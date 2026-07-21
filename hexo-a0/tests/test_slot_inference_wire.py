@@ -67,6 +67,8 @@ from hexo_a0.inference_server import (
     StatesRequestError,
     _pad_slot_batch,
     _round_pow2,
+    _slot_bucket_n,
+    _slot_bucket_shape,
     _states_slot_node_counts,
     _validate_states_slot,
 )
@@ -232,6 +234,67 @@ def test_build_slot_batch_from_keys_matches_states_path():
             "aux legal ordering != engine legal_moves() order"
         )
         offset += n
+
+
+# ---------------------------------------------------------------------------
+# Task 2: compiled build core (the one the slot server injects via core_fn)
+# must be bit-identical to the eager core on real graphs. gpu-named so the
+# default suite deselects it (torch.compile-on-CPU is slow); matches the bench,
+# which compiled the build core on CUDA.
+# ---------------------------------------------------------------------------
+
+def test_slot_build_compiled_core_matches_eager_gpu():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    from hexo_a0.inference_server import _slot_bucket_n
+    from hexo_a0.slot_graph import (
+        SlotBatch,
+        SlotBuilderConfig,
+        _build_slot_batch_core,
+        build_slot_batch_from_keys,
+    )
+
+    games = _e2e_games()
+    cfg = SlotBuilderConfig(
+        win_length=SMALL["win_length"],
+        placement_radius=SMALL["placement_radius"],
+        prune_empty_edges=True,
+    )
+    keyed = []
+    for g in games:
+        stones = g.placed_stones()
+        p1 = [_pack_hexkey(q, r) for (q, r), p in stones if p == "P1"]
+        p2 = [_pack_hexkey(q, r) for (q, r), p in stones if p == "P2"]
+        keyed.append((p1, p2, 0 if g.current_player() == "P1" else 1,
+                      g.moves_remaining_this_turn()))
+
+    dev = torch.device("cuda")
+    # Same mult-128 N bucket the server pads to, so the compiled core traces a
+    # static shape (exactly _handle_states_slot's path).
+    n_max = build_slot_batch_from_keys(keyed, cfg, device=dev).node_mask.shape[1]
+    pad_to = _slot_bucket_n(n_max)
+
+    eager, eaux = build_slot_batch_from_keys(
+        keyed, cfg, device=dev, pad_to=pad_to, return_aux=True
+    )
+
+    torch._dynamo.reset()
+    compiled_core = torch.compile(
+        _build_slot_batch_core, mode="default", dynamic=False
+    )
+    try:
+        got, gaux = build_slot_batch_from_keys(
+            keyed, cfg, device=dev, pad_to=pad_to, return_aux=True,
+            core_fn=compiled_core,
+        )
+        for field in dataclasses.fields(SlotBatch):
+            a, b = getattr(got, field.name), getattr(eager, field.name)
+            assert a.dtype == b.dtype and a.shape == b.shape, field.name
+            assert torch.equal(a, b), f"SlotBatch.{field.name} differs (compiled vs eager)"
+        assert torch.equal(gaux.legal_keys, eaux.legal_keys)
+        assert torch.equal(gaux.legal_counts, eaux.legal_counts)
+    finally:
+        torch._dynamo.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -492,8 +555,11 @@ def test_validate_states_slot_budget_ignores_wire_num_legal():
 def test_validate_states_slot_budget_passes_when_geometry_is_small():
     """Control: the SAME lie is harmless when the server-bounded geometry is
     small — proves the budget rejection above is driven by the server bound,
-    not merely by the tiny --slot-activation-budget-mb."""
-    args = _slot_args(slot_activation_budget_mb=1.0)
+    not merely by the tiny --slot-activation-budget-mb. (The 1-stone radius-2
+    geometry pads to the 128-node N floor, ~1.1 MiB at these dims, so the still-
+    tiny 2 MiB budget it clears is far below what the 50-stone case above blows.)
+    """
+    args = _slot_args(slot_activation_budget_mb=2.0)
     g = ([_pack_hexkey(0, 0)], [], 0, 2, 0)  # 1 stone, radius 2
     win_length, placement_radius, graphs = _validate_states_slot(
         _slot_frame([g], placement_radius=2), args
@@ -516,10 +582,11 @@ def test_states_slot_node_counts_dedupes_disk_overlap():
 
 def test_validate_states_slot_budget_uses_padded_pow2_shape():
     """PY2-W1: the budget must estimate on the PADDED [B, N] the forward actually
-    allocates (both dims rounded to powers of two via _round_pow2), not the raw
-    counts. pow2 bucketing can ~4x the dense [B, N, S, H] tensor, so a raw-count
-    estimate under-reports and could still OOM. Pick a budget the UNPADDED
-    estimate clears but the PADDED one (what _handle_states_slot builds) exceeds.
+    allocates (B rounded to a power of two, N to a multiple of 128 via the shared
+    _slot_bucket_b / _slot_bucket_n helpers), not the raw counts. The pad enlarges
+    the dense [B, N, S, H] tensor, so a raw-count estimate under-reports and could
+    still OOM. Pick a budget the UNPADDED estimate clears but the PADDED one (what
+    _handle_states_slot builds) exceeds.
     R3C-W1: node count is the EXACT disk-union size; element size defaults to
     4 B (CPU f32) and the ×3 builder-intermediate margin is part of the formula.
     """
@@ -529,7 +596,7 @@ def test_validate_states_slot_budget_uses_padded_pow2_shape():
     n_max_est = _states_slot_node_counts([g], radius)[0]  # exact = 19
     unpadded = 1 * n_max_est * num_slots * hidden * 4 * 3
     padded = (
-        _round_pow2(1) * _round_pow2(n_max_est, floor=8) * num_slots * hidden * 4 * 3
+        _round_pow2(1) * _slot_bucket_n(n_max_est) * num_slots * hidden * 4 * 3
     )
     assert padded > unpadded, "test needs the pad to actually enlarge the alloc"
 
@@ -638,23 +705,82 @@ def test_validate_states_slot_rejects_genuinely_huge_batch():
         _validate_states_slot(huge_frame, args)
 
 
+def test_slot_budget_default_clears_edge_budgeted_production_batch():
+    """A3 task-7 budget-default sanity at PRODUCTION dims (hidden 256, win_length
+    6 -> 30 slots, bf16 activations). An edge-budget-shaped batch
+    (max_batch_edges=45000 semantics: prune-aware ~6 edges/node -> ~7.5k total
+    nodes -> a handful of radius-8 games — the shape the Rust client actually
+    ships) must clear the DEFAULT --slot-activation-budget-mb (4096).
+
+    Verified with the REAL padded-pow2 estimator (_validate_states_slot), NOT
+    hand arithmetic: the R5 sketch (32 graphs x n_bucket 512 x 30 x 256 x 2 x 3
+    ~ 7.2 GB) was the wrong SHAPE. A radius-8 ~30-stone game's exact disk-union
+    node count is ~2000, so n_bucket is 2048 (not 512), while an edge-budgeted
+    batch is ~4 graphs (b_bucket 4, not 32). The real estimate is ~360 MiB —
+    ~11x under the 4096 default, so NO bump is needed.
+    """
+    # Accumulate radius-8 games until the prune-aware edge estimate (~6/node,
+    # the client's batching heuristic) would exceed max_batch_edges.
+    MAX_EDGES = 45000
+    pool = _random_radius8_graphs(40, seed=2024)
+    counts = _states_slot_node_counts(pool, 8)
+    batch, total_edges = [], 0
+    for g, c in zip(pool, counts):
+        if batch and total_edges + c * 6 > MAX_EDGES:
+            break
+        batch.append(g)
+        total_edges += c * 6
+    total_nodes = sum(_states_slot_node_counts(batch, 8))
+    # The "handful of graphs, ~7.5k nodes" shape the ledger describes.
+    assert 1 < len(batch) <= 12, len(batch)
+    assert 4000 < total_nodes < 12000, total_nodes
+
+    HIDDEN, WIN, BPE, DEFAULT_MB = 256, 6, 2, 4096.0  # bf16 = 2 bytes (CUDA prod)
+    args = _slot_args(
+        win_length=WIN, hidden_dim=HIDDEN, slot_activation_budget_mb=DEFAULT_MB
+    )
+    frame = (len(batch), WIN, 8, 300, FLAG_PRUNE, NODE_DIM, batch)
+    # Real estimator, bf16 activations: must NOT raise at the default budget.
+    _win, _rad, got = _validate_states_slot(frame, args, bytes_per_elem=BPE)
+    assert got == batch
+
+    # Recompute the estimate the guard uses, to pin the derivation + headroom.
+    n_max = max(_states_slot_node_counts(batch, 8))
+    b_bucket, n_bucket = _round_pow2(len(batch)), _round_pow2(n_max, floor=8)
+    est_mb = (b_bucket * n_bucket * (6 * (WIN - 1)) * HIDDEN * BPE * 3) / 2**20
+    # The R5 sketch's n_bucket=512 was wrong: real n_max ~2000 -> 2048.
+    assert n_bucket == 2048, (n_max, n_bucket)
+    assert est_mb < DEFAULT_MB, (est_mb, DEFAULT_MB)
+    # Comfortable headroom -> the 4096 default needs no bump (>2x margin).
+    assert est_mb * 2 < DEFAULT_MB, (
+        "edge-budget batch estimate + 2x headroom must fit the default", est_mb
+    )
+
+
 # ---------------------------------------------------------------------------
 # Slot padding buckets (PY-4): few compiled shapes under dynamic=False
 # ---------------------------------------------------------------------------
 
 def test_round_pow2_buckets_nearby_sizes_together():
+    # B keeps pow2 bucketing (few distinct batch sizes).
     assert _round_pow2(1) == 1
     assert _round_pow2(9) == _round_pow2(15) == _round_pow2(16) == 16
     assert _round_pow2(17) == 32
-    assert _round_pow2(3, floor=8) == 8
-    assert _round_pow2(100, floor=8) == 128
+    # N buckets to multiples of 128 (min 128). pow2 pathologically rounds the
+    # production N≈2053 up to 4096; mult-128 lands on 2176 (the bench basis).
+    assert _slot_bucket_n(3) == 128
+    assert _slot_bucket_n(100) == 128
+    assert _slot_bucket_n(128) == 128
+    assert _slot_bucket_n(129) == 256
+    assert _slot_bucket_n(2053) == 2176 != _round_pow2(2053) == 4096
 
 
 def test_nearby_sizes_bucket_to_same_padded_shape():
     """PY-4: two requests with nearby node counts round to the SAME padded [B, N]
     shape, so torch.compile(dynamic=False) sees a handful of shapes, not one per
-    request."""
-    assert _round_pow2(9, floor=8) == _round_pow2(11, floor=8) == 16
+    request. N buckets to multiples of 128, B to powers of two."""
+    assert _slot_bucket_n(9) == _slot_bucket_n(100) == 128  # nearby N → same bucket
+    assert _slot_bucket_n(200) == _slot_bucket_n(256) == 256
     assert _round_pow2(3) == _round_pow2(4) == 4  # nearby B → same bucket
 
 
@@ -692,6 +818,43 @@ def test_pad_slot_batch_shapes_and_real_region_preserved():
     assert not padded.filled[b:, :, :].any() and not padded.filled[:, n:, :].any()
     # A no-op pad (already at the target) returns the same object.
     assert _pad_slot_batch(padded, b_to, n_to) is padded
+
+
+def test_warmup_traces_same_padded_bucket_as_first_request():
+    """R5 warmup-shape: _warmup_slot must trace the compile on the SAME padded
+    (B, N) pow2 bucket production requests hit, else the FIRST real request pays
+    a recompile under compile(dynamic=False). Unit-level on the shared helpers:
+    _warmup_slot now runs its build through ``_slot_bucket_shape`` +
+    ``_pad_slot_batch`` (exactly as ``_handle_states_slot`` does), landing on a
+    pow2 bucket that PADS the raw shape; a first tiny request buckets the same.
+    """
+    from hexo_a0.slot_graph import build_slot_batch_from_keys, pack
+    from hexo_a0.inference_server import _slot_builder_config
+
+    args = _slot_args(win_length=WIN_LENGTH, hidden_dim=32)
+    origin = int(pack(torch.tensor([0]), torch.tensor([0]))[0])
+    wcfg = _slot_builder_config(args, args.win_length, placement_radius=1)
+
+    # Warmup batch (mirror _warmup_slot's build), then the shared pad path.
+    warm = build_slot_batch_from_keys([([origin], [], 0, 2)], wcfg)
+    wb, wn = _slot_bucket_shape(warm)
+    warm_padded = _pad_slot_batch(warm, wb, wn)
+
+    # B is a power of two, N a multiple of 128; both PAD (never truncate).
+    assert wb & (wb - 1) == 0, wb
+    assert wn % 128 == 0, wn
+    assert wb >= warm.num_graphs and wn >= warm.node_mask.shape[1]
+    assert warm_padded.node_mask.shape == (wb, wn)
+    # The pad actually changes N (raw 7 -> mult128 bucket 128): this is precisely
+    # the recompile the old unpadded warmup used to trigger on the first request.
+    assert wn != warm.node_mask.shape[1], "warmup N already bucketed; pad not observable"
+
+    # A first tiny request (different content — P2 to move, mr=1 — same 1-graph
+    # radius-1 geometry) buckets IDENTICALLY, so warmup's trace is reused.
+    req = build_slot_batch_from_keys([([origin], [], 1, 1)], wcfg)
+    assert _slot_bucket_shape(req) == (wb, wn)
+    req_padded = _pad_slot_batch(req, *_slot_bucket_shape(req))
+    assert req_padded.node_mask.shape == warm_padded.node_mask.shape
 
 
 # ---------------------------------------------------------------------------

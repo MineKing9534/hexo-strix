@@ -1668,6 +1668,16 @@ fn py_augment_axis_states_to_batch_bytes(
 ///     `(first_move, pv)` — the first move of the forced win and its full
 ///     principal variation (both attacker and defender replies), or `None` if
 ///     no forced win was found within `depth_cap` / `node_budget`.
+/// Per-graph FNV-1a legal-coord hashes for the inference server's states
+/// order-guard (replaces the ~6 ms/batch pure-Python hash loop). `flat_qr` is
+/// the interleaved `[q0, r0, q1, r1, ...]` int32 coord stream; `counts[i]` is
+/// graph `i`'s coord count. Byte-identical to Python `_fnv1a64` per graph.
+#[pyfunction]
+fn fnv1a64_qr_hashes(flat_qr: Vec<i32>, counts: Vec<usize>) -> PyResult<Vec<u64>> {
+    crate::inference_subprocess::fnv1a64_qr_hashes(&flat_qr, &counts)
+        .map_err(PyValueError::new_err)
+}
+
 #[pyfunction]
 #[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000, wide=false))]
 fn solve_forcing(
@@ -1845,6 +1855,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_augment_graph, m)?)?;
     m.add_function(wrap_pyfunction!(py_augment_axis_graph, m)?)?;
     m.add_function(wrap_pyfunction!(py_batched_self_play, m)?)?;
+    m.add_function(wrap_pyfunction!(fnv1a64_qr_hashes, m)?)?;
     m.add_function(wrap_pyfunction!(solve_forcing, m)?)?;
     m.add_function(wrap_pyfunction!(solve_threat, m)?)?;
     m.add_function(wrap_pyfunction!(solve_defense, m)?)?;

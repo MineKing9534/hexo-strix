@@ -2061,6 +2061,11 @@ fn main() {
     // `--slot-inference --win-length N` to the server so it converts the
     // (legacy GINE) checkpoint to the slot model at startup.
     let mut slot_inference = false;
+    // --slot-activation-budget-mb (plan-A3 task 7 rollout tuning): optional
+    // override for the server's A2 activation-memory guard cap (MiB). Only valid
+    // with --slot-inference; when unset the flag is omitted and the server keeps
+    // its own default. Forwarded verbatim via subprocess_model_args.
+    let mut slot_activation_budget_mb: Option<u32> = None;
 
     // Python subprocess inference flags
     let mut python_inference = false;
@@ -2183,6 +2188,7 @@ fn main() {
             "--emit-q" => { emit_q = true; i += 1; }
             "--wire-states" => { wire_states = true; i += 1; }
             "--slot-inference" => { slot_inference = true; i += 1; }
+            "--slot-activation-budget-mb" => { slot_activation_budget_mb = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--shape-hist" => { #[allow(unused)] { shape_hist = true; } i += 1; }
             "--playout-cap-divisor" => {
                 playout_cap_divisor = args[i + 1].parse().unwrap();
@@ -2374,6 +2380,17 @@ fn main() {
         );
         std::process::exit(1);
     }
+    // --slot-activation-budget-mb only tunes the slot backend's memory guard;
+    // without --slot-inference there is no slot forward and the server would
+    // reject the flag, so fail fast here with a clear message.
+    if slot_activation_budget_mb.is_some() && !slot_inference {
+        eprintln!(
+            "--slot-activation-budget-mb requires --slot-inference: it caps the \
+             A2 slot backend's activation-memory guard, which only exists on the \
+             slot inference path."
+        );
+        std::process::exit(1);
+    }
     let states_cfg: Option<StatesWireConfig> = if wire_states {
         if !python_inference {
             eprintln!(
@@ -2549,6 +2566,7 @@ fn main() {
                 model_use_jk, &model_jk_mode,
                 threat_features, relative_stones,
                 slot_inference, win_length,
+                slot_activation_budget_mb,
             );
             eprintln!("Spawning Python inference subprocess...");
             if inference_double_buffer {
@@ -2726,6 +2744,7 @@ fn main() {
                 model_use_jk, &model_jk_mode,
                 threat_features, relative_stones,
                 slot_inference, win_length,
+                slot_activation_budget_mb,
             );
             if n_workers > 1 {
                 let dispatch_label = match inference_dispatch {
@@ -2942,6 +2961,7 @@ fn subprocess_model_args(
     relative_stones: bool,
     slot_inference: bool,
     win_length: u8,
+    slot_activation_budget_mb: Option<u32>,
 ) -> Vec<String> {
     let mut v = vec![
         "--hidden-dim".into(), hidden_dim.to_string(),
@@ -2979,6 +2999,13 @@ fn subprocess_model_args(
         v.push("--slot-inference".into());
         v.push("--win-length".into());
         v.push(win_length.to_string());
+        // Only forward an explicit budget override; when None the server keeps
+        // its own default. Gated on slot_inference (CLI validation guarantees
+        // the budget is only set alongside --slot-inference).
+        if let Some(mb) = slot_activation_budget_mb {
+            v.push("--slot-activation-budget-mb".into());
+            v.push(mb.to_string());
+        }
     }
     v
 }
@@ -3871,9 +3898,11 @@ mod tests {
             256, 3, 8, 128, 128, "axis", "gine", "cpu",
             false, false, "sum", false, false,
             /*slot_inference=*/ false, /*win_length=*/ 6,
+            /*slot_activation_budget_mb=*/ None,
         );
         assert!(!v.iter().any(|a| a == "--slot-inference"));
         assert!(!v.iter().any(|a| a == "--win-length"));
+        assert!(!v.iter().any(|a| a == "--slot-activation-budget-mb"));
     }
 
     #[test]
@@ -3884,12 +3913,46 @@ mod tests {
             256, 3, 8, 128, 128, "axis", "gine", "cpu",
             false, false, "sum", false, false,
             /*slot_inference=*/ true, /*win_length=*/ 6,
+            /*slot_activation_budget_mb=*/ None,
         );
         let pos = v.iter().position(|a| a == "--slot-inference").expect("--slot-inference");
         let wpos = v.iter().position(|a| a == "--win-length").expect("--win-length");
         assert_eq!(v[wpos + 1], "6", "win_length value forwarded");
         // Both slot flags are present; win-length pairs with its value.
         assert!(pos < v.len());
+        // No explicit budget override => flag omitted, server keeps its default.
+        assert!(!v.iter().any(|a| a == "--slot-activation-budget-mb"));
+    }
+
+    #[test]
+    fn subprocess_model_args_forwards_slot_activation_budget() {
+        // A3 task 7: an explicit --slot-activation-budget-mb is forwarded to the
+        // server (paired with its value) ONLY alongside --slot-inference.
+        let v = subprocess_model_args(
+            256, 3, 8, 128, 128, "axis", "gine", "cpu",
+            false, false, "sum", false, false,
+            /*slot_inference=*/ true, /*win_length=*/ 6,
+            /*slot_activation_budget_mb=*/ Some(8192),
+        );
+        let bpos = v
+            .iter()
+            .position(|a| a == "--slot-activation-budget-mb")
+            .expect("--slot-activation-budget-mb");
+        assert_eq!(v[bpos + 1], "8192", "budget value forwarded");
+    }
+
+    #[test]
+    fn subprocess_model_args_omits_budget_without_slot_inference() {
+        // Defense in depth: even if a budget were somehow set without
+        // --slot-inference (CLI validation forbids it), the args builder must
+        // not leak a flag the server would reject with the legacy backend.
+        let v = subprocess_model_args(
+            256, 3, 8, 128, 128, "axis", "gine", "cpu",
+            false, false, "sum", false, false,
+            /*slot_inference=*/ false, /*win_length=*/ 6,
+            /*slot_activation_budget_mb=*/ Some(8192),
+        );
+        assert!(!v.iter().any(|a| a == "--slot-activation-budget-mb"));
     }
 
     #[test]

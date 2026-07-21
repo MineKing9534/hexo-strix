@@ -127,11 +127,18 @@ def build_edge_slots(
     stop = present & torch.where(wk == KIND_EMPTY, tk != KIND_EMPTY, tk == (1 - wk))
 
     # reach[...,d]: the ray from this node actually reaches step d (all earlier
-    # steps present-and-not-stopping).
-    cont = (present & ~stop).to(torch.uint8)
-    ones = torch.ones_like(cont[..., :1])
-    carry = torch.cumprod(torch.cat([ones, cont[..., :-1]], dim=-1), dim=-1)
-    reach = present & carry.bool()
+    # steps present-and-not-stopping). Unrolled cumulative-AND over the size-W
+    # walk dim, bit-identical to the ``cumprod`` scan it replaces
+    # (reach[d] = present[d] & cont[0] & ... & cont[d-1]) but ~28x faster on the
+    # scan segment — ``torch.cumprod`` over this tiny dim is pathological on ROCm
+    # (see scripts/bench_build_hotspots.py).
+    cont = present & ~stop
+    reaches = []
+    acc = torch.ones_like(cont[..., 0])
+    for d in range(window):
+        reaches.append(present[..., d] & acc)
+        acc = acc & cont[..., d]
+    reach = torch.stack(reaches, dim=-1)
 
     # Union of both endpoints' walks (REQUIRED — parity fails without it): slot
     # (i,a,s,d) also fills if the partner's mirrored slot (j,a,-s,d) reached i.
@@ -709,6 +716,7 @@ def build_slot_batch(
     device: torch.device | str = "cpu",
     pad_to: int | None = None,
     return_aux: bool = False,
+    core_fn=None,
 ) -> "SlotBatch | tuple[SlotBatch, SlotBatchAux]":
     """Build a padded :class:`SlotBatch` directly from a batch of board states
     — exactly the fields the MSG_FORWARD_STATES wire carries — with torch ops
@@ -729,6 +737,11 @@ def build_slot_batch(
 
     With ``return_aux=True`` also returns a :class:`SlotBatchAux` describing
     the batch's legal-node ordering.
+
+    ``core_fn`` overrides the shared ``_build_slot_batch_core`` implementation
+    (default) — the server passes a ``torch.compile``d core here so the
+    on-device build runs compiled while tests/other callers keep the eager
+    default.
     """
     device = torch.device(device)
     b = len(states)
@@ -746,7 +759,8 @@ def build_slot_batch(
         raise ValueError(
             "build_slot_batch: coordinate outside the packable ±32000 range"
         )
-    return _build_slot_batch_core(
+    core = core_fn if core_fn is not None else _build_slot_batch_core
+    return core(
         sgame, pack(sq, sr), skind,
         torch.tensor(to_move_l, dtype=torch.int64, device=device),
         torch.tensor(player_feats_l, dtype=torch.float32, device=device),
@@ -761,6 +775,7 @@ def build_slot_batch_from_keys(
     device: torch.device | str = "cpu",
     pad_to: int | None = None,
     return_aux: bool = False,
+    core_fn=None,
 ) -> "SlotBatch | tuple[SlotBatch, SlotBatchAux]":
     """Keys-input fast path of :func:`build_slot_batch` for the
     MSG_FORWARD_STATES wire: stones arrive as canonical int32 HexKeys (§1) and
@@ -825,7 +840,8 @@ def build_slot_batch_from_keys(
         raise ValueError(
             "build_slot_batch: coordinate outside the packable ±32000 range"
         )
-    return _build_slot_batch_core(
+    core = core_fn if core_fn is not None else _build_slot_batch_core
+    return core(
         sgame, skey, skind,
         torch.tensor(to_move_l, dtype=torch.int64, device=device),
         torch.tensor(player_feats_l, dtype=torch.float32, device=device),
@@ -949,10 +965,17 @@ def _build_slot_batch_core(
     tk = torch.gather(kinds_id, 1, partner.reshape(b, -1)).reshape(partner.shape)
     wk = kinds_id[:, :, None, None, None]
     stop = present & torch.where(wk == KIND_EMPTY, tk != KIND_EMPTY, tk == (1 - wk))
-    cont = (present & ~stop).to(torch.uint8)
-    ones = torch.ones_like(cont[..., :1])
-    carry = torch.cumprod(torch.cat([ones, cont[..., :-1]], dim=-1), dim=-1)
-    reach = present & carry.bool()
+    # Unrolled cumulative-AND over the size-W walk dim — bit-identical to the
+    # ``cumprod`` scan (reach[d] = present[d] & cont[0] & ... & cont[d-1]) but
+    # ~28x faster on the scan segment and compile-friendly (``torch.cumprod``
+    # over this tiny dim is pathological on ROCm — scripts/bench_build_hotspots.py).
+    cont = present & ~stop
+    reaches = []
+    acc = torch.ones_like(cont[..., 0])
+    for d in range(window):
+        reaches.append(present[..., d] & acc)
+        acc = acc & cont[..., d]
+    reach = torch.stack(reaches, dim=-1)
 
     # Union of both endpoints' walks (REQUIRED — plan §7 sharp edge 2): slot
     # (i, a, s, d) also fills if the partner's mirrored slot (j, a, -s, d)

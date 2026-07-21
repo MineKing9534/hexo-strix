@@ -85,6 +85,24 @@ def _fnv1a64(data) -> int:
     return h
 
 
+def _fnv1a64_qr_hashes(flat_qr, counts) -> "list[int] | None":
+    """Per-graph legal-coord FNV-1a hashes via the hexo_rs Rust binding, or
+    ``None`` when the (older) extension lacks it so the caller falls back to the
+    pure-Python ``_fnv1a64`` loop (the ~6 ms/batch hot spot the binding removes).
+
+    ``flat_qr`` is the interleaved ``[q0, r0, q1, r1, ...]`` int32 coord stream;
+    ``counts[i]`` is graph ``i``'s legal-coord count. The binding hashes the
+    exact same byte stream (each coord = q i32 LE then r i32 LE) as ``_fnv1a64``
+    — the golden-fixture/parity tests pin bit-identity.
+    """
+    import hexo_rs  # function-level import, per project convention
+
+    fn = getattr(hexo_rs, "fnv1a64_qr_hashes", None)
+    if fn is None:
+        return None
+    return fn(flat_qr, counts)
+
+
 def _unpack_hexkey(key: int) -> "tuple[int, int]":
     """Decode a canonical HexKey (perf-plan §1) into ``(q, r)``.
 
@@ -581,13 +599,17 @@ def _states_to_forward_body(
     }
 
     # Per-graph order guard: hash the rebuilt legal coords in graph order
-    # (== legal_moves() order); the client compares against its snapshot.
+    # (== legal_moves() order); the client compares against its snapshot. The
+    # Rust binding does the byte-identical hashing (removes the ~6 ms/batch
+    # pure-Python loop); fall back to it only when the extension lacks the fn.
     legal_coords = aux.coords[aux.legal_idx].numpy().astype("<i4", copy=False)
-    hashes = []
-    offset = 0
-    for count in legal_counts:
-        hashes.append(_fnv1a64(legal_coords[offset:offset + count].tobytes()))
-        offset += count
+    hashes = _fnv1a64_qr_hashes(legal_coords.reshape(-1).tolist(), legal_counts)
+    if hashes is None:
+        hashes = []
+        offset = 0
+        for count in legal_counts:
+            hashes.append(_fnv1a64(legal_coords[offset:offset + count].tobytes()))
+            offset += count
 
     return body, hashes
 
@@ -752,10 +774,12 @@ def _validate_states_slot(frame: tuple, args, *, bytes_per_elem: int = 4) -> tup
     # and rejecting ordinary production batches under the default budget.
     #
     # PY2-W1: estimate on the PADDED shape the forward actually allocates.
-    # _handle_states_slot pads B and N to powers of two (_round_pow2) before
-    # forward_padded, and pow2 bucketing can ~4x the dense [B, N, S, H] tensor;
-    # estimating on the raw counts under-reports and could still OOM. Round both
-    # dims exactly as the allocator does (same _round_pow2, same floor=8 on N).
+    # _handle_states_slot pads B and N before forward_padded (B to a power of
+    # two, N to a multiple of 128), and that padding can enlarge the dense
+    # [B, N, S, H] tensor; estimating on the raw counts under-reports and could
+    # still OOM. Round both dims through the SAME shared helpers the allocator
+    # uses (_slot_bucket_b / _slot_bucket_n) so guard and allocator cannot
+    # diverge.
     #
     # bytes_per_elem is the slot model's activation dtype size (bf16=2 on CUDA,
     # f32=4 on CPU). The ×3 covers the handful of dense [B, N, S, H]-shaped
@@ -765,8 +789,8 @@ def _validate_states_slot(frame: tuple, args, *, bytes_per_elem: int = 4) -> tup
     # a single H-wide activation and so are amply absorbed by the ×3 margin.
     num_slots = 6 * (args.win_length - 1)
     n_max_est = max(_states_slot_node_counts(graphs, placement_radius))
-    b_bucket = _round_pow2(num_graphs)
-    n_bucket = _round_pow2(n_max_est, floor=8)
+    b_bucket = _slot_bucket_b(num_graphs)
+    n_bucket = _slot_bucket_n(n_max_est)
     est_bytes = b_bucket * n_bucket * num_slots * args.hidden_dim * bytes_per_elem * 3
     budget_bytes = args.slot_activation_budget_mb * 1024 * 1024
     if est_bytes > budget_bytes:
@@ -883,15 +907,34 @@ def _load_slot_model(args, device: torch.device) -> torch.nn.Module:
     if device.type == "cuda":
         slot = slot.to(torch.bfloat16)
 
+    # Compiled batched build core (Task 2): the on-device slot build runs
+    # through this when compile is enabled, and eager (None) otherwise. It rides
+    # on the model instance so reload rebinds it and the handler/warmup read it
+    # off the live slot model — no module-level global state.
+    slot._slot_build_core = None
     if not args.no_compile:
         compile_kwargs = {}
         if getattr(args, "dynamic_compile", False) or os.environ.get("HEXO_DYNAMIC_COMPILE") == "1":
             compile_kwargs["dynamic"] = True
+        # mult128-on-N bucketing yields more distinct static [B, N] shapes than
+        # pow2 did, so raise the dynamo recompile cap (default 8) to avoid
+        # falling back to eager once the shape set grows (the bench needed this).
+        torch._dynamo.config.recompile_limit = 256
         # Same compile policy as the legacy model (eager slot LOSES — the A2
         # bench showed compile is the point); forward_padded is the static-
         # shape entry point the server calls.
         slot.forward_padded = torch.compile(
             slot.forward_padded, fullgraph=True, **compile_kwargs
+        )
+        # Compile the batched slot BUILD core too. torch.cumprod is gone (Task 1)
+        # and mode="default" + dynamic=False at mult-128 N buckets gives ~1.34ms
+        # at b=8 vs ~6.3ms eager on ROCm, bit-identical (scripts/
+        # bench_build_compile_e2e.py). Graph breaks at unique/nonzero/.item are
+        # allowed (NOT fullgraph); the mult-128 N bucketing keeps distinct build
+        # shapes under the raised recompile cap.
+        from hexo_a0.slot_graph import _build_slot_batch_core
+        slot._slot_build_core = torch.compile(
+            _build_slot_batch_core, mode="default", dynamic=False
         )
     return slot
 
@@ -903,7 +946,20 @@ def _warmup_slot(slot_model: torch.nn.Module, args, device: torch.device) -> Non
 
     origin_key = int(pack(torch.tensor([0]), torch.tensor([0]))[0])
     config = _slot_builder_config(args, args.win_length, placement_radius=1)
-    batch = build_slot_batch_from_keys([([origin_key], [], 0, 2)], config, device=device)
+    # Build through the (optionally compiled) build core at its mult-128 N
+    # bucket, exactly as _handle_states_slot does, so BOTH the build-core compile
+    # AND forward_padded are traced before READY (not on the first request).
+    core = getattr(slot_model, "_slot_build_core", None)
+    bucket_n = _slot_pad_n([([origin_key], [], 0, 2, 0)], placement_radius=1)
+    batch = build_slot_batch_from_keys(
+        [([origin_key], [], 0, 2)], config, device=device,
+        pad_to=bucket_n, core_fn=core,
+    )
+    # Trace the SAME padded (B, N) bucket class production hits (mirror
+    # _handle_states_slot exactly, via the shared _slot_bucket_shape helper).
+    # Without this the compile trace is on the unpadded shape and the first real
+    # request pays a recompile.
+    batch = _pad_slot_batch(batch, *_slot_bucket_shape(batch))
     if device.type == "cuda":
         batch.x = batch.x.to(torch.bfloat16)
         batch.dummy_x = batch.dummy_x.to(torch.bfloat16)
@@ -917,11 +973,18 @@ def _slot_legal_hashes(aux) -> "list[int]":
     path: ``(q: i32 LE, r: i32 LE)`` per legal move, in legal-column order."""
     from hexo_a0.slot_graph import unpack
 
-    lq, lr = unpack(aux.legal_keys.cpu())
-    coords = torch.stack([lq, lr], dim=1).to(torch.int32).numpy().astype("<i4", copy=False)
+    # Unpack keys -> (q, r) vectorized (on-device if CUDA) BEFORE the .cpu()
+    # sync, then flatten to the interleaved i32 stream the hasher consumes.
+    lq, lr = unpack(aux.legal_keys)
+    coords = torch.stack([lq, lr], dim=1).to(torch.int32).cpu().numpy().astype("<i4", copy=False)
+    counts = aux.legal_counts.tolist()
+
+    hashes = _fnv1a64_qr_hashes(coords.reshape(-1).tolist(), counts)
+    if hashes is not None:
+        return hashes
     hashes = []
     offset = 0
-    for count in aux.legal_counts.tolist():
+    for count in counts:
         hashes.append(_fnv1a64(coords[offset:offset + count].tobytes()))
         offset += count
     return hashes
@@ -930,10 +993,42 @@ def _slot_legal_hashes(aux) -> "list[int]":
 def _round_pow2(n: int, floor: int = 1) -> int:
     """Smallest power of two >= max(n, floor). The slot forward runs under
     torch.compile(dynamic=False), so every distinct [B, N] shape triggers a
-    fresh trace; rounding B and N to powers of two collapses nearby request
-    sizes onto a handful of shapes (few recompiles) at a bounded pad cost."""
+    fresh trace; rounding to a coarse grid collapses nearby request sizes onto
+    a handful of shapes (few recompiles) at a bounded pad cost."""
     n = max(int(n), floor, 1)
     return 1 << (n - 1).bit_length()
+
+
+# --- Slot [B, N] bucketing (single source of truth for allocator + guard) ----
+# B and N use DIFFERENT grids. B keeps powers of two (few distinct batch sizes).
+# N (max node count) rounds up to multiples of 128: pow2 pathologically rounds
+# the production N≈2053 up to 4096, whereas mult-128 lands on 2176. The
+# slot-padding ablation bench (scripts/bench_slot_padding_ablation.py) measured
+# mult128-on-N fastest — it beats pow2 and beats mult256 by ~5%. Both the
+# allocator (_slot_bucket_shape) and the activation-budget guard
+# (_validate_states_slot) MUST route through these two helpers so their padded
+# shapes cannot diverge (review finding PY2-W1).
+
+
+def _slot_bucket_b(b: int) -> int:
+    """Bucket the batch (B) dim: smallest power of two >= B."""
+    return _round_pow2(b)
+
+
+def _slot_bucket_n(n: int) -> int:
+    """Bucket the max-node (N) dim: smallest multiple of 128 >= max(n, 128)."""
+    n = max(int(n), 128)
+    return -(-n // 128) * 128
+
+
+def _slot_pad_n(graphs: list, placement_radius: int) -> int:
+    """The mult-128 N bucket to build a states-slot request at, from the EXACT
+    per-graph node counts (== the builder's ``n_max``; see
+    ``_states_slot_node_counts``). Passed as ``pad_to`` so the compiled build
+    core runs at a static bucketed N — otherwise every distinct raw ``n_max``
+    would trace a fresh graph. Shared by ``_handle_states_slot`` and
+    ``_warmup_slot`` so both hit the same bucket class."""
+    return _slot_bucket_n(max(_states_slot_node_counts(graphs, placement_radius)))
 
 
 def _pad_slot_batch(batch, b_to: int, n_to: int):
@@ -974,6 +1069,15 @@ def _pad_slot_batch(batch, b_to: int, n_to: int):
         src_player=src_player, node_mask=node_mask,
         stone_mask=stone_mask, legal_mask=legal_mask,
     )
+
+
+def _slot_bucket_shape(batch) -> "tuple[int, int]":
+    """The pow2 ``(B, N)`` bucket a slot batch is padded to before
+    ``forward_padded``. Single source of truth for BOTH the request handler
+    (``_handle_states_slot``) and warmup (``_warmup_slot``) so the compile trace
+    warmup produces matches the shape class production requests hit — otherwise
+    warmup traces the UNPADDED shape and the first real request recompiles."""
+    return _slot_bucket_b(batch.num_graphs), _slot_bucket_n(batch.node_mask.shape[1])
 
 
 def _write_forward_states_response(
@@ -1757,6 +1861,9 @@ def main() -> None:
                         sys.stderr.flush()
                         request_queue.put(("states_error", str(e)))
                     else:
+                        # The client is strictly synchronous, so the on-device
+                        # build+forward run inline in the main loop
+                        # (_handle_states_slot); the reader only frames+validates.
                         request_queue.put(("forward_states_slot", payload))
             elif msg_type == MSG_FORWARD_STATES:
                 # Rebuild runs HERE on the reader thread so it overlaps GPU
@@ -1916,8 +2023,17 @@ def main() -> None:
         try:
             builder_config = _slot_builder_config(args, win_length, placement_radius)
             states = [(p1, p2, cur, mr) for (p1, p2, cur, mr, _nl) in graphs]
+            # Build at a mult-128 N bucket through the (optionally compiled)
+            # build core: pad_to fixes the core's N so compile(dynamic=False)
+            # sees a small static shape set. bucket_n comes from the EXACT node
+            # count (== the builder's n_max), so it is always >= n_max. aux
+            # (legal ordering/counts) is independent of pad_to, so the response
+            # contract is unchanged.
+            bucket_n = _slot_pad_n(graphs, placement_radius)
+            core = getattr(slot_model, "_slot_build_core", None)
             batch, aux = build_slot_batch_from_keys(
-                states, builder_config, device=device, return_aux=True
+                states, builder_config, device=device,
+                pad_to=bucket_n, return_aux=True, core_fn=core,
             )
             rebuilt_counts = aux.legal_counts.cpu().tolist()
             for i, (_p1, _p2, _c, _m, num_legal) in enumerate(graphs):
@@ -1927,14 +2043,14 @@ def main() -> None:
                         f"legal count {rebuilt_counts[i]} (client/server "
                         f"builder divergence)"
                     )
-            # Bucket B and N to powers of two so compile(dynamic=False) sees a
-            # small fixed set of forward_padded shapes. aux (legal ordering,
-            # counts) comes from the UNPADDED build, so the response contract is
-            # unaffected; ghost graphs/nodes are inert (masks False) and their
-            # values are sliced off below.
+            # Pad B to its bucket so compile(dynamic=False) sees a small fixed
+            # set of forward_padded shapes (N is already at its mult-128 bucket
+            # from the build's pad_to, so _slot_bucket_shape is idempotent on N).
+            # aux (legal ordering, counts) comes from the pre-B-pad build, so the
+            # response contract is unaffected; ghost graphs/nodes are inert
+            # (masks False) and their values are sliced off below.
             real_b = batch.num_graphs
-            bucket_b = _round_pow2(real_b)
-            bucket_n = _round_pow2(batch.node_mask.shape[1], floor=8)
+            bucket_b, bucket_n = _slot_bucket_shape(batch)
             batch = _pad_slot_batch(batch, bucket_b, bucket_n)
             if device.type == "cuda":
                 batch.x = batch.x.to(torch.bfloat16)
@@ -1982,9 +2098,12 @@ def main() -> None:
                 writer_queue.put(("states_probe",))
                 continue
             if item[0] == "forward_states_slot":
-                # Slot backend (--slot-inference): handled inline, in request
-                # order, outside the legacy double-buffered prepare path
-                # (_prepare_tensors never sees these).
+                # Slot backend (--slot-inference): build + forward run inline
+                # here, in request order, outside the legacy double-buffered
+                # prepare path (_prepare_tensors never sees these). The client is
+                # strictly synchronous, so there is nothing to overlap the build
+                # against — the reader frames+validates, the main loop builds and
+                # forwards.
                 _handle_states_slot(item[1])
                 continue
             return item[1]  # forward body (graph-mode or rebuilt states-mode)
