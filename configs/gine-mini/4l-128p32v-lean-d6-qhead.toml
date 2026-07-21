@@ -177,6 +177,12 @@ playout_cap_fraction = 0.75
 playout_cap_divisor = 4
 use_rust_mcts = true
 
+# EXPERIMENT 2026-07-22 @ step 206636
+# Switch self-play from root-solve to leaf-solve to try to improve targets
+[self_play.mcts]
+disable_root_forcing = true
+leaf_forcing_node_budget = 500
+
 [eval]
 interval = 2000
 checkpoint_interval = 1000

@@ -1391,6 +1391,25 @@ pub struct ForcingWin { pub depth: u8, pub first_move: Coord, pub pv: Vec<Coord>
 #[derive(Debug)]
 pub enum Outcome { Win(ForcingWin), No, BudgetExceeded }
 
+/// Exact solver verdict without principal-variation reconstruction.
+///
+/// This is the cheap result shape for callers such as MCTS leaf evaluation that
+/// only need to know whether the side to move has a proven forced win. A `Win`
+/// carries the iterative-deepening proof depth, but deliberately omits the first
+/// move and PV probes performed by [`solve_wide`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForcingVerdict {
+    Win { depth: u8 },
+    No,
+    BudgetExceeded,
+}
+
+impl ForcingVerdict {
+    /// True iff this is a proven forced win for the side to move.
+    #[inline]
+    pub fn is_win(self) -> bool { matches!(self, ForcingVerdict::Win { .. }) }
+}
+
 impl Outcome {
     /// True iff this is a proven forced win for the side to move.
     #[inline]
@@ -1429,6 +1448,35 @@ pub fn solve_wide(game: &GameState, depth_cap: u8, node_budget: u64) -> Outcome 
     solve_ex(game, depth_cap, node_budget, true, Limits::default())
 }
 
+/// Verdict-only counterpart to [`solve_wide`] for hot paths that do not consume
+/// a first move or principal variation.
+///
+/// The proof search and node budget are identical to [`solve_wide`]. On a proven
+/// win this returns immediately with its proof depth instead of running the warm
+/// follow-up probes used to reconstruct [`ForcingWin`].
+pub fn solve_wide_verdict(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+) -> ForcingVerdict {
+    let (mut board, mut s, placements) = match prepare_search(
+        game, node_budget, true, Limits::default(), false,
+    ) {
+        Ok(prepared) => prepared,
+        Err(result) => return forcing_verdict(result),
+    };
+    forcing_verdict(solve_from_state(&mut board, placements, depth_cap, &mut s))
+}
+
+#[inline]
+fn forcing_verdict(result: SolveResult) -> ForcingVerdict {
+    match result {
+        SolveResult::Win { depth } => ForcingVerdict::Win { depth },
+        SolveResult::No => ForcingVerdict::No,
+        SolveResult::BudgetExceeded => ForcingVerdict::BudgetExceeded,
+    }
+}
+
 /// See `solve`; `wide` gates the experimental wide-partner-width knob. false
 /// reproduces `solve` exactly. `limits` are research-only cutoffs
 /// (`Limits::default()` for all production callers — identical behaviour).
@@ -1457,55 +1505,15 @@ fn solve_ex_support(
     limits: Limits,
     capture: bool,
 ) -> (Outcome, Option<Rc<Vec<Coord>>>) {
-    let attacker = match game.current_player() { Some(p) => p, None => return (Outcome::No, None) };
-    let defender = attacker.opponent();
-    let wl = game.config().win_length;
-    let radius = game.config().placement_radius;
-    let placements = game.moves_remaining_this_turn();
-    if !(1..=MAX_WL).contains(&(wl as usize)) {
-        return (Outcome::BudgetExceeded, None); // see solve_from
-    }
-    let mut board = SolverBoard::new();
-    // Pre-size once over the position's bounding box (avoids incremental regrowth),
-    // and enable reach tracking before bulk-loading so counts build incrementally.
-    let mut it = game.stones().iter();
-    if let Some((&c0, _)) = it.next() {
-        let (mut lo, mut hi) = (c0, c0);
-        for (&c, _) in it {
-            lo = (lo.0.min(c.0), lo.1.min(c.1));
-            hi = (hi.0.max(c.0), hi.1.max(c.1));
-        }
-        // A pathological coordinate spread would blow up the dense grid (`grow`
-        // panics past MAX_GRID_CELLS), and coordinates near the i32 extremes
-        // would overflow the grid arithmetic before that assert could fire.
-        // Real games are spatially bounded near the origin; if either bound
-        // trips, give up honestly instead of aborting the engine.
-        const MAX_COORD: i32 = 1 << 30;
-        if lo.0 < -MAX_COORD || lo.1 < -MAX_COORD || hi.0 > MAX_COORD || hi.1 > MAX_COORD {
+    let (mut board, mut s, placements) = match prepare_search(
+        game, node_budget, wide, limits, capture,
+    ) {
+        Ok(prepared) => prepared,
+        Err(SolveResult::No) => return (Outcome::No, None),
+        Err(SolveResult::BudgetExceeded) | Err(SolveResult::Win { .. }) => {
             return (Outcome::BudgetExceeded, None);
         }
-        let (span_q, span_r) = (
-            hi.0 as i64 - lo.0 as i64 + 6 * GRID_PAD as i64,
-            hi.1 as i64 - lo.1 as i64 + 6 * GRID_PAD as i64,
-        );
-        if span_q.saturating_mul(span_r) > MAX_GRID_CELLS {
-            return (Outcome::BudgetExceeded, None);
-        }
-        board.reserve(lo, hi);
-    }
-    if radius < wl as i32 - 1 {
-        board.enable_reach(radius);
-    }
-    // `game.stones()` iteration order is nondeterministic (engine HashMap).
-    // Result determinism relies on the XOR-commutative Zobrist hash plus every
-    // derived list (completions, hot cells, partners, moves) being sorted —
-    // do not let stone/scan order leak into tie-breaking.
-    for (&c, &p) in game.stones() { board.place(c, p); }
-    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
-    s.limits = limits;
-    if capture {
-        s.support = Some(FxHashMap::default());
-    }
+    };
     match solve_from_state(&mut board, placements, depth_cap, &mut s) {
         SolveResult::No => (Outcome::No, None),
         SolveResult::BudgetExceeded => (Outcome::BudgetExceeded, None),
@@ -1538,6 +1546,65 @@ fn solve_ex_support(
             }
         }
     }
+}
+
+fn prepare_search(
+    game: &GameState,
+    node_budget: u64,
+    wide: bool,
+    limits: Limits,
+    capture: bool,
+) -> Result<(SolverBoard, SearchState, u8), SolveResult> {
+    let attacker = game.current_player().ok_or(SolveResult::No)?;
+    let defender = attacker.opponent();
+    let wl = game.config().win_length;
+    let radius = game.config().placement_radius;
+    let placements = game.moves_remaining_this_turn();
+    if !(1..=MAX_WL).contains(&(wl as usize)) {
+        return Err(SolveResult::BudgetExceeded); // see solve_from
+    }
+    let mut board = SolverBoard::new();
+    // Pre-size once over the position's bounding box (avoids incremental regrowth),
+    // and enable reach tracking before bulk-loading so counts build incrementally.
+    let mut it = game.stones().iter();
+    if let Some((&c0, _)) = it.next() {
+        let (mut lo, mut hi) = (c0, c0);
+        for (&c, _) in it {
+            lo = (lo.0.min(c.0), lo.1.min(c.1));
+            hi = (hi.0.max(c.0), hi.1.max(c.1));
+        }
+        // A pathological coordinate spread would blow up the dense grid (`grow`
+        // panics past MAX_GRID_CELLS), and coordinates near the i32 extremes
+        // would overflow the grid arithmetic before that assert could fire.
+        // Real games are spatially bounded near the origin; if either bound
+        // trips, give up honestly instead of aborting the engine.
+        const MAX_COORD: i32 = 1 << 30;
+        if lo.0 < -MAX_COORD || lo.1 < -MAX_COORD || hi.0 > MAX_COORD || hi.1 > MAX_COORD {
+            return Err(SolveResult::BudgetExceeded);
+        }
+        let (span_q, span_r) = (
+            hi.0 as i64 - lo.0 as i64 + 6 * GRID_PAD as i64,
+            hi.1 as i64 - lo.1 as i64 + 6 * GRID_PAD as i64,
+        );
+        if span_q.saturating_mul(span_r) > MAX_GRID_CELLS {
+            return Err(SolveResult::BudgetExceeded);
+        }
+        board.reserve(lo, hi);
+    }
+    if radius < wl as i32 - 1 {
+        board.enable_reach(radius);
+    }
+    // `game.stones()` iteration order is nondeterministic (engine HashMap).
+    // Result determinism relies on the XOR-commutative Zobrist hash plus every
+    // derived list (completions, hot cells, partners, moves) being sorted —
+    // do not let stone/scan order leak into tie-breaking.
+    for (&c, &p) in game.stones() { board.place(c, p); }
+    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
+    s.limits = limits;
+    if capture {
+        s.support = Some(FxHashMap::default());
+    }
+    Ok((board, s, placements))
 }
 
 /// Board-level entry point: solve from a pre-built `SolverBoard` (the same path
@@ -2277,6 +2344,47 @@ mod tests {
             solve_from(&mut b, Player::P1, Player::P2, 2, 6, 8, 40, 1),
             SolveResult::BudgetExceeded
         ));
+    }
+
+    #[test]
+    fn wide_verdict_matches_full_solver_on_win_no_and_budget_exceeded() {
+        use hexo_engine::game::{GameConfig, GameState};
+
+        let win_stones: Vec<(Coord, Player)> = [
+            (0, 0), (1, 0), (2, 0), (100, 100), (100, 101), (98, 104), (99, 103),
+        ]
+        .into_iter()
+        .map(|c| (c, Player::P1))
+        .collect();
+        let win = GameState::from_state(
+            &win_stones, Player::P1, 2, GameConfig::FULL_HEXO,
+        );
+        let full_depth = match solve_wide(&win, 6, 2_000) {
+            Outcome::Win(w) => w.depth,
+            other => panic!("expected full solver win, got {other:?}"),
+        };
+        assert_eq!(
+            solve_wide_verdict(&win, 6, 2_000),
+            ForcingVerdict::Win { depth: full_depth },
+        );
+
+        let quiet = GameState::with_config(GameConfig::FULL_HEXO);
+        assert!(matches!(solve_wide(&quiet, 6, 2_000), Outcome::No));
+        assert_eq!(solve_wide_verdict(&quiet, 6, 2_000), ForcingVerdict::No);
+
+        let fork_stones: Vec<(Coord, Player)> =
+            [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)]
+                .into_iter()
+                .map(|c| (c, Player::P1))
+                .collect();
+        let fork = GameState::from_state(
+            &fork_stones, Player::P1, 2, GameConfig::FULL_HEXO,
+        );
+        assert!(matches!(solve_wide(&fork, 40, 1), Outcome::BudgetExceeded));
+        assert_eq!(
+            solve_wide_verdict(&fork, 40, 1),
+            ForcingVerdict::BudgetExceeded,
+        );
     }
 
     fn line(cells: &[Coord], p: Player) -> SolverBoard {

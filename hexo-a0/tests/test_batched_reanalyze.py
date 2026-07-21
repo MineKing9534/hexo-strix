@@ -64,11 +64,21 @@ class TestRustBatchedGumbelMcts:
 
         monkeypatch.setattr(hexo_rs, "MCTSConfig", FakeMCTSConfig)
         monkeypatch.setattr(hexo_rs, "batched_gumbel_mcts", fake_batched)
-        mcts = MCTSConfig(n_simulations=96, m_actions=16)
+        mcts = MCTSConfig(
+            n_simulations=96, m_actions=16,
+            disable_root_forcing=True,
+            forcing_depth_cap=16,
+            forcing_node_budget=25_000,
+            leaf_forcing_node_budget=500,
+        )
         sp_mod._rust_batched_gumbel_mcts(
             _games(1), _tiny_model(), mcts, torch.device("cpu"), n_simulations=8,
         )
         assert captured["n_simulations"] == 8
+        assert captured["disable_forcing_solver"] is True
+        assert captured["forcing_depth_cap"] == 16
+        assert captured["forcing_node_budget"] == 25_000
+        assert captured["leaf_forcing_node_budget"] == 500
 
     def test_parity_with_serial_path(self):
         """Same position, same seed, same deterministic model: serial vs batched.

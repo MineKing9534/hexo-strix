@@ -86,6 +86,21 @@ truncate_delta = 0.25
 """))
         assert cfg.mcts.truncate_delta == pytest.approx(0.25)
 
+    def test_leaf_forcing_budget_and_self_play_override_parse(self):
+        cfg = load_config(_write_tmp("""
+[mcts]
+disable_root_forcing = false
+leaf_forcing_node_budget = 500
+
+[self_play.mcts]
+disable_root_forcing = true
+leaf_forcing_node_budget = 250
+"""))
+        assert cfg.mcts.disable_root_forcing is False
+        assert cfg.mcts.leaf_forcing_node_budget == 500
+        assert cfg.self_play.mcts.disable_root_forcing is True
+        assert cfg.self_play.mcts.leaf_forcing_node_budget == 250
+
     def test_training_section(self):
         cfg = load_config(_write_tmp("""
 [training]

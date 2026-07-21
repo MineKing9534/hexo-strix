@@ -2399,6 +2399,13 @@ class Trainer:
             ])
 
         # VCF forcing-solver runtime knobs ([self_play.mcts] overrides [mcts]).
+        disable_root_forcing = (
+            sp_mcts.disable_root_forcing
+            if sp_mcts.disable_root_forcing is not None
+            else self.mcts_config.disable_root_forcing
+        )
+        if disable_root_forcing:
+            cmd.append("--disable-root-forcing")
         # Only emit a flag when the resolved value is non-zero (explicitly
         # configured); 0 means "use the Rust compile-time default", so a default
         # config produces a byte-identical command line — safe against a
@@ -2415,6 +2422,15 @@ class Trainer:
         )
         if forcing_node_budget:
             cmd.extend(["--forcing-node-budget", str(forcing_node_budget)])
+        leaf_forcing_node_budget = (
+            sp_mcts.leaf_forcing_node_budget
+            if sp_mcts.leaf_forcing_node_budget is not None
+            else self.mcts_config.leaf_forcing_node_budget
+        )
+        if leaf_forcing_node_budget:
+            cmd.extend([
+                "--leaf-forcing-node-budget", str(leaf_forcing_node_budget),
+            ])
 
         # Python subprocess inference (torch.compile, ~2x faster forward pass)
         if rust_cfg.python_inference:

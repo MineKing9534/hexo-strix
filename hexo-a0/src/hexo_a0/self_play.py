@@ -48,6 +48,15 @@ def _rust_gumbel_mcts(
     if graph_batch_fn is None:
         graph_batch_fn = game_to_graph_batch
 
+    leaf_forcing_node_budget = getattr(mcts, "leaf_forcing_node_budget", 0)
+    leaf_extra = (
+        {"leaf_forcing_node_budget": leaf_forcing_node_budget}
+        if leaf_forcing_node_budget else {}
+    )
+    root_forcing_extra = (
+        {"disable_forcing_solver": True}
+        if getattr(mcts, "disable_root_forcing", False) else {}
+    )
     mcts_config = hexo_rs.MCTSConfig(
         n_simulations=mcts.n_simulations,
         m_actions=mcts.m_actions,
@@ -55,6 +64,10 @@ def _rust_gumbel_mcts(
         c_scale=mcts.c_scale,
         root_dirichlet_alpha=getattr(mcts, "root_dirichlet_alpha", 0.0),
         root_dirichlet_fraction=getattr(mcts, "root_dirichlet_fraction", 0.0),
+        forcing_depth_cap=getattr(mcts, "forcing_depth_cap", 0),
+        forcing_node_budget=getattr(mcts, "forcing_node_budget", 0),
+        **root_forcing_extra,
+        **leaf_extra,
     )
 
     _stream = torch.cuda.Stream(device) if device.type == "cuda" else None
@@ -124,6 +137,15 @@ def _rust_batched_gumbel_mcts(
     if graph_batch_fn is None:
         graph_batch_fn = game_to_graph_batch
 
+    leaf_forcing_node_budget = getattr(mcts, "leaf_forcing_node_budget", 0)
+    leaf_extra = (
+        {"leaf_forcing_node_budget": leaf_forcing_node_budget}
+        if leaf_forcing_node_budget else {}
+    )
+    root_forcing_extra = (
+        {"disable_forcing_solver": True}
+        if getattr(mcts, "disable_root_forcing", False) else {}
+    )
     mcts_config = hexo_rs.MCTSConfig(
         n_simulations=n_simulations if n_simulations is not None else mcts.n_simulations,
         m_actions=m_actions if m_actions is not None else mcts.m_actions,
@@ -131,6 +153,10 @@ def _rust_batched_gumbel_mcts(
         c_scale=mcts.c_scale,
         root_dirichlet_alpha=getattr(mcts, "root_dirichlet_alpha", 0.0),
         root_dirichlet_fraction=getattr(mcts, "root_dirichlet_fraction", 0.0),
+        forcing_depth_cap=getattr(mcts, "forcing_depth_cap", 0),
+        forcing_node_budget=getattr(mcts, "forcing_node_budget", 0),
+        **root_forcing_extra,
+        **leaf_extra,
     )
     _clear_gate = clear_gate if clear_gate is not None else CacheClearGate.for_device(device)
 
@@ -212,6 +238,15 @@ def batched_self_play_games(
         scriptable_net.eval()
 
     n_sims = n_simulations_override if n_simulations_override is not None else mcts.n_simulations
+    leaf_forcing_node_budget = getattr(mcts, "leaf_forcing_node_budget", 0)
+    leaf_extra = (
+        {"leaf_forcing_node_budget": leaf_forcing_node_budget}
+        if leaf_forcing_node_budget else {}
+    )
+    root_forcing_extra = (
+        {"disable_forcing_solver": True}
+        if getattr(mcts, "disable_root_forcing", False) else {}
+    )
     mcts_config = hexo_rs.MCTSConfig(
         n_simulations=n_sims,
         m_actions=mcts.m_actions,
@@ -219,6 +254,10 @@ def batched_self_play_games(
         c_scale=mcts.c_scale,
         root_dirichlet_alpha=getattr(mcts, "root_dirichlet_alpha", 0.0),
         root_dirichlet_fraction=getattr(mcts, "root_dirichlet_fraction", 0.0),
+        forcing_depth_cap=getattr(mcts, "forcing_depth_cap", 0),
+        forcing_node_budget=getattr(mcts, "forcing_node_budget", 0),
+        **root_forcing_extra,
+        **leaf_extra,
     )
 
     _stream = torch.cuda.Stream(device) if device.type == "cuda" else None

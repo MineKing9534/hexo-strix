@@ -152,6 +152,35 @@ Several evaluation opponents are available:
 
 Promotion between champions can be gated with SPRT (`convergence_mode = "champion"`); see the `sprt_*` modules and `head-to-head`.
 
+To compare the root forcing shortcut with low-budget forcing at every MCTS
+leaf, use the same checkpoint on both sides. The match uses paired openings and
+swaps colours, so it does not require retraining:
+
+```bash
+uv run --no-sync hexo-a0 head-to-head \
+  --checkpoint-a <checkpoint.pt> --checkpoint-b <checkpoint.pt> \
+  --win-length 6 --radius 8 --max-moves 300 \
+  --a-forcing-mode leaf --b-forcing-mode root \
+  --forcing-depth-cap 16 --forcing-node-budget 25000 \
+  --leaf-forcing-node-budget 500 --device cuda:0
+```
+
+The final summary reports the leaf solver's calls, win hit rate, budget
+exhaustions, and mean time. For a short diagnostic run, add
+`--leaf-forcing-capture <path.jsonl>` to capture bounded, replayable leaf
+records; capture I/O should be disabled for the timed SPRT.
+
+To use the leaf-only setup during self-play, disable the root shortcut and set
+the leaf budget together:
+
+```toml
+[self_play.mcts]
+disable_root_forcing = true
+leaf_forcing_node_budget = 500
+```
+
+Both settings inherit from `[mcts]` when omitted from `[self_play.mcts]`.
+
 ## Play server
 
 `hexo-a0 serve` starts an HTTP play-and-analyze server: a human can play the trained bot at selectable difficulty tiers, completed games are recorded to SQLite, and a token-gated `/admin` page exposes analysis. The web frontend (HTML/JS/CSS, fonts, and social-card assets) is served from `hexo_a0/serving/static` and `templates`. It's designed to bind `0.0.0.0` behind a reverse proxy / Tailscale Funnel with `--url-prefix`.

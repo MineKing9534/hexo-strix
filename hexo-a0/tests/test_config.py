@@ -58,6 +58,8 @@ class TestMCTSConfig:
         assert c.exploration_fraction == 0.25
         assert c.exploration_max == 0.9
         assert c.exploration_window == 2000
+        assert c.disable_root_forcing is False
+        assert c.leaf_forcing_node_budget == 0
 
     def test_truncate_delta_default_off(self):
         c = MCTSConfig()

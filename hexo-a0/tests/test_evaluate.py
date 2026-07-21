@@ -536,6 +536,42 @@ class TestMctsArgmaxMove:
         assert calls["raw"] > 0
         assert calls["mcts"] == 0
 
+    def test_per_side_leaf_forcing_config_reaches_rust(self, model, monkeypatch):
+        """The no-retraining SPRT needs A and B to construct different MCTS
+        configs while sharing the same network weights."""
+        from hexo_a0 import evaluate as ev
+
+        captured = []
+
+        class FakeMCTSConfig:
+            def __init__(self, **kwargs):
+                captured.append(kwargs)
+
+        monkeypatch.setattr(hexo_rs, "MCTSConfig", FakeMCTSConfig)
+        monkeypatch.setattr(
+            ev,
+            "_mcts_argmax_move",
+            lambda _model, game, *_args, **_kwargs: game.legal_moves()[0],
+        )
+
+        play_eval_game(
+            model, FAST_GAME_CONFIG, DEVICE,
+            opponent="random", model_side="P1",
+            mcts_sims=2, mcts_m_actions=2,
+            mcts_disable_forcing_solver=True,
+            mcts_forcing_depth_cap=16,
+            mcts_forcing_node_budget=25_000,
+            mcts_leaf_forcing_node_budget=500,
+        )
+
+        assert len(captured) == 2  # model + pre-built opponent config
+        cfg = captured[0]
+        assert cfg["disable_forcing_solver"] is True
+        assert cfg["forcing_depth_cap"] == 16
+        assert cfg["forcing_node_budget"] == 25_000
+        assert cfg["leaf_forcing_node_budget"] == 500
+        assert "leaf_forcing_node_budget" not in captured[1]
+
 
 # ---------------------------------------------------------------------------
 # E.4-inject: joint p₂ candidate injection plumbing

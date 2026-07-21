@@ -13,6 +13,7 @@ use super::MCTSConfig;
 use super::forcing;
 use super::gumbel_mcts::{SELF_PLAY_DEPTH_CAP, SELF_PLAY_NODE_BUDGET};
 use super::halving::{compute_improved_policy, gumbel_top_k};
+use super::leaf_forcing;
 use super::node::MCTSNode;
 use super::scoring::{QContext, sigma};
 use super::simulate::{complete_simulation, simulate_select};
@@ -310,7 +311,23 @@ where
                         let prior_vals = super::scoring::softmax(&logit_vals);
                         let leaf_priors: HashMap<Coord, f64> =
                             coords.into_iter().zip(prior_vals).collect();
-                        let leaf_value = values[i];
+                        let leaf_value = if config.leaf_forcing_node_budget == 0 {
+                            values[i]
+                        } else {
+                            let depth_cap = if config.forcing_depth_cap == 0 {
+                                SELF_PLAY_DEPTH_CAP
+                            } else {
+                                config.forcing_depth_cap
+                            };
+                            leaf_forcing::override_value(
+                                &pending_states[i],
+                                values[i],
+                                depth_cap,
+                                config.leaf_forcing_node_budget,
+                                leaf.selection.path_actions.len(),
+                                searches[leaf.search_idx].root.current_player,
+                            )
+                        };
 
                         complete_simulation(
                             &mut searches[leaf.search_idx].root,

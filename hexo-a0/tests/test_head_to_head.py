@@ -195,6 +195,62 @@ class TestCliRegistration:
         assert ns.sprt_s1 == pytest.approx(0.55)
         assert ns.max_games == 1000
         assert ns.state_file is None
+        assert ns.a_forcing_mode == "root"
+        assert ns.b_forcing_mode == "root"
+        assert ns.leaf_forcing_node_budget == 500
+
+    def test_subparser_accepts_root_vs_leaf_experiment(self):
+        from hexo_a0 import cli as cli_mod
+
+        called = {}
+        original = cli_mod._run_head_to_head
+        cli_mod._run_head_to_head = lambda args: called.setdefault("args", args) and 0
+        try:
+            rc = cli_mod.main([
+                "head-to-head",
+                "--checkpoint-a", "same.pt",
+                "--checkpoint-b", "same.pt",
+                "--win-length", "6",
+                "--radius", "8",
+                "--max-moves", "300",
+                "--a-forcing-mode", "leaf",
+                "--b-forcing-mode", "root",
+                "--forcing-depth-cap", "16",
+                "--forcing-node-budget", "25000",
+                "--leaf-forcing-node-budget", "500",
+            ])
+        finally:
+            cli_mod._run_head_to_head = original
+
+        assert rc == 0
+        ns = called["args"]
+        assert ns.a_forcing_mode == "leaf"
+        assert ns.b_forcing_mode == "root"
+        assert ns.forcing_depth_cap == 16
+        assert ns.forcing_node_budget == 25_000
+        assert ns.leaf_forcing_node_budget == 500
+
+    def test_leaf_mode_rejects_zero_budget_before_match(self, tmp_path, capsys):
+        from hexo_a0 import cli as cli_mod
+
+        checkpoint = tmp_path / "same.pt"
+        checkpoint.touch()
+        args = type("Args", (), {
+            "checkpoint_a": str(checkpoint),
+            "checkpoint_b": str(checkpoint),
+            "forcing_depth_cap": 0,
+            "forcing_node_budget": 0,
+            "leaf_forcing_node_budget": 0,
+            "leaf_forcing_capture_limit": 10_000,
+            "window_size": 1000,
+            "state_file": None,
+            "disable_forcing_solver": False,
+            "a_forcing_mode": "leaf",
+            "b_forcing_mode": "root",
+        })()
+
+        assert cli_mod._run_head_to_head(args) == 1
+        assert "requires --leaf-forcing-node-budget > 0" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

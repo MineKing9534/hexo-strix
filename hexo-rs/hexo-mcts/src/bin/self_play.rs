@@ -1645,6 +1645,7 @@ fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
         disable_forcing_solver: base.disable_forcing_solver,
         forcing_depth_cap: base.forcing_depth_cap,
         forcing_node_budget: base.forcing_node_budget,
+        leaf_forcing_node_budget: base.leaf_forcing_node_budget,
     }
 }
 
@@ -2112,8 +2113,14 @@ fn main() {
     // VCF forcing-solver runtime knobs. 0 = sentinel meaning "use the
     // compile-time SELF_PLAY_DEPTH_CAP / SELF_PLAY_NODE_BUDGET default", so an
     // unset value is bit-identical to prior self-play behaviour.
+    let mut disable_root_forcing: bool = false;
     let mut forcing_depth_cap: u8 = 0;
     let mut forcing_node_budget: u64 = 0;
+    // 0 disables leaf solving. A non-zero value proves wins at newly selected
+    // MCTS leaves and overrides only those leaf values with +1.
+    let mut leaf_forcing_node_budget: u64 = 0;
+    let mut leaf_forcing_capture: Option<PathBuf> = None;
+    let mut leaf_forcing_capture_limit: u64 = 10_000;
 
     // Root Dirichlet noise (AlphaZero-style root exploration applied before
     // Gumbel-Top-k candidate sampling). Both default to 0.0 → disabled,
@@ -2260,8 +2267,24 @@ fn main() {
                 forcing_depth_cap = args[i + 1].parse().unwrap();
                 i += 2;
             }
+            "--disable-root-forcing" => {
+                disable_root_forcing = true;
+                i += 1;
+            }
             "--forcing-node-budget" => {
                 forcing_node_budget = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--leaf-forcing-node-budget" => {
+                leaf_forcing_node_budget = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--leaf-forcing-capture" => {
+                leaf_forcing_capture = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--leaf-forcing-capture-limit" => {
+                leaf_forcing_capture_limit = args[i + 1].parse().unwrap();
                 i += 2;
             }
             "--warmup-games" => {
@@ -2465,6 +2488,23 @@ fn main() {
 
     PROFILE_PLAY_ENABLED.store(profile_play, Ordering::Relaxed);
 
+    if let Some(path) = leaf_forcing_capture.as_deref() {
+        if leaf_forcing_node_budget == 0 {
+            eprintln!("--leaf-forcing-capture requires --leaf-forcing-node-budget > 0");
+            std::process::exit(1);
+        }
+        hexo_rs::mcts::leaf_forcing::configure_capture(path, leaf_forcing_capture_limit)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to open leaf-forcing capture {}: {e}", path.display());
+                std::process::exit(1);
+            });
+        eprintln!(
+            "Capturing up to {} MCTS leaf positions to {}",
+            leaf_forcing_capture_limit,
+            path.display(),
+        );
+    }
+
     let explore_use_visit_counts = match exploration_distribution.as_str() {
         "visit_counts" => true,
         "improved_policy" => false,
@@ -2508,15 +2548,16 @@ fn main() {
         forced_candidate_capture_k: 0,
         // Self-play keeps Gumbel noise on; only eval/play disable it.
         disable_gumbel_noise: false,
-        // Self-play keeps the VCF forcing-solver shortcut on; only the
-        // eval/play path may toggle it off. Default (false) preserves the
-        // current bit-identical self-play behaviour.
-        disable_forcing_solver: false,
+        // Default false preserves the existing root shortcut. Leaf-only
+        // experiments set this through --disable-root-forcing while keeping
+        // leaf_forcing_node_budget non-zero.
+        disable_forcing_solver: disable_root_forcing,
         // Runtime overrides for the forcing-solver depth cap / node budget.
         // 0 (the sentinel) resolves to SELF_PLAY_DEPTH_CAP / SELF_PLAY_NODE_BUDGET
         // inside the shortcut, so an unconfigured run is bit-identical.
         forcing_depth_cap,
         forcing_node_budget,
+        leaf_forcing_node_budget,
     });
 
     let batch_timeout = if batch_timeout_ms > 0 {
@@ -2931,6 +2972,24 @@ fn main() {
 
         let total_games = game_counter.load(Ordering::Relaxed);
         eprintln!("Stopped after {} games.", total_games);
+    }
+
+    let leaf_stats = hexo_rs::mcts::leaf_forcing::stats(false);
+    if leaf_stats.calls > 0 {
+        let mean_us = leaf_stats.elapsed_ns as f64 / leaf_stats.calls as f64 / 1_000.0;
+        eprintln!(
+            "Leaf forcing: calls={} wins={} no={} budget_exceeded={} mean={:.1}us captured={} capture_errors={}",
+            leaf_stats.calls,
+            leaf_stats.wins,
+            leaf_stats.no,
+            leaf_stats.budget_exceeded,
+            mean_us,
+            leaf_stats.captured,
+            leaf_stats.capture_errors,
+        );
+    }
+    if let Err(e) = hexo_rs::mcts::leaf_forcing::finish_capture() {
+        eprintln!("Failed to flush leaf-forcing capture: {e}");
     }
 }
 
@@ -4348,7 +4407,16 @@ mod tests {
 
     #[test]
     fn reduced_sim_config_uses_divisor() {
-        let base = MCTSConfig { n_simulations: 64, m_actions: 16, c_visit: 50, c_scale: 1.0, virtual_loss: 0.5, ..Default::default() };
+        let base = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.5,
+            disable_forcing_solver: true,
+            leaf_forcing_node_budget: 500,
+            ..Default::default()
+        };
         assert_eq!(reduced_sim_config(&base, 4).n_simulations, 16);
         assert_eq!(reduced_sim_config(&base, 1).n_simulations, 64);
         assert_eq!(reduced_sim_config(&base, 0).n_simulations, 64); // clamp divisor to 1
@@ -4360,6 +4428,8 @@ mod tests {
         assert_eq!(r.c_visit, 50);
         assert_eq!(r.c_scale, 1.0);
         assert_eq!(r.virtual_loss, 0.5);
+        assert!(r.disable_forcing_solver);
+        assert_eq!(r.leaf_forcing_node_budget, 500);
     }
 
     #[test]

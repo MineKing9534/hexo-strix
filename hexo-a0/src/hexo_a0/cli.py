@@ -216,6 +216,34 @@ def main(argv=None):
                                  "shortcut for BOTH sides, measuring raw-network strength "
                                  "(requires a hexo_rs extension rebuilt with the "
                                  "disable_forcing_solver kwarg).")
+    h2h_parser.add_argument(
+        "--a-forcing-mode", choices=["root", "leaf", "both", "off"], default="root",
+        help="A-side forcing integration (default: root). 'leaf' disables the root shortcut and enables leaf-value proofs.",
+    )
+    h2h_parser.add_argument(
+        "--b-forcing-mode", choices=["root", "leaf", "both", "off"], default="root",
+        help="B-side forcing integration (default: root). Use A=leaf, B=root with the same checkpoint for the no-retraining SPRT.",
+    )
+    h2h_parser.add_argument(
+        "--forcing-depth-cap", type=int, default=0,
+        help="Shared root/leaf IDTT depth cap (0 = Rust default).",
+    )
+    h2h_parser.add_argument(
+        "--forcing-node-budget", type=int, default=0,
+        help="Root IDTT node budget for both sides (0 = Rust default).",
+    )
+    h2h_parser.add_argument(
+        "--leaf-forcing-node-budget", type=int, default=500,
+        help="Leaf IDTT budget used by sides in leaf/both mode (default: 500).",
+    )
+    h2h_parser.add_argument(
+        "--leaf-forcing-capture", type=str, default=None,
+        help="Optional replayable JSONL capture of encountered leaf positions; diagnostic I/O, do not use for the timed SPRT.",
+    )
+    h2h_parser.add_argument(
+        "--leaf-forcing-capture-limit", type=int, default=10_000,
+        help="Maximum JSONL leaf records written when capture is enabled (default: 10000).",
+    )
     # --- serve ---
     serve_parser = subparsers.add_parser(
         "serve",
@@ -692,8 +720,40 @@ def _run_head_to_head(args):
         print(f"Checkpoint B not found: {ckpt_b}")
         return 1
 
+    if args.forcing_depth_cap < 0:
+        print("--forcing-depth-cap must be >= 0")
+        return 1
+    if args.forcing_node_budget < 0:
+        print("--forcing-node-budget must be >= 0")
+        return 1
+    if args.leaf_forcing_node_budget < 0:
+        print("--leaf-forcing-node-budget must be >= 0")
+        return 1
+    if args.leaf_forcing_capture_limit < 0:
+        print("--leaf-forcing-capture-limit must be >= 0")
+        return 1
+
     window = None if args.window_size <= 0 else args.window_size
     state_file = Path(args.state_file) if args.state_file else None
+
+    def forcing_side(mode: str) -> tuple[bool, int]:
+        if mode == "root":
+            return False, 0
+        if mode == "leaf":
+            return True, args.leaf_forcing_node_budget
+        if mode == "both":
+            return False, args.leaf_forcing_node_budget
+        return True, 0
+
+    mode_a = "off" if args.disable_forcing_solver else args.a_forcing_mode
+    mode_b = "off" if args.disable_forcing_solver else args.b_forcing_mode
+    if args.leaf_forcing_node_budget == 0 and (
+        mode_a in ("leaf", "both") or mode_b in ("leaf", "both")
+    ):
+        print("leaf/both forcing mode requires --leaf-forcing-node-budget > 0")
+        return 1
+    a_disable_root, a_leaf_budget = forcing_side(mode_a)
+    b_disable_root, b_leaf_budget = forcing_side(mode_b)
 
     summary = run_head_to_head(
         checkpoint_a=ckpt_a,
@@ -715,7 +775,16 @@ def _run_head_to_head(args):
         opening_plies=args.opening_plies,
         opening_temperature=args.opening_temperature,
         opening_generator=args.opening_generator,
-        disable_forcing_solver=args.disable_forcing_solver,
+        mcts_a_disable_root_forcing=a_disable_root,
+        mcts_b_disable_root_forcing=b_disable_root,
+        forcing_depth_cap=args.forcing_depth_cap,
+        forcing_node_budget=args.forcing_node_budget,
+        mcts_a_leaf_forcing_node_budget=a_leaf_budget,
+        mcts_b_leaf_forcing_node_budget=b_leaf_budget,
+        leaf_forcing_capture=(
+            Path(args.leaf_forcing_capture) if args.leaf_forcing_capture else None
+        ),
+        leaf_forcing_capture_limit=args.leaf_forcing_capture_limit,
     )
     # accept_h1 or reject_h1 → 0 (SPRT terminated); inconclusive → 2
     if summary["decision"] in ("accept_h1", "reject_h1"):

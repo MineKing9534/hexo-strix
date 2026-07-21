@@ -191,8 +191,10 @@ class MCTSConfig:
     exploration_distribution: str = _f("improved_policy", "Distribution sampled during opening-exploration placements: 'improved_policy' (π', the σ-sharpened completed-Q policy — near one-hot at low sims) or 'visit_counts' (the Gumbel-AZ-paper acting distribution — the broad Sequential-Halving visit staircase). Ablation toggle; Rust self-play only.", group="Exploration")
     truncate_delta: float = _f(0.0, "Q-margin truncation gate for exploration acting (Rust self-play only). When > 0, in-window sampling zeroes candidates whose completed-Q falls more than this margin below the best candidate's — diverse-but-sound exploration. 0 = off. Validated offline at 0.25; see docs/research/2026-06-11-q-margin-truncated-exploration.md. The gate's soundness guarantee is strongest under exploration_distribution='visit_counts' (production): in legacy improved_policy mode, non-candidate prior mass is never gated and remains in the sampling distribution unchanged.", group="Exploration")
     # --- Forcing solver ---
+    disable_root_forcing: bool = _f(False, "Disable the root VCF forcing shortcut while leaving optional leaf forcing active. False preserves the existing root-solver behaviour. Set true with leaf_forcing_node_budget > 0 for leaf-only search.", group="Forcing solver")
     forcing_depth_cap: int = _f(0, "Runtime override for the VCF forcing-solver iterative-deepening depth cap (in attacker turns) used by the mr>=1 forced-win shortcut in self-play. 0 = use the Rust compile-time default (SELF_PLAY_DEPTH_CAP = 6); any non-zero value caps the search at that depth. 0 emits no CLI flag, so an unset value is byte-identical to prior behaviour and safe against a self_play binary that predates the flag.", group="Forcing solver")
     forcing_node_budget: int = _f(0, "Runtime override for the VCF forcing-solver per-position node budget (the hard ceiling on solve effort) used by the mr>=1 forced-win shortcut in self-play. 0 = use the Rust compile-time default (SELF_PLAY_NODE_BUDGET = 2000); any non-zero value uses that budget. 0 emits no CLI flag, so an unset value is byte-identical to prior behaviour and safe against an older self_play binary.", group="Forcing solver")
+    leaf_forcing_node_budget: int = _f(0, "Per-leaf VCF node budget. 0 disables leaf solving (default). When non-zero, each newly evaluated MCTS leaf is searched with the wide IDTT solver; a proven current-player win replaces only that leaf's network value with +1, while No/BudgetExceeded leave it untouched. Uses forcing_depth_cap.", group="Forcing solver")
 
 
 @dataclass
@@ -279,8 +281,10 @@ class SelfPlayMctsOverride:
     paper default. See docs/research/2026-06-04-cscale-target-reshape.md."""
     c_scale: float | None = _f(None, "Self-play-only σ scaling override; inherits [mcts].c_scale when unset", group="Search")
     c_visit: int | None = _f(None, "Self-play-only σ visit-baseline override; inherits [mcts].c_visit when unset", group="Search")
+    disable_root_forcing: bool | None = _f(None, "Self-play-only root VCF shortcut toggle; inherits [mcts].disable_root_forcing when unset. Set true with a non-zero leaf budget for leaf-only self-play.", group="Forcing solver")
     forcing_depth_cap: int | None = _f(None, "Self-play-only VCF forcing-solver depth-cap override; inherits [mcts].forcing_depth_cap when unset. 0 (inherited or set) = use the Rust compile-time default (SELF_PLAY_DEPTH_CAP).", group="Forcing solver")
     forcing_node_budget: int | None = _f(None, "Self-play-only VCF forcing-solver node-budget override; inherits [mcts].forcing_node_budget when unset. 0 (inherited or set) = use the Rust compile-time default (SELF_PLAY_NODE_BUDGET).", group="Forcing solver")
+    leaf_forcing_node_budget: int | None = _f(None, "Self-play-only per-leaf VCF node budget; inherits [mcts].leaf_forcing_node_budget when unset. 0 disables leaf solving.", group="Forcing solver")
 
 
 @dataclass

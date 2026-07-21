@@ -236,6 +236,14 @@ def run_head_to_head(
     opening_temperature: float = 1.0,
     opening_generator: Literal["alternate", "a", "b", "champion"] = "alternate",
     disable_forcing_solver: bool = False,
+    mcts_a_disable_root_forcing: bool = False,
+    mcts_b_disable_root_forcing: bool = False,
+    forcing_depth_cap: int = 0,
+    forcing_node_budget: int = 0,
+    mcts_a_leaf_forcing_node_budget: int = 0,
+    mcts_b_leaf_forcing_node_budget: int = 0,
+    leaf_forcing_capture: Path | None = None,
+    leaf_forcing_capture_limit: int = 10_000,
 ) -> dict:
     """Run a SPRT-bounded match between two checkpoints.
 
@@ -252,6 +260,24 @@ def run_head_to_head(
     ``"a"``, ``"b"``, or ``"champion"`` (= B).
     """
     import hexo_rs  # lazy import — same pattern as evaluate.py / sprt_daemon
+
+    leaf_requested = (
+        mcts_a_leaf_forcing_node_budget > 0
+        or mcts_b_leaf_forcing_node_budget > 0
+    )
+    if leaf_requested and not hasattr(hexo_rs, "leaf_forcing_stats"):
+        raise RuntimeError(
+            "leaf forcing was requested, but hexo_rs predates the leaf-forcing "
+            "bindings; rebuild the Rust extension"
+        )
+    if hasattr(hexo_rs, "leaf_forcing_stats"):
+        hexo_rs.leaf_forcing_stats(reset=True)
+    if leaf_forcing_capture is not None:
+        if not hasattr(hexo_rs, "configure_leaf_forcing_capture"):
+            raise RuntimeError("hexo_rs was built without leaf-forcing capture support")
+        hexo_rs.configure_leaf_forcing_capture(
+            str(leaf_forcing_capture), leaf_forcing_capture_limit,
+        )
 
     if seed is not None:
         random.seed(seed)
@@ -287,6 +313,20 @@ def run_head_to_head(
         mcts_a_forced_candidate_capture_k, mcts_b_forced_candidate_capture_k,
         mcts_a_virtual_loss, mcts_b_virtual_loss,
     )
+    logger.info(
+        "Forcing: root A=%s B=%s depth=%s root_budget=%s leaf_budget A=%d B=%d",
+        "off" if disable_forcing_solver or mcts_a_disable_root_forcing else "on",
+        "off" if disable_forcing_solver or mcts_b_disable_root_forcing else "on",
+        forcing_depth_cap or "default",
+        forcing_node_budget or "default",
+        mcts_a_leaf_forcing_node_budget,
+        mcts_b_leaf_forcing_node_budget,
+    )
+    if leaf_forcing_capture is not None:
+        logger.info(
+            "Leaf capture: %s (limit=%d; diagnostic I/O affects timing)",
+            leaf_forcing_capture, leaf_forcing_capture_limit,
+        )
     logger.info(
         "SPRT: s0=%.3f s1=%.3f alpha=%.3f beta=%.3f  bounds [%.3f, %.3f]",
         sprt_s0, sprt_s1, sprt_alpha, sprt_beta, lower, upper,
@@ -344,6 +384,14 @@ def run_head_to_head(
             opening=current_opening if noise_off else None,
             disable_gumbel_noise=noise_off,
             disable_forcing_solver=disable_forcing_solver,
+            mcts_disable_forcing_solver=mcts_a_disable_root_forcing,
+            opponent_mcts_disable_forcing_solver=mcts_b_disable_root_forcing,
+            mcts_forcing_depth_cap=forcing_depth_cap,
+            opponent_mcts_forcing_depth_cap=forcing_depth_cap,
+            mcts_forcing_node_budget=forcing_node_budget,
+            opponent_mcts_forcing_node_budget=forcing_node_budget,
+            mcts_leaf_forcing_node_budget=mcts_a_leaf_forcing_node_budget,
+            opponent_mcts_leaf_forcing_node_budget=mcts_b_leaf_forcing_node_budget,
         )
         game_move_logs.append(result["move_log"])  # collected in both modes
         if noise_off:
@@ -407,6 +455,12 @@ def run_head_to_head(
                 "mcts_b_forced_candidate_capture_k": mcts_b_forced_candidate_capture_k,
                 "mcts_a_virtual_loss": mcts_a_virtual_loss,
                 "mcts_b_virtual_loss": mcts_b_virtual_loss,
+                "mcts_a_disable_root_forcing": mcts_a_disable_root_forcing,
+                "mcts_b_disable_root_forcing": mcts_b_disable_root_forcing,
+                "forcing_depth_cap": forcing_depth_cap,
+                "forcing_node_budget": forcing_node_budget,
+                "mcts_a_leaf_forcing_node_budget": mcts_a_leaf_forcing_node_budget,
+                "mcts_b_leaf_forcing_node_budget": mcts_b_leaf_forcing_node_budget,
             }
             _atomic_write_json(state_file, payload)
 
@@ -434,6 +488,23 @@ def run_head_to_head(
     final_elo_hi = _score_to_elo(final_ci_hi)
 
     logger.info("=" * 78)
+
+    leaf_forcing_stats = (
+        dict(hexo_rs.leaf_forcing_stats())
+        if hasattr(hexo_rs, "leaf_forcing_stats") else {}
+    )
+    if leaf_forcing_capture is not None:
+        hexo_rs.configure_leaf_forcing_capture(None)
+    if leaf_forcing_stats.get("calls", 0):
+        calls = leaf_forcing_stats["calls"]
+        logger.info(
+            "Leaf forcing: calls=%d wins=%d no=%d budget_exceeded=%d mean=%.1fus",
+            calls,
+            leaf_forcing_stats["wins"],
+            leaf_forcing_stats["no"],
+            leaf_forcing_stats["budget_exceeded"],
+            leaf_forcing_stats["elapsed_ns"] / calls / 1_000.0,
+        )
     logger.info("Final: %s", verdict)
     logger.info(
         "Games=%d  W-D-L=%d-%d-%d  score=%.3f  LLR=%.3f",
@@ -505,4 +576,13 @@ def run_head_to_head(
         "score_ci_hi": final_ci_hi,
         "checkpoint_a": str(ckpt_a.path),
         "checkpoint_b": str(ckpt_b.path),
+        "leaf_forcing_stats": leaf_forcing_stats,
+        "forcing": {
+            "a_root": not (disable_forcing_solver or mcts_a_disable_root_forcing),
+            "b_root": not (disable_forcing_solver or mcts_b_disable_root_forcing),
+            "depth_cap": forcing_depth_cap,
+            "root_node_budget": forcing_node_budget,
+            "a_leaf_node_budget": mcts_a_leaf_forcing_node_budget,
+            "b_leaf_node_budget": mcts_b_leaf_forcing_node_budget,
+        },
     }

@@ -2372,6 +2372,15 @@ class TestPoolSubprocessArgs:
         assert "--playout-cap-fraction" in src
         assert "--playout-cap-divisor" in src
 
+    def test_trainer_source_emits_leaf_only_forcing_flags(self):
+        import inspect
+        from hexo_a0 import trainer
+
+        src = inspect.getsource(trainer.Trainer._rust_self_play_worker_inner)
+        assert "sp_mcts.disable_root_forcing" in src
+        assert "--disable-root-forcing" in src
+        assert "--leaf-forcing-node-budget" in src
+
     def test_resume_short_chunk_alignment_arithmetic(self):
         """Pure-logic check for resume realignment: burning a short first
         chunk restores train_steps to a chunk boundary.

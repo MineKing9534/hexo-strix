@@ -10,6 +10,7 @@ pub mod batched;
 pub mod forcing;
 pub mod gumbel_mcts;
 pub mod halving;
+pub mod leaf_forcing;
 pub mod node;
 pub mod scoring;
 pub mod select;
@@ -85,4 +86,13 @@ pub struct MCTSConfig {
     /// bit-identical to prior behaviour. Any non-zero value uses that budget
     /// instead. As with `forcing_depth_cap`, raw `0` only selects the default.
     pub forcing_node_budget: u64,
+    /// Run the wide VCF solver at every non-terminal MCTS leaf and replace the
+    /// network value with +1.0 only when the side to move has a proven win.
+    /// `0` (the default) disables leaf solving completely, preserving the
+    /// previous search byte-for-byte. Any non-zero value is the per-leaf node
+    /// budget. `No` and `BudgetExceeded` never alter the network value.
+    ///
+    /// Leaf solving shares `forcing_depth_cap` with the root solver so root vs
+    /// leaf experiments differ only in placement and node budget.
+    pub leaf_forcing_node_budget: u64,
 }

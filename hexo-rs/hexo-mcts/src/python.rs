@@ -301,6 +301,7 @@ impl PyMCTSConfig {
         disable_forcing_solver=false,
         forcing_depth_cap=0,
         forcing_node_budget=0,
+        leaf_forcing_node_budget=0,
     ))]
     fn new(
         n_simulations: u32,
@@ -315,6 +316,7 @@ impl PyMCTSConfig {
         disable_forcing_solver: bool,
         forcing_depth_cap: u8,
         forcing_node_budget: u64,
+        leaf_forcing_node_budget: u64,
     ) -> PyResult<Self> {
         if m_actions < 1 {
             return Err(PyValueError::new_err("m_actions must be >= 1"));
@@ -353,6 +355,7 @@ impl PyMCTSConfig {
                 disable_forcing_solver,
                 forcing_depth_cap,
                 forcing_node_budget,
+                leaf_forcing_node_budget,
             },
         })
     }
@@ -1833,6 +1836,40 @@ fn py_snapshot_eval_cache(py: Python<'_>) -> PyResult<Py<PyAny>> {
     Ok(dict.into())
 }
 
+// ---------------------------------------------------------------------------
+// Leaf-forcing experiment instrumentation.
+// ---------------------------------------------------------------------------
+
+#[pyfunction(name = "leaf_forcing_stats")]
+#[pyo3(signature = (reset=false))]
+fn py_leaf_forcing_stats(py: Python<'_>, reset: bool) -> PyResult<Py<PyAny>> {
+    let stats = crate::mcts::leaf_forcing::stats(reset);
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("calls", stats.calls)?;
+    dict.set_item("wins", stats.wins)?;
+    dict.set_item("no", stats.no)?;
+    dict.set_item("budget_exceeded", stats.budget_exceeded)?;
+    dict.set_item("elapsed_ns", stats.elapsed_ns)?;
+    dict.set_item("captured", stats.captured)?;
+    dict.set_item("capture_errors", stats.capture_errors)?;
+    Ok(dict.into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[pyfunction(name = "configure_leaf_forcing_capture")]
+#[pyo3(signature = (path=None, limit=10_000))]
+fn py_configure_leaf_forcing_capture(path: Option<String>, limit: u64) -> PyResult<()> {
+    match path {
+        Some(path) => crate::mcts::leaf_forcing::configure_capture(
+            std::path::Path::new(&path),
+            limit,
+        )
+        .map_err(|e| PyValueError::new_err(format!("opening {path}: {e}"))),
+        None => crate::mcts::leaf_forcing::finish_capture()
+            .map_err(|e| PyValueError::new_err(format!("flushing leaf capture: {e}"))),
+    }
+}
+
 /// Register every hexo_rs class/function on `m`. The #[pymodule] entry point
 /// lives in the hexo-py crate (which adds the hexo-infer-backed classes);
 /// keeping no #[pymodule] here avoids a duplicate PyInit_hexo_rs symbol in
@@ -1859,6 +1896,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_forcing, m)?)?;
     m.add_function(wrap_pyfunction!(solve_threat, m)?)?;
     m.add_function(wrap_pyfunction!(solve_defense, m)?)?;
+    m.add_function(wrap_pyfunction!(py_leaf_forcing_stats, m)?)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    m.add_function(wrap_pyfunction!(py_configure_leaf_forcing_capture, m)?)?;
     #[cfg(feature = "torch")]
     m.add_function(wrap_pyfunction!(py_native_self_play, m)?)?;
     #[cfg(feature = "dedup_count")]

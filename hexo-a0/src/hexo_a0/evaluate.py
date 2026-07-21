@@ -92,6 +92,14 @@ def play_eval_game(
     opening: list[tuple[int, int]] | None = None,
     disable_gumbel_noise: bool = False,
     disable_forcing_solver: bool = False,
+    mcts_disable_forcing_solver: bool | None = None,
+    opponent_mcts_disable_forcing_solver: bool | None = None,
+    mcts_forcing_depth_cap: int = 0,
+    opponent_mcts_forcing_depth_cap: int = 0,
+    mcts_forcing_node_budget: int = 0,
+    opponent_mcts_forcing_node_budget: int = 0,
+    mcts_leaf_forcing_node_budget: int = 0,
+    opponent_mcts_leaf_forcing_node_budget: int = 0,
 ) -> dict:
     """Play one complete evaluation game: model vs opponent.
 
@@ -167,14 +175,24 @@ def play_eval_game(
     )
 
     def _make_cfg(sims: int, m_actions: int, c_visit: int, c_scale: float,
-                  capture_k: int = 0, vl: float = 0.0):
+                  capture_k: int = 0, vl: float = 0.0,
+                  disable_root_forcing: bool = False,
+                  forcing_depth_cap: int = 0,
+                  forcing_node_budget: int = 0,
+                  leaf_forcing_node_budget: int = 0):
         if sims <= 0:
             return None
-        # Only pass disable_forcing_solver when set (solver-off diagnostic),
-        # so the default path stays compatible with hexo_rs extensions built
-        # before the kwarg existed. The Rust default is solver-ON regardless,
-        # so omitting the kwarg is identical to disable_forcing_solver=False.
-        extra = {"disable_forcing_solver": True} if disable_forcing_solver else {}
+        # Only pass non-default experiment kwargs. The ordinary eval path thus
+        # remains compatible with extensions predating these controls.
+        extra = {}
+        if disable_root_forcing:
+            extra["disable_forcing_solver"] = True
+        if forcing_depth_cap:
+            extra["forcing_depth_cap"] = forcing_depth_cap
+        if forcing_node_budget:
+            extra["forcing_node_budget"] = forcing_node_budget
+        if leaf_forcing_node_budget:
+            extra["leaf_forcing_node_budget"] = leaf_forcing_node_budget
         return hexo_rs.MCTSConfig(
             n_simulations=sims, m_actions=m_actions,
             c_visit=c_visit, c_scale=c_scale,
@@ -187,6 +205,10 @@ def play_eval_game(
     mcts_config = _make_cfg(
         mcts_sims, mcts_m_actions, mcts_c_visit, mcts_c_scale,
         mcts_forced_candidate_capture_k, mcts_virtual_loss,
+        disable_forcing_solver or bool(mcts_disable_forcing_solver),
+        mcts_forcing_depth_cap,
+        mcts_forcing_node_budget,
+        mcts_leaf_forcing_node_budget,
     )
     opp_sims = mcts_sims if opponent_mcts_sims is None else opponent_mcts_sims
     opp_m_actions = (
@@ -197,6 +219,10 @@ def play_eval_game(
     opp_mcts_config = _make_cfg(
         opp_sims, opp_m_actions, opp_c_visit, opp_c_scale,
         opponent_mcts_forced_candidate_capture_k, opponent_mcts_virtual_loss,
+        disable_forcing_solver or bool(opponent_mcts_disable_forcing_solver),
+        opponent_mcts_forcing_depth_cap,
+        opponent_mcts_forcing_node_budget,
+        opponent_mcts_leaf_forcing_node_budget,
     )
 
     game = hexo_rs.GameState(game_config)

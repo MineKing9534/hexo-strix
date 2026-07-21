@@ -6,6 +6,7 @@ use rand::Rng;
 
 use super::MCTSConfig;
 use super::halving::{compute_improved_policy, gumbel_top_k, sequential_halving};
+use super::leaf_forcing;
 use super::node::MCTSNode;
 use super::scoring::{QContext, sigma};
 use super::simulate::{
@@ -567,6 +568,12 @@ where
 
     // Step 4: Sequential halving with batched evaluation
     let vl_magnitude = config.virtual_loss;
+    let leaf_forcing_depth_cap = if config.forcing_depth_cap == 0 {
+        SELF_PLAY_DEPTH_CAP
+    } else {
+        config.forcing_depth_cap
+    };
+    let leaf_forcing_node_budget = config.leaf_forcing_node_budget;
     let surviving_indices = sequential_halving(
         &mut root,
         &candidate_indices,
@@ -581,6 +588,8 @@ where
                 c_visit,
                 c_scale,
                 vl_magnitude,
+                leaf_forcing_depth_cap,
+                leaf_forcing_node_budget,
                 eval_fn,
             );
         },
@@ -677,6 +686,8 @@ fn simulate_batch_with_eval<F>(
     c_visit: u32,
     c_scale: f64,
     vl_magnitude: f64,
+    leaf_forcing_depth_cap: u8,
+    leaf_forcing_node_budget: u64,
     eval_fn: &mut F,
 ) where
     F: FnMut(&[GameState]) -> (Vec<HashMap<Coord, f64>>, Vec<f64>),
@@ -805,7 +816,18 @@ fn simulate_batch_with_eval<F>(
             .into_iter()
             .zip(prior_vals)
             .collect();
-        let leaf_value = values[i];
+        let leaf_value = if leaf_forcing_node_budget == 0 {
+            values[i]
+        } else {
+            leaf_forcing::override_value(
+                &pending_states[i],
+                values[i],
+                leaf_forcing_depth_cap,
+                leaf_forcing_node_budget,
+                selection.path_actions.len(),
+                root.current_player,
+            )
+        };
         complete_simulation(root, selection, leaf_priors, leaf_value);
 
         #[cfg(feature = "dedup_count")]
@@ -2455,6 +2477,92 @@ mod tests {
                 skipped.improved_policy
             );
         }
+    }
+
+    /// Leaf forcing is a value evaluator, not a root shortcut: keep the
+    /// network policy/prior, prove the side-to-move win after selection, and
+    /// let the ordinary same-player (mr=2 -> mr=1) backup carry +1 to the
+    /// root child. With the feature disabled the identical leaf keeps the
+    /// deliberately pessimistic network value.
+    #[test]
+    fn leaf_forcing_overrides_proven_leaf_value_only_when_enabled() {
+        let stones: Vec<(Coord, Player)> = [
+            (10, 0), (11, 0), (12, 0), (13, 0),
+            (9, 1), (9, 2), (9, 3), (9, 4),
+        ]
+        .into_iter()
+        .map(|c| (c, Player::P1))
+        .collect();
+        let game = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
+        let quiet = (5, 0);
+        let other = (5, 1);
+        assert!(game.legal_moves_set().contains(&quiet));
+        assert!(game.legal_moves_set().contains(&other));
+
+        let mut quiet_leaf = game.clone();
+        quiet_leaf.apply_move(quiet).unwrap();
+        assert_eq!(quiet_leaf.moves_remaining_this_turn(), 1);
+        assert!(matches!(
+            forcing::solve_wide(&quiet_leaf, SELF_PLAY_DEPTH_CAP, 500),
+            forcing::Outcome::Win(_)
+        ));
+
+        let make_eval = || {
+            move |states: &[GameState]| {
+                let logits = states
+                    .iter()
+                    .map(|state| {
+                        state
+                            .legal_moves()
+                            .into_iter()
+                            .map(|coord| {
+                                let logit = if state.moves_remaining_this_turn() == 2 {
+                                    if coord == quiet { 100.0 }
+                                    else if coord == other { 99.0 }
+                                    else { -100.0 }
+                                } else {
+                                    0.0
+                                };
+                                (coord, logit)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let values = states
+                    .iter()
+                    .map(|state| if state.moves_remaining_this_turn() == 2 { 0.0 } else { -0.75 })
+                    .collect();
+                (logits, values)
+            }
+        };
+
+        let base = MCTSConfig {
+            n_simulations: 2,
+            m_actions: 2,
+            c_visit: 50,
+            c_scale: 1.0,
+            disable_gumbel_noise: true,
+            disable_forcing_solver: true,
+            ..Default::default()
+        };
+        let off = MCTSConfig { leaf_forcing_node_budget: 0, ..base.clone() };
+        let on = MCTSConfig { leaf_forcing_node_budget: 500, ..base };
+
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut eval = make_eval();
+        let off_result = gumbel_mcts(&game, &off, &mut rng, None, &mut eval).unwrap();
+        let quiet_idx = off_result.coords.iter().position(|&c| c == quiet).unwrap();
+        assert_eq!(off_result.per_child_q[quiet_idx], -0.75);
+
+        super::leaf_forcing::stats(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut eval = make_eval();
+        let on_result = gumbel_mcts(&game, &on, &mut rng, None, &mut eval).unwrap();
+        let quiet_idx = on_result.coords.iter().position(|&c| c == quiet).unwrap();
+        assert_eq!(on_result.per_child_q[quiet_idx], 1.0);
+        let stats = super::leaf_forcing::stats(false);
+        assert!(stats.calls >= 2);
+        assert!(stats.wins >= 1);
     }
 
     /// Change (A): the forcing-solver shortcut must also fire at an mr==1 root
