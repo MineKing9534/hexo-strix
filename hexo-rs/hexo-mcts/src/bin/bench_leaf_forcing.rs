@@ -3,7 +3,7 @@
 //! Usage:
 //!   bench_leaf_forcing <capture.jsonl> [--depth-cap=N] [--node-budget=N]
 //!       [--max=N] [--repeats=N] [--wide] [--legacy-order]
-//!       [--compare-ordering]
+//!       [--incremental] [--compare-ordering] [--compare-incremental]
 
 use hexo_engine::{GameConfig, GameState, Player};
 use hexo_rs::mcts::forcing::{self, ForcingVerdict, VerdictScratch};
@@ -112,6 +112,37 @@ fn verdict_index(verdict: ForcingVerdict) -> usize {
     }
 }
 
+fn solve_position(
+    state: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    proof_ordering: bool,
+    incremental: bool,
+    scratch: &mut VerdictScratch,
+) -> ForcingVerdict {
+    if incremental {
+        forcing::solve_verdict_with_scratch_incremental(
+            state,
+            depth_cap,
+            node_budget,
+            wide,
+            proof_ordering,
+            scratch,
+        )
+    } else if proof_ordering {
+        forcing::solve_verdict_with_scratch_proof_ordered(
+            state,
+            depth_cap,
+            node_budget,
+            wide,
+            scratch,
+        )
+    } else {
+        forcing::solve_verdict_with_scratch(state, depth_cap, node_budget, wide, scratch)
+    }
+}
+
 fn compare_ordering(positions: &[CapturedPosition], depth_cap: u8, node_budget: u64, wide: bool) {
     let mut legacy_scratch = VerdictScratch::default();
     let mut proof_scratch = VerdictScratch::default();
@@ -152,6 +183,56 @@ fn compare_ordering(positions: &[CapturedPosition], depth_cap: u8, node_budget: 
     println!("both-win proof-depth changes={win_depth_changes}");
 }
 
+fn compare_incremental(
+    positions: &[CapturedPosition],
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    proof_ordering: bool,
+) {
+    let mut legacy_scratch = VerdictScratch::default();
+    let mut incremental_scratch = VerdictScratch::default();
+    let mut transitions = [[0usize; 3]; 3];
+    let mut win_depth_changes = 0usize;
+    for position in positions {
+        let state = game(position);
+        let legacy = solve_position(
+            &state,
+            depth_cap,
+            node_budget,
+            wide,
+            proof_ordering,
+            false,
+            &mut legacy_scratch,
+        );
+        let incremental = solve_position(
+            &state,
+            depth_cap,
+            node_budget,
+            wide,
+            proof_ordering,
+            true,
+            &mut incremental_scratch,
+        );
+        transitions[verdict_index(legacy)][verdict_index(incremental)] += 1;
+        if let (ForcingVerdict::Win { depth: a }, ForcingVerdict::Win { depth: b }) =
+            (legacy, incremental)
+            && a != b
+        {
+            win_depth_changes += 1;
+        }
+    }
+    println!("incremental transition matrix (legacy rows -> incremental columns)");
+    println!("                 WIN       NO       BUDGET_EXCEEDED");
+    for (label, row) in ["WIN", "NO", "BUDGET_EXCEEDED"]
+        .into_iter()
+        .zip(transitions)
+    {
+        println!("{label:>15} {:>8} {:>8} {:>21}", row[0], row[1], row[2]);
+    }
+    println!("both-win proof-depth changes={win_depth_changes}");
+}
+
 fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let path = args.next().ok_or(
@@ -163,7 +244,9 @@ fn main() -> Result<(), String> {
     let mut repeats = 1usize;
     let mut wide = false;
     let mut proof_ordering = true;
-    let mut compare = false;
+    let mut incremental = false;
+    let mut compare_order = false;
+    let mut compare_windows = false;
     for arg in args {
         if let Some(value) = arg.strip_prefix("--depth-cap=") {
             depth_cap = value
@@ -183,8 +266,12 @@ fn main() -> Result<(), String> {
             wide = true;
         } else if arg == "--legacy-order" {
             proof_ordering = false;
+        } else if arg == "--incremental" {
+            incremental = true;
         } else if arg == "--compare-ordering" {
-            compare = true;
+            compare_order = true;
+        } else if arg == "--compare-incremental" {
+            compare_windows = true;
         } else {
             return Err(format!("unknown argument {arg:?}"));
         }
@@ -199,20 +286,27 @@ fn main() -> Result<(), String> {
     }
     let mut scratch = VerdictScratch::default();
 
-    if compare {
+    if compare_order {
         compare_ordering(&positions, depth_cap, node_budget, wide);
+        return Ok(());
+    }
+    if compare_windows {
+        compare_incremental(&positions, depth_cap, node_budget, wide, proof_ordering);
         return Ok(());
     }
 
     // Warm instruction/data caches without including setup in the measurement.
     for position in positions.iter().take(100) {
         let state = game(position);
-        let solve = if proof_ordering {
-            forcing::solve_verdict_with_scratch_proof_ordered
-        } else {
-            forcing::solve_verdict_with_scratch
-        };
-        black_box(solve(&state, depth_cap, node_budget, wide, &mut scratch));
+        black_box(solve_position(
+            &state,
+            depth_cap,
+            node_budget,
+            wide,
+            proof_ordering,
+            incremental,
+            &mut scratch,
+        ));
     }
 
     let mut elapsed_ns = Vec::with_capacity(positions.len() * repeats);
@@ -225,12 +319,15 @@ fn main() -> Result<(), String> {
         for position in &positions {
             let state = game(position);
             let started = Instant::now();
-            let solve = if proof_ordering {
-                forcing::solve_verdict_with_scratch_proof_ordered
-            } else {
-                forcing::solve_verdict_with_scratch
-            };
-            let verdict = solve(&state, depth_cap, node_budget, wide, &mut scratch);
+            let verdict = solve_position(
+                &state,
+                depth_cap,
+                node_budget,
+                wide,
+                proof_ordering,
+                incremental,
+                &mut scratch,
+            );
             elapsed_ns.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
             match verdict {
                 ForcingVerdict::Win { .. } => wins += 1,
@@ -249,12 +346,13 @@ fn main() -> Result<(), String> {
     let sum_ns: u128 = elapsed_ns.iter().map(|&x| x as u128).sum();
     println!("capture={path}");
     println!(
-        "positions={} repeats={} calls={} width={} ordering={} depth_cap={} node_budget={}",
+        "positions={} repeats={} calls={} width={} ordering={} windows={} depth_cap={} node_budget={}",
         positions.len(),
         repeats,
         calls,
         if wide { "wide" } else { "tight" },
         if proof_ordering { "proof" } else { "legacy" },
+        if incremental { "incremental" } else { "legacy" },
         depth_cap,
         node_budget,
     );

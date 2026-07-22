@@ -246,6 +246,8 @@ def run_head_to_head(
     mcts_b_leaf_forcing_tight: bool = False,
     mcts_a_leaf_forcing_proof_ordering: bool = False,
     mcts_b_leaf_forcing_proof_ordering: bool = False,
+    mcts_a_leaf_forcing_incremental_windows: bool = False,
+    mcts_b_leaf_forcing_incremental_windows: bool = False,
     leaf_forcing_capture: Path | None = None,
     leaf_forcing_capture_limit: int = 10_000,
 ) -> dict:
@@ -318,7 +320,7 @@ def run_head_to_head(
         mcts_a_virtual_loss, mcts_b_virtual_loss,
     )
     logger.info(
-        "Forcing: root A=%s B=%s depth=%s root_budget=%s leaf_budget A=%d B=%d leaf_width A=%s B=%s leaf_order A=%s B=%s",
+        "Forcing: root A=%s B=%s depth=%s root_budget=%s leaf_budget A=%d B=%d leaf_width A=%s B=%s leaf_order A=%s B=%s leaf_windows A=%s B=%s",
         "off" if disable_forcing_solver or mcts_a_disable_root_forcing else "on",
         "off" if disable_forcing_solver or mcts_b_disable_root_forcing else "on",
         forcing_depth_cap or "default",
@@ -329,6 +331,8 @@ def run_head_to_head(
         "tight" if mcts_b_leaf_forcing_tight else "wide",
         "proof" if mcts_a_leaf_forcing_proof_ordering else "legacy",
         "proof" if mcts_b_leaf_forcing_proof_ordering else "legacy",
+        "incremental" if mcts_a_leaf_forcing_incremental_windows else "legacy",
+        "incremental" if mcts_b_leaf_forcing_incremental_windows else "legacy",
     )
     if leaf_forcing_capture is not None:
         logger.info(
@@ -404,6 +408,8 @@ def run_head_to_head(
             opponent_mcts_leaf_forcing_tight=mcts_b_leaf_forcing_tight,
             mcts_leaf_forcing_proof_ordering=mcts_a_leaf_forcing_proof_ordering,
             opponent_mcts_leaf_forcing_proof_ordering=mcts_b_leaf_forcing_proof_ordering,
+            mcts_leaf_forcing_incremental_windows=mcts_a_leaf_forcing_incremental_windows,
+            opponent_mcts_leaf_forcing_incremental_windows=mcts_b_leaf_forcing_incremental_windows,
         )
         game_move_logs.append(result["move_log"])  # collected in both modes
         if noise_off:
@@ -477,6 +483,8 @@ def run_head_to_head(
                 "mcts_b_leaf_forcing_tight": mcts_b_leaf_forcing_tight,
                 "mcts_a_leaf_forcing_proof_ordering": mcts_a_leaf_forcing_proof_ordering,
                 "mcts_b_leaf_forcing_proof_ordering": mcts_b_leaf_forcing_proof_ordering,
+                "mcts_a_leaf_forcing_incremental_windows": mcts_a_leaf_forcing_incremental_windows,
+                "mcts_b_leaf_forcing_incremental_windows": mcts_b_leaf_forcing_incremental_windows,
             }
             _atomic_write_json(state_file, payload)
 
@@ -604,5 +612,7 @@ def run_head_to_head(
             "b_leaf_width": "tight" if mcts_b_leaf_forcing_tight else "wide",
             "a_leaf_ordering": "proof" if mcts_a_leaf_forcing_proof_ordering else "legacy",
             "b_leaf_ordering": "proof" if mcts_b_leaf_forcing_proof_ordering else "legacy",
+            "a_leaf_windows": "incremental" if mcts_a_leaf_forcing_incremental_windows else "legacy",
+            "b_leaf_windows": "incremental" if mcts_b_leaf_forcing_incremental_windows else "legacy",
         },
     }

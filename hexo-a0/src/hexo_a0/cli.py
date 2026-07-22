@@ -253,6 +253,14 @@ def main(argv=None):
         help="B-side tight leaf move ordering (default: legacy).",
     )
     h2h_parser.add_argument(
+        "--a-leaf-forcing-windows", choices=["legacy", "incremental"], default="legacy",
+        help="A-side tight leaf window kernel (default: legacy).",
+    )
+    h2h_parser.add_argument(
+        "--b-leaf-forcing-windows", choices=["legacy", "incremental"], default="legacy",
+        help="B-side tight leaf window kernel (default: legacy).",
+    )
+    h2h_parser.add_argument(
         "--leaf-forcing-capture", type=str, default=None,
         help="Optional replayable JSONL capture of encountered leaf positions; diagnostic I/O, do not use for the timed SPRT.",
     )
@@ -801,6 +809,8 @@ def _run_head_to_head(args):
         mcts_b_leaf_forcing_tight=args.b_leaf_forcing_width == "tight",
         mcts_a_leaf_forcing_proof_ordering=args.a_leaf_forcing_ordering == "proof",
         mcts_b_leaf_forcing_proof_ordering=args.b_leaf_forcing_ordering == "proof",
+        mcts_a_leaf_forcing_incremental_windows=args.a_leaf_forcing_windows == "incremental",
+        mcts_b_leaf_forcing_incremental_windows=args.b_leaf_forcing_windows == "incremental",
         leaf_forcing_capture=(
             Path(args.leaf_forcing_capture) if args.leaf_forcing_capture else None
         ),

@@ -304,6 +304,7 @@ impl PyMCTSConfig {
         leaf_forcing_node_budget=0,
         leaf_forcing_tight=false,
         leaf_forcing_proof_ordering=false,
+        leaf_forcing_incremental_windows=false,
         leaf_forcing_parallel_min_batch=0,
     ))]
     fn new(
@@ -322,6 +323,7 @@ impl PyMCTSConfig {
         leaf_forcing_node_budget: u64,
         leaf_forcing_tight: bool,
         leaf_forcing_proof_ordering: bool,
+        leaf_forcing_incremental_windows: bool,
         leaf_forcing_parallel_min_batch: usize,
     ) -> PyResult<Self> {
         if m_actions < 1 {
@@ -364,6 +366,7 @@ impl PyMCTSConfig {
                 leaf_forcing_node_budget,
                 leaf_forcing_tight,
                 leaf_forcing_proof_ordering,
+                leaf_forcing_incremental_windows,
                 leaf_forcing_parallel_min_batch,
             },
         })

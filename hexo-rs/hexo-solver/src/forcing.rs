@@ -159,6 +159,10 @@ pub struct SolverBoard {
     /// -1 = reach tracking off.
     reach_radius: i32,
     disk: Vec<Coord>,
+    /// Optional exact window cache for tight verdict-only leaf probes. Each
+    /// placement touches exactly `3 * win_length` windows; legacy/root callers
+    /// leave it disabled and pay only one predictable branch in place/remove.
+    windows: WindowIndex,
     pub stones: Vec<(Coord, Player)>,
     pub hash: u64,
 }
@@ -180,6 +184,7 @@ impl SolverBoard {
             h: 0,
             reach_radius: -1,
             disk: Vec::new(),
+            windows: WindowIndex::default(),
             stones: Vec::new(),
             hash: 0,
         }
@@ -199,6 +204,7 @@ impl SolverBoard {
         }
         self.stones.clear();
         self.hash = 0;
+        self.windows.states.clear();
         if self.reach_radius >= 0 {
             self.reach.fill(0);
         }
@@ -209,6 +215,14 @@ impl SolverBoard {
         self.reach_radius = -1;
         self.reach.clear();
         self.disk.clear();
+    }
+
+    /// Enable or disable incremental length-`wl` window maintenance while
+    /// retaining the map allocation across independent leaf probes.
+    fn configure_windows(&mut self, wl: u8, enabled: bool) {
+        self.windows.states.clear();
+        self.windows.wl = wl;
+        self.windows.enabled = enabled;
     }
 
     #[inline]
@@ -337,6 +351,7 @@ impl SolverBoard {
         self.grid[i] = pcode(player);
         self.stones.push((coord, player));
         self.hash ^= zob(coord, player);
+        self.windows.update(coord, player, true);
         if self.reach_radius >= 0 {
             let (q0, r0, w) = (self.q0, self.r0, self.w);
             for di in 0..self.disk.len() {
@@ -356,6 +371,7 @@ impl SolverBoard {
         let player = if self.grid[i] == 1 { Player::P1 } else { Player::P2 };
         self.grid[i] = 0;
         self.hash ^= zob(coord, player);
+        self.windows.update(coord, player, false);
         // Make/unmake removes are LIFO in the search, so scan from the end.
         if let Some(pos) = self.stones.iter().rposition(|&(c, _)| c == coord) {
             self.stones.swap_remove(pos);
@@ -389,6 +405,68 @@ impl SolverBoard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowState {
+    p1: u16,
+    p2: u16,
+}
+
+impl WindowState {
+    #[inline]
+    fn masks(self, player: Player) -> (u16, u16) {
+        match player {
+            Player::P1 => (self.p1, self.p2),
+            Player::P2 => (self.p2, self.p1),
+        }
+    }
+}
+
+#[derive(Default)]
+struct WindowIndex {
+    wl: u8,
+    enabled: bool,
+    states: FxHashMap<(Coord, u8), WindowState>,
+}
+
+impl WindowIndex {
+    /// Apply one stone delta to the 3*wl windows containing `coord`.
+    #[inline]
+    fn update(&mut self, coord: Coord, player: Player, placed: bool) {
+        if !self.enabled {
+            return;
+        }
+        debug_assert!((1..=MAX_WL as u8).contains(&self.wl));
+        for (axis, &(dq, dr)) in WIN_AXES.iter().enumerate() {
+            for offset in 0..self.wl {
+                let start = (
+                    coord.0 - i32::from(offset) * dq,
+                    coord.1 - i32::from(offset) * dr,
+                );
+                let key = (start, axis as u8);
+                let bit = 1u16 << offset;
+                if placed {
+                    let state = self.states.entry(key).or_default();
+                    match player {
+                        Player::P1 => state.p1 |= bit,
+                        Player::P2 => state.p2 |= bit,
+                    }
+                } else if let std::collections::hash_map::Entry::Occupied(mut occupied) =
+                    self.states.entry(key)
+                {
+                    let state = occupied.get_mut();
+                    match player {
+                        Player::P1 => state.p1 &= !bit,
+                        Player::P2 => state.p2 &= !bit,
+                    }
+                    if state.p1 == 0 && state.p2 == 0 {
+                        occupied.remove();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Scan all length-`wl` enemy-free windows for `player` whose stone count lies in
 /// [pc_lo, pc_hi] and (in the tight regime) whose gap cells are all playable,
 /// invoking `f(window_start, axis_index, pc, gap_cells)`. `f` returns true to stop
@@ -399,6 +477,70 @@ impl SolverBoard {
 /// window through a stone is within wl-1 <= radius of that stone), keeping the
 /// wide-radius path byte-for-byte unchanged and zero-cost.
 fn scan_windows(
+    board: &SolverBoard,
+    player: Player,
+    wl: u8,
+    radius: i32,
+    pc_lo: i32,
+    pc_hi: i32,
+    f: &mut impl FnMut(Coord, usize, u8, &[Coord]) -> bool,
+) {
+    if board.windows.enabled && board.windows.wl == wl {
+        scan_windows_incremental(board, player, wl, radius, pc_lo, pc_hi, f);
+        return;
+    }
+    scan_windows_legacy(board, player, wl, radius, pc_lo, pc_hi, f);
+}
+
+/// Window scan backed by the exact 3*wl incremental kernel. The map contains
+/// each structural window once, so this removes the legacy per-stone duplicate
+/// strip work. Radius legality remains a query-time filter because reachability
+/// can change when stones outside the window are placed.
+fn scan_windows_incremental(
+    board: &SolverBoard,
+    player: Player,
+    wl: u8,
+    radius: i32,
+    pc_lo: i32,
+    pc_hi: i32,
+    f: &mut impl FnMut(Coord, usize, u8, &[Coord]) -> bool,
+) {
+    let l = i32::from(wl);
+    debug_assert!((1..=MAX_WL as i32).contains(&l));
+    let enforce = radius < l - 1;
+    let full = if wl == 16 { u16::MAX } else { (1u16 << wl) - 1 };
+    let mut empties = [(0i32, 0i32); MAX_WL];
+    for (&(start, axis), &state) in &board.windows.states {
+        let (mine, enemy) = state.masks(player);
+        if mine == 0 || enemy != 0 {
+            continue;
+        }
+        let pc = mine.count_ones() as i32;
+        if pc < pc_lo || pc > pc_hi {
+            continue;
+        }
+        let (dq, dr) = WIN_AXES[axis as usize];
+        let gaps = full & !mine;
+        let mut ne = 0usize;
+        for offset in 0..wl {
+            if gaps & (1u16 << offset) != 0 {
+                empties[ne] = (
+                    start.0 + i32::from(offset) * dq,
+                    start.1 + i32::from(offset) * dr,
+                );
+                ne += 1;
+            }
+        }
+        if enforce && empties[..ne].iter().any(|&e| !board.within_radius(e, radius)) {
+            continue;
+        }
+        if f(start, axis as usize, pc as u8, &empties[..ne]) {
+            return;
+        }
+    }
+}
+
+fn scan_windows_legacy(
     board: &SolverBoard,
     player: Player,
     wl: u8,
@@ -1638,7 +1780,7 @@ pub fn solve_verdict_with_scratch(
     wide: bool,
     scratch: &mut VerdictScratch,
 ) -> ForcingVerdict {
-    solve_verdict_with_scratch_ordering(game, depth_cap, node_budget, wide, false, scratch)
+    solve_verdict_with_scratch_options(game, depth_cap, node_budget, wide, false, false, scratch)
 }
 
 /// Leaf-specialized verdict probe that prioritizes equal-B tight moves by the
@@ -1651,15 +1793,39 @@ pub fn solve_verdict_with_scratch_proof_ordered(
     wide: bool,
     scratch: &mut VerdictScratch,
 ) -> ForcingVerdict {
-    solve_verdict_with_scratch_ordering(game, depth_cap, node_budget, wide, true, scratch)
+    solve_verdict_with_scratch_options(game, depth_cap, node_budget, wide, true, false, scratch)
 }
 
-fn solve_verdict_with_scratch_ordering(
+/// Tight leaf probe using the incremental 3*win_length structural-window
+/// kernel. `proof_ordering` composes independently with the ordering A/B knob.
+/// Wide callers fall back to legacy window scans because their builder-scoring
+/// pass has different workload and is outside this VCF-only optimization.
+pub fn solve_verdict_with_scratch_incremental(
     game: &GameState,
     depth_cap: u8,
     node_budget: u64,
     wide: bool,
     proof_ordering: bool,
+    scratch: &mut VerdictScratch,
+) -> ForcingVerdict {
+    solve_verdict_with_scratch_options(
+        game,
+        depth_cap,
+        node_budget,
+        wide,
+        proof_ordering,
+        !wide,
+        scratch,
+    )
+}
+
+fn solve_verdict_with_scratch_options(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    proof_ordering: bool,
+    incremental_windows: bool,
     scratch: &mut VerdictScratch,
 ) -> ForcingVerdict {
     let placements = match prepare_search_reusing(
@@ -1668,6 +1834,7 @@ fn solve_verdict_with_scratch_ordering(
         wide,
         Limits::default(),
         false,
+        incremental_windows,
         &mut scratch.board,
         &mut scratch.search,
     ) {
@@ -1778,18 +1945,21 @@ fn prepare_search(
         wide,
         limits,
         capture,
+        false,
         &mut board,
         &mut search,
     )?;
     Ok((board, search, placements))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_search_reusing(
     game: &GameState,
     node_budget: u64,
     wide: bool,
     limits: Limits,
     capture: bool,
+    incremental_windows: bool,
     board: &mut SolverBoard,
     search: &mut SearchState,
 ) -> Result<u8, SolveResult> {
@@ -1802,6 +1972,7 @@ fn prepare_search_reusing(
         return Err(SolveResult::BudgetExceeded); // see solve_from
     }
     board.clear_for_reuse();
+    board.configure_windows(wl, incremental_windows);
     search.clear_for_search(wl, radius, attacker, defender, node_budget, wide);
     let tight_reach = radius < wl as i32 - 1;
     if !tight_reach || board.reach_radius != radius {
@@ -2895,6 +3066,85 @@ mod tests {
         assert!(!b.within_radius((99, -79), 2));
         // Untracked-radius queries fall back to a stone scan.
         assert!(b.within_radius((5, 0), 8));
+    }
+
+    fn normalized_threats(index: ThreatIndex) -> Vec<(Coord, u8, Vec<Coord>)> {
+        let mut rows = Vec::new();
+        for (cell, entries) in index {
+            for entry in entries {
+                rows.push((cell, entry.pc, entry.cells().to_vec()));
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn incremental_windows_match_legacy_across_place_remove_and_radius_modes() {
+        let script = [
+            ((0, 0), Player::P1, true),
+            ((1, 0), Player::P1, true),
+            ((0, 1), Player::P2, true),
+            ((2, 0), Player::P1, true),
+            ((40, -25), Player::P2, true), // exercise dense-grid growth
+            ((3, 0), Player::P1, true),
+            ((0, 1), Player::P2, false),
+            ((-1, 0), Player::P2, true),
+            ((40, -25), Player::P2, false),
+        ];
+
+        for radius in [2, 8] {
+            let mut legacy = SolverBoard::new();
+            let mut incremental = SolverBoard::new();
+            incremental.configure_windows(6, true);
+            if radius < 5 {
+                legacy.enable_reach(radius);
+                incremental.enable_reach(radius);
+            }
+
+            for &(coord, player, place) in &script {
+                if place {
+                    legacy.place(coord, player);
+                    incremental.place(coord, player);
+                } else {
+                    legacy.remove(coord);
+                    incremental.remove(coord);
+                }
+                assert_eq!(legacy.hash, incremental.hash);
+                for side in [Player::P1, Player::P2] {
+                    assert_eq!(
+                        completions(&incremental, side, 6, radius),
+                        completions(&legacy, side, 6, radius),
+                        "completion mismatch after {coord:?} at radius {radius}",
+                    );
+                    assert_eq!(
+                        normalized_threats(threat_table(&incremental, side, 6, radius)),
+                        normalized_threats(threat_table(&legacy, side, 6, radius)),
+                        "threat mismatch after {coord:?} at radius {radius}",
+                    );
+                    assert_eq!(
+                        any_four_gate(&incremental, side, 6, radius),
+                        any_four_gate(&legacy, side, 6, radius),
+                    );
+                    for empties in [1, 2] {
+                        assert_eq!(
+                            has_completion(&incremental, side, 6, empties, radius),
+                            has_completion(&legacy, side, 6, empties, radius),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_window_updates_are_exactly_three_times_win_length() {
+        let mut board = SolverBoard::new();
+        board.configure_windows(6, true);
+        board.place((3, -2), Player::P1);
+        assert_eq!(board.windows.states.len(), 18);
+        board.remove((3, -2));
+        assert!(board.windows.states.is_empty());
     }
 
     /// Differential: the O(1) tracked reach path must agree with the linear

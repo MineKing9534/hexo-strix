@@ -564,6 +564,7 @@ class TestMctsArgmaxMove:
             mcts_leaf_forcing_node_budget=500,
             mcts_leaf_forcing_tight=True,
             mcts_leaf_forcing_proof_ordering=True,
+            mcts_leaf_forcing_incremental_windows=True,
         )
 
         assert len(captured) == 2  # model + pre-built opponent config
@@ -574,9 +575,11 @@ class TestMctsArgmaxMove:
         assert cfg["leaf_forcing_node_budget"] == 500
         assert cfg["leaf_forcing_tight"] is True
         assert cfg["leaf_forcing_proof_ordering"] is True
+        assert cfg["leaf_forcing_incremental_windows"] is True
         assert "leaf_forcing_node_budget" not in captured[1]
         assert "leaf_forcing_tight" not in captured[1]
         assert "leaf_forcing_proof_ordering" not in captured[1]
+        assert "leaf_forcing_incremental_windows" not in captured[1]
 
 
 # ---------------------------------------------------------------------------

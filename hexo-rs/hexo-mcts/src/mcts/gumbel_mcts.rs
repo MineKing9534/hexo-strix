@@ -577,6 +577,7 @@ where
     let leaf_forcing_parallel_min_batch = config.leaf_forcing_parallel_min_batch;
     let leaf_forcing_tight = config.leaf_forcing_tight;
     let leaf_forcing_proof_ordering = config.leaf_forcing_proof_ordering;
+    let leaf_forcing_incremental_windows = config.leaf_forcing_incremental_windows;
     let surviving_indices = sequential_halving(
         &mut root,
         &candidate_indices,
@@ -596,6 +597,7 @@ where
                 leaf_forcing_parallel_min_batch,
                 leaf_forcing_tight,
                 leaf_forcing_proof_ordering,
+                leaf_forcing_incremental_windows,
                 eval_fn,
             );
         },
@@ -697,6 +699,7 @@ fn simulate_batch_with_eval<F>(
     leaf_forcing_parallel_min_batch: usize,
     leaf_forcing_tight: bool,
     leaf_forcing_proof_ordering: bool,
+    leaf_forcing_incremental_windows: bool,
     eval_fn: &mut F,
 ) where
     F: FnMut(&[GameState]) -> (Vec<HashMap<Coord, f64>>, Vec<f64>),
@@ -829,6 +832,7 @@ fn simulate_batch_with_eval<F>(
             leaf_forcing_parallel_min_batch,
             leaf_forcing_tight,
             leaf_forcing_proof_ordering,
+            leaf_forcing_incremental_windows,
         )
     };
 

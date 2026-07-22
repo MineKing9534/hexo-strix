@@ -197,6 +197,7 @@ class MCTSConfig:
     leaf_forcing_node_budget: int = _f(0, "Per-leaf VCF node budget. 0 disables leaf solving (default). When non-zero, each newly evaluated MCTS leaf is searched with the wide IDTT solver; a proven current-player win replaces only that leaf's network value with +1, while No/BudgetExceeded leave it untouched. Uses forcing_depth_cap.", group="Forcing solver")
     leaf_forcing_tight: bool = _f(False, "Use the narrower hot-cell-only IDTT generator for leaf probes. False preserves the existing wide solver. Root forcing is unaffected.", group="Forcing solver")
     leaf_forcing_proof_ordering: bool = _f(False, "Order tight B=2 leaf turns by fewest mandatory defender covers. False preserves historical coordinate ordering for A/B tests.", group="Forcing solver")
+    leaf_forcing_incremental_windows: bool = _f(False, "Maintain exact length-win windows incrementally for tight leaf probes (18 updates per placement at win_length 6). False preserves legacy strip scans.", group="Forcing solver")
     leaf_forcing_parallel_min_batch: int = _f(0, "Minimum evaluated-leaf batch size for parallel VCF probes on the shared Rayon pool. 0 disables parallel solving (default); 4 is a conservative starting point. Scheduling only: verdicts and node budgets are unchanged.", group="Forcing solver")
 
 
@@ -290,6 +291,7 @@ class SelfPlayMctsOverride:
     leaf_forcing_node_budget: int | None = _f(None, "Self-play-only per-leaf VCF node budget; inherits [mcts].leaf_forcing_node_budget when unset. 0 disables leaf solving.", group="Forcing solver")
     leaf_forcing_tight: bool | None = _f(None, "Self-play-only leaf generator width; inherits [mcts].leaf_forcing_tight when unset. False uses wide; true uses tight.", group="Forcing solver")
     leaf_forcing_proof_ordering: bool | None = _f(None, "Self-play-only tight leaf proof-ordering toggle; inherits [mcts].leaf_forcing_proof_ordering when unset.", group="Forcing solver")
+    leaf_forcing_incremental_windows: bool | None = _f(None, "Self-play-only incremental tight-window toggle; inherits [mcts].leaf_forcing_incremental_windows when unset.", group="Forcing solver")
     leaf_forcing_parallel_min_batch: int | None = _f(None, "Self-play-only parallel leaf-probe threshold; inherits [mcts].leaf_forcing_parallel_min_batch when unset. 0 keeps probes serial.", group="Forcing solver")
 
 

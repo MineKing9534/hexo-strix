@@ -103,6 +103,10 @@ pub struct MCTSConfig {
     /// preserves the historical equal-B coordinate order for clean A/B tests.
     /// Wide leaf probes are unaffected.
     pub leaf_forcing_proof_ordering: bool,
+    /// Maintain exact length-win windows incrementally for tight leaf probes.
+    /// Each placement updates 3*win_length windows. `false` preserves the
+    /// historical full strip scans; wide/root forcing is unaffected.
+    pub leaf_forcing_incremental_windows: bool,
     /// Minimum evaluated-leaf batch size at which independent leaf-forcing
     /// probes run on Rayon's shared worker pool. `0` disables parallel solving
     /// (the default and legacy behavior). Values below 2 are treated as 2.

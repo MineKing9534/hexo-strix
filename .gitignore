@@ -27,6 +27,7 @@ docs/*
 !docs/research
 docs/research/*
 !docs/research/2026-07-14-solver-zobrist-collision-and-wl4-guard.md
+!docs/research/2026-07-22-tight-window-kernel.md
 *.pt             # model checkpoints
 *.bin
 # ...EXCEPT the committed A3 wire-states golden fixtures (cross-language pin;

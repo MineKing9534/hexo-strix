@@ -143,7 +143,7 @@ reanalyze_m_actions = 8
 [self_play]
 engine = "rust"
 device = "cuda"
-workers = 32
+workers = 64
 precision = "bf16"
 model_update_interval = 100
 source = "trainee"
@@ -181,6 +181,7 @@ use_rust_mcts = true
 # Switch self-play from root-solve to leaf-solve to try to improve targets
 [self_play.mcts]
 leaf_forcing_tight = true
+leaf_forcing_incremental_windows = true
 disable_root_forcing = true
 leaf_forcing_node_budget = 500
 
@@ -211,68 +212,67 @@ workers = 8
 
 [run]
 device = "cuda"
-checkpoint_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints"
-log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead"
+checkpoint_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/checkpoints"
+log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2"
 compile = true
 fp16 = true
 
 # --- Curriculum stages (from scratch: W1 -> S4) ---
 
-[[curriculum.stages]]
-name = "W1: 4-in-a-row, radius 2"
-log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/w1-4-2"
-training_batch_size = 512
-game_win_length = 4
-game_placement_radius = 2
-game_max_moves = 20
-convergence_mode = "random"
-win_rate_threshold = 0.90
-patience = 5
-min_steps_per_stage = 0
-confirm_advance = false
-eval_sims = 0
-eval_interval = 200
-mcts_exploration_moves = 2
-mcts_exploration_fraction = 0
-
-[[curriculum.stages]]
-name = "W2: 5-in-a-row, radius 2"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/w2-5-2"
-training_batch_size = 512
-game_win_length = 5
-game_placement_radius = 2
-game_max_moves = 30
-convergence_mode = "random"
-win_rate_threshold = 0.90
-patience = 5
-min_steps_per_stage = 1000
-confirm_advance = false
-eval_sims = 0
-eval_interval = 200
-mcts_exploration_moves = 4
-mcts_exploration_fraction = 0
+# [[curriculum.stages]]
+# name = "W1: 4-in-a-row, radius 2"
+# log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/w1-4-2"
+# training_batch_size = 512
+# game_win_length = 4
+# game_placement_radius = 2
+# game_max_moves = 20
+# convergence_mode = "random"
+# win_rate_threshold = 0.90
+# patience = 5
+# min_steps_per_stage = 0
+# confirm_advance = false
+# eval_sims = 0
+# eval_interval = 200
+# mcts_exploration_moves = 2
+# mcts_exploration_fraction = 0
+#
+# [[curriculum.stages]]
+# name = "W2: 5-in-a-row, radius 2"
+# run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/w2-5-2"
+# training_batch_size = 512
+# game_win_length = 5
+# game_placement_radius = 2
+# game_max_moves = 30
+# convergence_mode = "random"
+# win_rate_threshold = 0.90
+# patience = 5
+# min_steps_per_stage = 1000
+# confirm_advance = false
+# eval_sims = 0
+# eval_interval = 200
+# mcts_exploration_moves = 4
+# mcts_exploration_fraction = 0
 
 [[curriculum.stages]]
 name = "S1: 6-in-a-row, radius 2"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s1-6-2"
+run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/s1-6-2"
 game_placement_radius = 2
 min_steps_per_stage = 20000
-confirm_advance = false
+confirm_advance = true
+self_play_model_update_interval = 500
 
 [[curriculum.stages]]
 name = "S2: 6-in-a-row, radius 4"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s2-6-4"
+run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/s2-6-4"
 game_placement_radius = 4
 min_steps_per_stage = 20000
-confirm_advance = false
-training_lr = 1e-4
-training_lr_min = 5e-6
+confirm_advance = true
 
 [[curriculum.stages]]
 name = "S3: 6-in-a-row, radius 6"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s3-6-6"
+run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/s3-6-6"
 game_placement_radius = 6
 
 [[curriculum.stages]]
 name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s4-6-8"
+run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/s4-6-8"

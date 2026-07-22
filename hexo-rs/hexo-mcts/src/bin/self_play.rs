@@ -1648,6 +1648,7 @@ fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
         leaf_forcing_node_budget: base.leaf_forcing_node_budget,
         leaf_forcing_tight: base.leaf_forcing_tight,
         leaf_forcing_proof_ordering: base.leaf_forcing_proof_ordering,
+        leaf_forcing_incremental_windows: base.leaf_forcing_incremental_windows,
         leaf_forcing_parallel_min_batch: base.leaf_forcing_parallel_min_batch,
     }
 }
@@ -2128,6 +2129,9 @@ fn main() {
     // False preserves equal-B coordinate order; true prioritizes tight B=2
     // turns with fewer mandatory defender covers.
     let mut leaf_forcing_proof_ordering: bool = false;
+    // False preserves full strip scans; true maintains the 18 structural
+    // windows affected by each placement (wl=6) for tight leaf probes.
+    let mut leaf_forcing_incremental_windows: bool = false;
     // 0 keeps leaf solving serial; non-zero parallelizes evaluated batches at
     // or above this size on Rayon's shared pool.
     let mut leaf_forcing_parallel_min_batch: usize = 0;
@@ -2297,6 +2301,10 @@ fn main() {
             }
             "--leaf-forcing-proof-ordering" => {
                 leaf_forcing_proof_ordering = true;
+                i += 1;
+            }
+            "--leaf-forcing-incremental-windows" => {
+                leaf_forcing_incremental_windows = true;
                 i += 1;
             }
             "--leaf-forcing-parallel-min-batch" => {
@@ -2584,6 +2592,7 @@ fn main() {
         leaf_forcing_node_budget,
         leaf_forcing_tight,
         leaf_forcing_proof_ordering,
+        leaf_forcing_incremental_windows,
         leaf_forcing_parallel_min_batch,
     });
 
@@ -4444,6 +4453,7 @@ mod tests {
             leaf_forcing_node_budget: 500,
             leaf_forcing_tight: true,
             leaf_forcing_proof_ordering: true,
+            leaf_forcing_incremental_windows: true,
             leaf_forcing_parallel_min_batch: 4,
             ..Default::default()
         };
@@ -4462,6 +4472,7 @@ mod tests {
         assert_eq!(r.leaf_forcing_node_budget, 500);
         assert!(r.leaf_forcing_tight);
         assert!(r.leaf_forcing_proof_ordering);
+        assert!(r.leaf_forcing_incremental_windows);
         assert_eq!(r.leaf_forcing_parallel_min_batch, 4);
     }
 

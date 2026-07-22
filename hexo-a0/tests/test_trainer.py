@@ -2382,6 +2382,7 @@ class TestPoolSubprocessArgs:
         assert "--leaf-forcing-node-budget" in src
         assert "--leaf-forcing-tight" in src
         assert "--leaf-forcing-proof-ordering" in src
+        assert "--leaf-forcing-incremental-windows" in src
         assert "--leaf-forcing-parallel-min-batch" in src
 
     def test_resume_short_chunk_alignment_arithmetic(self):

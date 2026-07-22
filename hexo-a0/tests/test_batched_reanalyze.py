@@ -72,6 +72,7 @@ class TestRustBatchedGumbelMcts:
             leaf_forcing_node_budget=500,
             leaf_forcing_tight=True,
             leaf_forcing_proof_ordering=True,
+            leaf_forcing_incremental_windows=True,
             leaf_forcing_parallel_min_batch=4,
         )
         sp_mod._rust_batched_gumbel_mcts(
@@ -84,6 +85,7 @@ class TestRustBatchedGumbelMcts:
         assert captured["leaf_forcing_node_budget"] == 500
         assert captured["leaf_forcing_tight"] is True
         assert captured["leaf_forcing_proof_ordering"] is True
+        assert captured["leaf_forcing_incremental_windows"] is True
         assert captured["leaf_forcing_parallel_min_batch"] == 4
 
     def test_parity_with_serial_path(self):

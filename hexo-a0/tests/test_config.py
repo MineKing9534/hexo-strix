@@ -62,6 +62,7 @@ class TestMCTSConfig:
         assert c.leaf_forcing_node_budget == 0
         assert c.leaf_forcing_tight is False
         assert c.leaf_forcing_proof_ordering is False
+        assert c.leaf_forcing_incremental_windows is False
         assert c.leaf_forcing_parallel_min_batch == 0
 
     def test_truncate_delta_default_off(self):

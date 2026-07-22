@@ -59,6 +59,8 @@ def _rust_gumbel_mcts(
         leaf_extra["leaf_forcing_tight"] = True
     if getattr(mcts, "leaf_forcing_proof_ordering", False):
         leaf_extra["leaf_forcing_proof_ordering"] = True
+    if getattr(mcts, "leaf_forcing_incremental_windows", False):
+        leaf_extra["leaf_forcing_incremental_windows"] = True
     if leaf_forcing_parallel_min_batch:
         leaf_extra["leaf_forcing_parallel_min_batch"] = leaf_forcing_parallel_min_batch
     root_forcing_extra = (
@@ -156,6 +158,8 @@ def _rust_batched_gumbel_mcts(
         leaf_extra["leaf_forcing_tight"] = True
     if getattr(mcts, "leaf_forcing_proof_ordering", False):
         leaf_extra["leaf_forcing_proof_ordering"] = True
+    if getattr(mcts, "leaf_forcing_incremental_windows", False):
+        leaf_extra["leaf_forcing_incremental_windows"] = True
     if leaf_forcing_parallel_min_batch:
         leaf_extra["leaf_forcing_parallel_min_batch"] = leaf_forcing_parallel_min_batch
     root_forcing_extra = (
@@ -265,6 +269,8 @@ def batched_self_play_games(
         leaf_extra["leaf_forcing_tight"] = True
     if getattr(mcts, "leaf_forcing_proof_ordering", False):
         leaf_extra["leaf_forcing_proof_ordering"] = True
+    if getattr(mcts, "leaf_forcing_incremental_windows", False):
+        leaf_extra["leaf_forcing_incremental_windows"] = True
     if leaf_forcing_parallel_min_batch:
         leaf_extra["leaf_forcing_parallel_min_batch"] = leaf_forcing_parallel_min_batch
     root_forcing_extra = (

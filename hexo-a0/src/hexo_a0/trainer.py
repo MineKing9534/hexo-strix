@@ -2445,6 +2445,13 @@ class Trainer:
         )
         if leaf_forcing_proof_ordering:
             cmd.append("--leaf-forcing-proof-ordering")
+        leaf_forcing_incremental_windows = (
+            sp_mcts.leaf_forcing_incremental_windows
+            if sp_mcts.leaf_forcing_incremental_windows is not None
+            else self.mcts_config.leaf_forcing_incremental_windows
+        )
+        if leaf_forcing_incremental_windows:
+            cmd.append("--leaf-forcing-incremental-windows")
         leaf_forcing_parallel_min_batch = (
             sp_mcts.leaf_forcing_parallel_min_batch
             if sp_mcts.leaf_forcing_parallel_min_batch is not None

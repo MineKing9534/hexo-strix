@@ -328,6 +328,7 @@ where
                             config.leaf_forcing_parallel_min_batch,
                             config.leaf_forcing_tight,
                             config.leaf_forcing_proof_ordering,
+                            config.leaf_forcing_incremental_windows,
                         )
                     };
 
