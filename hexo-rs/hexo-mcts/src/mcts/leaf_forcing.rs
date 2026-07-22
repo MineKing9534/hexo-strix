@@ -5,6 +5,7 @@
 //! only "no VCF in the restricted forcing tree", and `BudgetExceeded` is
 //! unresolved, so neither may replace the network value.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use hexo_engine::{GameState, Player};
@@ -18,6 +19,13 @@ static BUDGET_EXCEEDED: AtomicU64 = AtomicU64::new(0);
 static ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
 static CAPTURED: AtomicU64 = AtomicU64::new(0);
 static CAPTURE_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Each MCTS game worker solves leaves synchronously, so thread-local
+    /// scratch reuses allocations without synchronization or cross-game state.
+    static SCRATCH: RefCell<forcing::VerdictScratch> =
+        RefCell::new(forcing::VerdictScratch::default());
+}
 
 /// Process-wide counters for leaf-forcing experiments. They are deliberately
 /// independent of MCTS results so production search structures stay compact.
@@ -49,7 +57,14 @@ pub fn override_value(
 
     #[cfg(not(target_arch = "wasm32"))]
     let started = std::time::Instant::now();
-    let verdict = forcing::solve_wide_verdict(game, depth_cap, node_budget);
+    let verdict = SCRATCH.with(|scratch| {
+        forcing::solve_wide_verdict_with_scratch(
+            game,
+            depth_cap,
+            node_budget,
+            &mut scratch.borrow_mut(),
+        )
+    });
     #[cfg(not(target_arch = "wasm32"))]
     let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     #[cfg(target_arch = "wasm32")]

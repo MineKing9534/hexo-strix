@@ -185,6 +185,32 @@ impl SolverBoard {
         }
     }
 
+    /// Empty the board while retaining its dense-grid allocations and bounds.
+    ///
+    /// Verdict-only leaf probes call this between unrelated positions. Search
+    /// make/unmake leaves only the input stones behind, so clearing occupied
+    /// cells is proportional to the game length rather than the grid area.
+    /// Reach counts are reset in bulk and rebuilt as stones are loaded.
+    fn clear_for_reuse(&mut self) {
+        for &(coord, _) in &self.stones {
+            if let Some(i) = self.idx(coord) {
+                self.grid[i] = 0;
+            }
+        }
+        self.stones.clear();
+        self.hash = 0;
+        if self.reach_radius >= 0 {
+            self.reach.fill(0);
+        }
+    }
+
+    /// Disable tight-radius reach tracking without releasing its buffers.
+    fn disable_reach(&mut self) {
+        self.reach_radius = -1;
+        self.reach.clear();
+        self.disk.clear();
+    }
+
     #[inline]
     fn idx(&self, (q, r): Coord) -> Option<usize> {
         let x = q - self.q0;
@@ -289,7 +315,8 @@ impl SolverBoard {
         }
         self.reach_radius = radius;
         self.disk = hex_offsets(radius);
-        self.reach = vec![0u16; self.grid.len()];
+        self.reach.clear();
+        self.reach.resize(self.grid.len(), 0);
         let (q0, r0, w) = (self.q0, self.r0, self.w);
         for si in 0..self.stones.len() {
             let (s, _) = self.stones[si];
@@ -1125,6 +1152,36 @@ impl SearchState {
         }
     }
 
+    /// Reset for an unrelated solve while retaining hash-table allocations.
+    ///
+    /// The tables are deliberately cleared, not shared across leaves: their
+    /// keys omit attacker/configuration because those values are fixed for one
+    /// search. Retaining only the allocations preserves that invariant while
+    /// avoiding three fresh table allocations on every low-budget probe.
+    fn clear_for_search(
+        &mut self,
+        wl: u8,
+        radius: i32,
+        atk: Player,
+        dfn: Player,
+        node_budget: u64,
+        wide: bool,
+    ) {
+        self.tt.clear();
+        self.gencache.clear();
+        self.comps.clear();
+        self.nodes = 0;
+        self.budget = node_budget;
+        self.exceeded = false;
+        self.wl = wl;
+        self.radius = radius;
+        self.atk = atk;
+        self.dfn = dfn;
+        self.wide = wide;
+        self.limits = Limits::default();
+        self.support = None;
+    }
+
     /// Fresh node budget for a follow-up run (PV probes) that KEEPS the warm
     /// tt/gencache/comps. Cached verdicts are position truths, so a warm cache
     /// changes which probes complete within budget — never what they conclude.
@@ -1404,6 +1461,25 @@ pub enum ForcingVerdict {
     BudgetExceeded,
 }
 
+/// Reusable allocation state for independent verdict-only forcing probes.
+///
+/// This is intentionally opaque: callers may retain it on a worker thread,
+/// but every solve resets all position- and configuration-dependent contents.
+/// Root/deep analysis APIs continue to allocate fresh state and are unaffected.
+pub struct VerdictScratch {
+    board: SolverBoard,
+    search: SearchState,
+}
+
+impl Default for VerdictScratch {
+    fn default() -> Self {
+        Self {
+            board: SolverBoard::new(),
+            search: SearchState::new(1, 0, Player::P1, Player::P2, 0, true),
+        }
+    }
+}
+
 impl ForcingVerdict {
     /// True iff this is a proven forced win for the side to move.
     #[inline]
@@ -1466,6 +1542,36 @@ pub fn solve_wide_verdict(
         Err(result) => return forcing_verdict(result),
     };
     forcing_verdict(solve_from_state(&mut board, placements, depth_cap, &mut s))
+}
+
+/// Scratch-reusing counterpart to [`solve_wide_verdict`].
+///
+/// Results and node-budget semantics are identical; only allocation ownership
+/// differs. A scratch value must not be used concurrently.
+pub fn solve_wide_verdict_with_scratch(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    scratch: &mut VerdictScratch,
+) -> ForcingVerdict {
+    let placements = match prepare_search_reusing(
+        game,
+        node_budget,
+        true,
+        Limits::default(),
+        false,
+        &mut scratch.board,
+        &mut scratch.search,
+    ) {
+        Ok(placements) => placements,
+        Err(result) => return forcing_verdict(result),
+    };
+    forcing_verdict(solve_from_state(
+        &mut scratch.board,
+        placements,
+        depth_cap,
+        &mut scratch.search,
+    ))
 }
 
 #[inline]
@@ -1555,6 +1661,29 @@ fn prepare_search(
     limits: Limits,
     capture: bool,
 ) -> Result<(SolverBoard, SearchState, u8), SolveResult> {
+    let mut board = SolverBoard::new();
+    let mut search = SearchState::new(1, 0, Player::P1, Player::P2, 0, wide);
+    let placements = prepare_search_reusing(
+        game,
+        node_budget,
+        wide,
+        limits,
+        capture,
+        &mut board,
+        &mut search,
+    )?;
+    Ok((board, search, placements))
+}
+
+fn prepare_search_reusing(
+    game: &GameState,
+    node_budget: u64,
+    wide: bool,
+    limits: Limits,
+    capture: bool,
+    board: &mut SolverBoard,
+    search: &mut SearchState,
+) -> Result<u8, SolveResult> {
     let attacker = game.current_player().ok_or(SolveResult::No)?;
     let defender = attacker.opponent();
     let wl = game.config().win_length;
@@ -1563,7 +1692,14 @@ fn prepare_search(
     if !(1..=MAX_WL).contains(&(wl as usize)) {
         return Err(SolveResult::BudgetExceeded); // see solve_from
     }
-    let mut board = SolverBoard::new();
+    board.clear_for_reuse();
+    search.clear_for_search(wl, radius, attacker, defender, node_budget, wide);
+    let tight_reach = radius < wl as i32 - 1;
+    if !tight_reach || board.reach_radius != radius {
+        // Do this before a possible grid growth: a wide or changed-radius
+        // probe must not allocate/copy the previous probe's reach grid.
+        board.disable_reach();
+    }
     // Pre-size once over the position's bounding box (avoids incremental regrowth),
     // and enable reach tracking before bulk-loading so counts build incrementally.
     let mut it = game.stones().iter();
@@ -1591,7 +1727,7 @@ fn prepare_search(
         }
         board.reserve(lo, hi);
     }
-    if radius < wl as i32 - 1 {
+    if tight_reach {
         board.enable_reach(radius);
     }
     // `game.stones()` iteration order is nondeterministic (engine HashMap).
@@ -1599,12 +1735,11 @@ fn prepare_search(
     // derived list (completions, hot cells, partners, moves) being sorted —
     // do not let stone/scan order leak into tie-breaking.
     for (&c, &p) in game.stones() { board.place(c, p); }
-    let mut s = SearchState::new(wl, radius, attacker, defender, node_budget, wide);
-    s.limits = limits;
+    search.limits = limits;
     if capture {
-        s.support = Some(FxHashMap::default());
+        search.support = Some(FxHashMap::default());
     }
-    Ok((board, s, placements))
+    Ok(placements)
 }
 
 /// Board-level entry point: solve from a pre-built `SolverBoard` (the same path
@@ -2384,6 +2519,108 @@ mod tests {
         assert_eq!(
             solve_wide_verdict(&fork, 40, 1),
             ForcingVerdict::BudgetExceeded,
+        );
+    }
+
+    #[test]
+    fn reused_verdict_scratch_is_isolated_across_players_configs_and_results() {
+        use hexo_engine::game::{GameConfig, GameState};
+
+        let full = GameConfig::FULL_HEXO;
+        let tight_five = GameConfig {
+            win_length: 5,
+            placement_radius: 2,
+            max_moves: 200,
+        };
+        let p1_win_stones: Vec<(Coord, Player)> =
+            [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]
+                .into_iter()
+                .map(|c| (c, Player::P1))
+                .collect();
+        let p2_win_stones = vec![
+            ((0, 0), Player::P1),
+            ((3, 2), Player::P2),
+            ((4, 2), Player::P2),
+            ((5, 2), Player::P2),
+            ((6, 2), Player::P2),
+        ];
+        let fork_stones: Vec<(Coord, Player)> =
+            [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)]
+                .into_iter()
+                .map(|c| (c, Player::P1))
+                .collect();
+
+        let cases = [
+            (
+                GameState::from_state(&p1_win_stones, Player::P1, 2, full),
+                8,
+                2_000,
+            ),
+            (GameState::with_config(full), 8, 2_000),
+            (
+                GameState::from_state(&fork_stones, Player::P1, 2, full),
+                40,
+                1,
+            ),
+            (
+                GameState::from_state(&p2_win_stones, Player::P2, 2, tight_five),
+                8,
+                2_000,
+            ),
+        ];
+        let mut scratch = VerdictScratch::default();
+
+        // Repeat in both orders so stale wins, losses, budgets, player roles,
+        // reach radii, and win lengths would all have a chance to leak.
+        for indices in [[0, 1, 2, 3], [3, 2, 1, 0], [0, 2, 3, 1]] {
+            for index in indices {
+                let (game, depth, budget) = &cases[index];
+                let fresh = solve_wide_verdict(game, *depth, *budget);
+                let reused = solve_wide_verdict_with_scratch(
+                    game,
+                    *depth,
+                    *budget,
+                    &mut scratch,
+                );
+                assert_eq!(reused, fresh, "scratch mismatch for case {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn reused_verdict_scratch_retains_search_table_capacity() {
+        use hexo_engine::game::{GameConfig, GameState};
+
+        let fork_stones: Vec<(Coord, Player)> =
+            [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)]
+                .into_iter()
+                .map(|c| (c, Player::P1))
+                .collect();
+        let fork = GameState::from_state(
+            &fork_stones,
+            Player::P1,
+            2,
+            GameConfig::FULL_HEXO,
+        );
+        let quiet = GameState::with_config(GameConfig::FULL_HEXO);
+        let mut scratch = VerdictScratch::default();
+
+        let _ = solve_wide_verdict_with_scratch(&fork, 16, 500, &mut scratch);
+        let capacities = (
+            scratch.search.tt.capacity(),
+            scratch.search.gencache.capacity(),
+            scratch.search.comps.capacity(),
+        );
+        assert!(capacities.0 > 0 && capacities.2 > 0);
+
+        let _ = solve_wide_verdict_with_scratch(&quiet, 16, 500, &mut scratch);
+        assert_eq!(
+            (
+                scratch.search.tt.capacity(),
+                scratch.search.gencache.capacity(),
+                scratch.search.comps.capacity(),
+            ),
+            capacities,
         );
     }
 
