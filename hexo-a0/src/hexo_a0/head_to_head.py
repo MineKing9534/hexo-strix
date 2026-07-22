@@ -242,6 +242,8 @@ def run_head_to_head(
     forcing_node_budget: int = 0,
     mcts_a_leaf_forcing_node_budget: int = 0,
     mcts_b_leaf_forcing_node_budget: int = 0,
+    mcts_a_leaf_forcing_tight: bool = False,
+    mcts_b_leaf_forcing_tight: bool = False,
     leaf_forcing_capture: Path | None = None,
     leaf_forcing_capture_limit: int = 10_000,
 ) -> dict:
@@ -314,13 +316,15 @@ def run_head_to_head(
         mcts_a_virtual_loss, mcts_b_virtual_loss,
     )
     logger.info(
-        "Forcing: root A=%s B=%s depth=%s root_budget=%s leaf_budget A=%d B=%d",
+        "Forcing: root A=%s B=%s depth=%s root_budget=%s leaf_budget A=%d B=%d leaf_width A=%s B=%s",
         "off" if disable_forcing_solver or mcts_a_disable_root_forcing else "on",
         "off" if disable_forcing_solver or mcts_b_disable_root_forcing else "on",
         forcing_depth_cap or "default",
         forcing_node_budget or "default",
         mcts_a_leaf_forcing_node_budget,
         mcts_b_leaf_forcing_node_budget,
+        "tight" if mcts_a_leaf_forcing_tight else "wide",
+        "tight" if mcts_b_leaf_forcing_tight else "wide",
     )
     if leaf_forcing_capture is not None:
         logger.info(
@@ -392,6 +396,8 @@ def run_head_to_head(
             opponent_mcts_forcing_node_budget=forcing_node_budget,
             mcts_leaf_forcing_node_budget=mcts_a_leaf_forcing_node_budget,
             opponent_mcts_leaf_forcing_node_budget=mcts_b_leaf_forcing_node_budget,
+            mcts_leaf_forcing_tight=mcts_a_leaf_forcing_tight,
+            opponent_mcts_leaf_forcing_tight=mcts_b_leaf_forcing_tight,
         )
         game_move_logs.append(result["move_log"])  # collected in both modes
         if noise_off:
@@ -461,6 +467,8 @@ def run_head_to_head(
                 "forcing_node_budget": forcing_node_budget,
                 "mcts_a_leaf_forcing_node_budget": mcts_a_leaf_forcing_node_budget,
                 "mcts_b_leaf_forcing_node_budget": mcts_b_leaf_forcing_node_budget,
+                "mcts_a_leaf_forcing_tight": mcts_a_leaf_forcing_tight,
+                "mcts_b_leaf_forcing_tight": mcts_b_leaf_forcing_tight,
             }
             _atomic_write_json(state_file, payload)
 
@@ -584,5 +592,7 @@ def run_head_to_head(
             "root_node_budget": forcing_node_budget,
             "a_leaf_node_budget": mcts_a_leaf_forcing_node_budget,
             "b_leaf_node_budget": mcts_b_leaf_forcing_node_budget,
+            "a_leaf_width": "tight" if mcts_a_leaf_forcing_tight else "wide",
+            "b_leaf_width": "tight" if mcts_b_leaf_forcing_tight else "wide",
         },
     }

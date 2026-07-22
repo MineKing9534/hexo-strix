@@ -177,6 +177,7 @@ the leaf budget together:
 [self_play.mcts]
 disable_root_forcing = true
 leaf_forcing_node_budget = 500
+leaf_forcing_tight = false            # experimental: true selects tight IDTT
 leaf_forcing_parallel_min_batch = 4  # 0 keeps leaf probes serial
 ```
 

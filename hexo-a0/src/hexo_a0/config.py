@@ -195,6 +195,7 @@ class MCTSConfig:
     forcing_depth_cap: int = _f(0, "Runtime override for the VCF forcing-solver iterative-deepening depth cap (in attacker turns) used by the mr>=1 forced-win shortcut in self-play. 0 = use the Rust compile-time default (SELF_PLAY_DEPTH_CAP = 6); any non-zero value caps the search at that depth. 0 emits no CLI flag, so an unset value is byte-identical to prior behaviour and safe against a self_play binary that predates the flag.", group="Forcing solver")
     forcing_node_budget: int = _f(0, "Runtime override for the VCF forcing-solver per-position node budget (the hard ceiling on solve effort) used by the mr>=1 forced-win shortcut in self-play. 0 = use the Rust compile-time default (SELF_PLAY_NODE_BUDGET = 2000); any non-zero value uses that budget. 0 emits no CLI flag, so an unset value is byte-identical to prior behaviour and safe against an older self_play binary.", group="Forcing solver")
     leaf_forcing_node_budget: int = _f(0, "Per-leaf VCF node budget. 0 disables leaf solving (default). When non-zero, each newly evaluated MCTS leaf is searched with the wide IDTT solver; a proven current-player win replaces only that leaf's network value with +1, while No/BudgetExceeded leave it untouched. Uses forcing_depth_cap.", group="Forcing solver")
+    leaf_forcing_tight: bool = _f(False, "Use the narrower hot-cell-only IDTT generator for leaf probes. False preserves the existing wide solver. Root forcing is unaffected.", group="Forcing solver")
     leaf_forcing_parallel_min_batch: int = _f(0, "Minimum evaluated-leaf batch size for parallel VCF probes on the shared Rayon pool. 0 disables parallel solving (default); 4 is a conservative starting point. Scheduling only: verdicts and node budgets are unchanged.", group="Forcing solver")
 
 
@@ -286,6 +287,7 @@ class SelfPlayMctsOverride:
     forcing_depth_cap: int | None = _f(None, "Self-play-only VCF forcing-solver depth-cap override; inherits [mcts].forcing_depth_cap when unset. 0 (inherited or set) = use the Rust compile-time default (SELF_PLAY_DEPTH_CAP).", group="Forcing solver")
     forcing_node_budget: int | None = _f(None, "Self-play-only VCF forcing-solver node-budget override; inherits [mcts].forcing_node_budget when unset. 0 (inherited or set) = use the Rust compile-time default (SELF_PLAY_NODE_BUDGET).", group="Forcing solver")
     leaf_forcing_node_budget: int | None = _f(None, "Self-play-only per-leaf VCF node budget; inherits [mcts].leaf_forcing_node_budget when unset. 0 disables leaf solving.", group="Forcing solver")
+    leaf_forcing_tight: bool | None = _f(None, "Self-play-only leaf generator width; inherits [mcts].leaf_forcing_tight when unset. False uses wide; true uses tight.", group="Forcing solver")
     leaf_forcing_parallel_min_batch: int | None = _f(None, "Self-play-only parallel leaf-probe threshold; inherits [mcts].leaf_forcing_parallel_min_batch when unset. 0 keeps probes serial.", group="Forcing solver")
 
 

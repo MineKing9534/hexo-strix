@@ -2431,6 +2431,13 @@ class Trainer:
             cmd.extend([
                 "--leaf-forcing-node-budget", str(leaf_forcing_node_budget),
             ])
+        leaf_forcing_tight = (
+            sp_mcts.leaf_forcing_tight
+            if sp_mcts.leaf_forcing_tight is not None
+            else self.mcts_config.leaf_forcing_tight
+        )
+        if leaf_forcing_tight:
+            cmd.append("--leaf-forcing-tight")
         leaf_forcing_parallel_min_batch = (
             sp_mcts.leaf_forcing_parallel_min_batch
             if sp_mcts.leaf_forcing_parallel_min_batch is not None

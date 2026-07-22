@@ -198,6 +198,8 @@ class TestCliRegistration:
         assert ns.a_forcing_mode == "root"
         assert ns.b_forcing_mode == "root"
         assert ns.leaf_forcing_node_budget == 500
+        assert ns.a_leaf_forcing_width == "wide"
+        assert ns.b_leaf_forcing_width == "wide"
 
     def test_subparser_accepts_root_vs_leaf_experiment(self):
         from hexo_a0 import cli as cli_mod
@@ -218,6 +220,8 @@ class TestCliRegistration:
                 "--forcing-depth-cap", "16",
                 "--forcing-node-budget", "25000",
                 "--leaf-forcing-node-budget", "500",
+                "--a-leaf-forcing-width", "tight",
+                "--b-leaf-forcing-width", "wide",
             ])
         finally:
             cli_mod._run_head_to_head = original
@@ -229,6 +233,8 @@ class TestCliRegistration:
         assert ns.forcing_depth_cap == 16
         assert ns.forcing_node_budget == 25_000
         assert ns.leaf_forcing_node_budget == 500
+        assert ns.a_leaf_forcing_width == "tight"
+        assert ns.b_leaf_forcing_width == "wide"
 
     def test_leaf_mode_rejects_zero_budget_before_match(self, tmp_path, capsys):
         from hexo_a0 import cli as cli_mod

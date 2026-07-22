@@ -91,15 +91,19 @@ truncate_delta = 0.25
 [mcts]
 disable_root_forcing = false
 leaf_forcing_node_budget = 500
+leaf_forcing_tight = false
 
 [self_play.mcts]
 disable_root_forcing = true
 leaf_forcing_node_budget = 250
+leaf_forcing_tight = true
 """))
         assert cfg.mcts.disable_root_forcing is False
         assert cfg.mcts.leaf_forcing_node_budget == 500
+        assert cfg.mcts.leaf_forcing_tight is False
         assert cfg.self_play.mcts.disable_root_forcing is True
         assert cfg.self_play.mcts.leaf_forcing_node_budget == 250
+        assert cfg.self_play.mcts.leaf_forcing_tight is True
 
     def test_training_section(self):
         cfg = load_config(_write_tmp("""

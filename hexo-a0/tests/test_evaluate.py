@@ -562,6 +562,7 @@ class TestMctsArgmaxMove:
             mcts_forcing_depth_cap=16,
             mcts_forcing_node_budget=25_000,
             mcts_leaf_forcing_node_budget=500,
+            mcts_leaf_forcing_tight=True,
         )
 
         assert len(captured) == 2  # model + pre-built opponent config
@@ -570,7 +571,9 @@ class TestMctsArgmaxMove:
         assert cfg["forcing_depth_cap"] == 16
         assert cfg["forcing_node_budget"] == 25_000
         assert cfg["leaf_forcing_node_budget"] == 500
+        assert cfg["leaf_forcing_tight"] is True
         assert "leaf_forcing_node_budget" not in captured[1]
+        assert "leaf_forcing_tight" not in captured[1]
 
 
 # ---------------------------------------------------------------------------

@@ -1554,10 +1554,26 @@ pub fn solve_wide_verdict_with_scratch(
     node_budget: u64,
     scratch: &mut VerdictScratch,
 ) -> ForcingVerdict {
+    solve_verdict_with_scratch(game, depth_cap, node_budget, true, scratch)
+}
+
+/// Verdict-only, scratch-reusing search with an explicit generator width.
+///
+/// `wide = false` selects the production tight generator used by [`solve`];
+/// `wide = true` is identical to [`solve_wide_verdict_with_scratch`]. This is
+/// exposed for leaf-search A/B experiments that need to vary width without
+/// changing any other search semantics or allocation behaviour.
+pub fn solve_verdict_with_scratch(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    scratch: &mut VerdictScratch,
+) -> ForcingVerdict {
     let placements = match prepare_search_reusing(
         game,
         node_budget,
-        true,
+        wide,
         Limits::default(),
         false,
         &mut scratch.board,

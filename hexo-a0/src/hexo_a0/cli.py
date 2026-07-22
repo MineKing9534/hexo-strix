@@ -237,6 +237,14 @@ def main(argv=None):
         help="Leaf IDTT budget used by sides in leaf/both mode (default: 500).",
     )
     h2h_parser.add_argument(
+        "--a-leaf-forcing-width", choices=["wide", "tight"], default="wide",
+        help="A-side leaf IDTT generator width (default: wide).",
+    )
+    h2h_parser.add_argument(
+        "--b-leaf-forcing-width", choices=["wide", "tight"], default="wide",
+        help="B-side leaf IDTT generator width (default: wide).",
+    )
+    h2h_parser.add_argument(
         "--leaf-forcing-capture", type=str, default=None,
         help="Optional replayable JSONL capture of encountered leaf positions; diagnostic I/O, do not use for the timed SPRT.",
     )
@@ -781,6 +789,8 @@ def _run_head_to_head(args):
         forcing_node_budget=args.forcing_node_budget,
         mcts_a_leaf_forcing_node_budget=a_leaf_budget,
         mcts_b_leaf_forcing_node_budget=b_leaf_budget,
+        mcts_a_leaf_forcing_tight=args.a_leaf_forcing_width == "tight",
+        mcts_b_leaf_forcing_tight=args.b_leaf_forcing_width == "tight",
         leaf_forcing_capture=(
             Path(args.leaf_forcing_capture) if args.leaf_forcing_capture else None
         ),

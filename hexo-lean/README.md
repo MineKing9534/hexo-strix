@@ -154,16 +154,19 @@ These are design constraints found while reading `hexo-engine` and the current
 IDTT VCF kernel; they are not claims that the existing corpus contains a wrong
 verdict.
 
-- `CellSet2` sorts a two-placement move and uses that order for legality. This
-  is an acknowledged completeness gap: the lexicographically first cell can be
-  illegal before the turn even when playing the other cell first makes it
-  legal. The new prover should keep order until both orders are proved
-  equivalent.
-- Tight-radius window scanning currently requires every gap to be reachable on
-  the pre-move board. The formal `PlayableOrder` accepts the more general real
-  rule where the first gap can expose the second. Any pruning based on the
-  stronger pre-move condition therefore needs an explicit “missed proofs only”
-  argument at each attacker and defender use site.
+- `CellSet2` sorts a two-placement move and uses that order for legality. The
+  generic game semantics are ordered, but the current tight generator only
+  emits pairs after every member passed the pre-turn reachability filter. Both
+  orders are therefore legal for every emitted pair, so normalization is sound
+  within the current restricted search tree.
+- Tight-radius window scanning requires every gap to be reachable on the
+  pre-move board. This is sound for a one-sided prover: dropping a chained-reach
+  candidate can lose a proof but cannot manufacture one. The stronger
+  completeness claim that a newly reachable second placement can never help a
+  quiet two-stone builder create next-turn completions is not established here;
+  it needs either a locality proof or a finite counterexample search. Do not use
+  this filter as part of an exhaustive defender-reduction theorem until that
+  distinction is discharged.
 - The current forcing state does not carry `move_count`/`max_moves`. A leaf
   certificate must either model draw, as this package does, or prove a horizon
   guard showing that every certified line finishes before the move limit.
@@ -173,16 +176,19 @@ verdict.
 
 ## Next milestones
 
-1. Prove ordered `placeMany` preserves an unhit completion edge, then remove
+1. Prove emitted-pair order-insensitivity from the pre-turn reachability gate;
+   separately prove or refute completeness of that gate for chained-reach
+   two-stone builders.
+2. Prove ordered `placeMany` preserves an unhit completion edge, then remove
    the `survives` parameter from the defender-cover theorem.
-2. Define certificate syntax and a total checker; prove checker success implies
+3. Define certificate syntax and a total checker; prove checker success implies
    `ForcesWin`.
-3. Add an executable finite-window enumerator and prove it equals the
+4. Add an executable finite-window enumerator and prove it equals the
    `CompletionEdge` specification.
-4. Export shared JSON fixtures from Rust and differential-test legality,
+5. Export shared JSON fixtures from Rust and differential-test legality,
    transitions, windows, gaps, covers, and certificates.
-5. Implement the incremental Rust kernel behind a leaf-only flag, verify
+6. Implement the incremental Rust kernel behind a leaf-only flag, verify
    verdict parity/certificate replay, then benchmark and SPRT it.
 
-Only after milestones 1–3 should a pruning rule be promoted from “heuristic
+Only after milestones 1–4 should a pruning rule be promoted from “heuristic
 candidate ordering” to “formally exhaustive defender reduction.”

@@ -95,6 +95,10 @@ pub struct MCTSConfig {
     /// Leaf solving shares `forcing_depth_cap` with the root solver so root vs
     /// leaf experiments differ only in placement and node budget.
     pub leaf_forcing_node_budget: u64,
+    /// Use the narrower hot-cell-only VCF move generator for leaf probes.
+    /// `false` (the default) preserves the existing wide leaf solver. This
+    /// does not affect the root forcing shortcut.
+    pub leaf_forcing_tight: bool,
     /// Minimum evaluated-leaf batch size at which independent leaf-forcing
     /// probes run on Rayon's shared worker pool. `0` disables parallel solving
     /// (the default and legacy behavior). Values below 2 are treated as 2.

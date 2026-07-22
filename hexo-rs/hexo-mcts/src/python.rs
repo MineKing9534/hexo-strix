@@ -302,6 +302,7 @@ impl PyMCTSConfig {
         forcing_depth_cap=0,
         forcing_node_budget=0,
         leaf_forcing_node_budget=0,
+        leaf_forcing_tight=false,
         leaf_forcing_parallel_min_batch=0,
     ))]
     fn new(
@@ -318,6 +319,7 @@ impl PyMCTSConfig {
         forcing_depth_cap: u8,
         forcing_node_budget: u64,
         leaf_forcing_node_budget: u64,
+        leaf_forcing_tight: bool,
         leaf_forcing_parallel_min_batch: usize,
     ) -> PyResult<Self> {
         if m_actions < 1 {
@@ -358,6 +360,7 @@ impl PyMCTSConfig {
                 forcing_depth_cap,
                 forcing_node_budget,
                 leaf_forcing_node_budget,
+                leaf_forcing_tight,
                 leaf_forcing_parallel_min_batch,
             },
         })

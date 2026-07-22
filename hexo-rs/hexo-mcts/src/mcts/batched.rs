@@ -326,6 +326,7 @@ where
                             depth_cap,
                             config.leaf_forcing_node_budget,
                             config.leaf_forcing_parallel_min_batch,
+                            config.leaf_forcing_tight,
                         )
                     };
 
