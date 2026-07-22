@@ -1,0 +1,6 @@
+name = "hexo"
+version = "0.1.0"
+defaultTargets = ["Hexo"]
+
+[[lean_lib]]
+name = "Hexo"
