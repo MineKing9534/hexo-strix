@@ -574,6 +574,7 @@ where
         config.forcing_depth_cap
     };
     let leaf_forcing_node_budget = config.leaf_forcing_node_budget;
+    let leaf_forcing_parallel_min_batch = config.leaf_forcing_parallel_min_batch;
     let surviving_indices = sequential_halving(
         &mut root,
         &candidate_indices,
@@ -590,6 +591,7 @@ where
                 vl_magnitude,
                 leaf_forcing_depth_cap,
                 leaf_forcing_node_budget,
+                leaf_forcing_parallel_min_batch,
                 eval_fn,
             );
         },
@@ -688,6 +690,7 @@ fn simulate_batch_with_eval<F>(
     vl_magnitude: f64,
     leaf_forcing_depth_cap: u8,
     leaf_forcing_node_budget: u64,
+    leaf_forcing_parallel_min_batch: usize,
     eval_fn: &mut F,
 ) where
     F: FnMut(&[GameState]) -> (Vec<HashMap<Coord, f64>>, Vec<f64>),
@@ -799,6 +802,28 @@ fn simulate_batch_with_eval<F>(
     #[cfg(not(feature = "dedup_skip"))]
     let (logits_list, values) = eval_fn(&pending_states);
 
+    let leaf_values = if leaf_forcing_node_budget == 0 {
+        values
+    } else {
+        let root_player = root.current_player;
+        let requests: Vec<_> = pending_selections
+            .iter()
+            .enumerate()
+            .map(|(i, selection)| leaf_forcing::Request {
+                game: &pending_states[i],
+                network_value: values[i],
+                mcts_depth: selection.path_actions.len(),
+                root_player,
+            })
+            .collect();
+        leaf_forcing::override_batch(
+            &requests,
+            leaf_forcing_depth_cap,
+            leaf_forcing_node_budget,
+            leaf_forcing_parallel_min_batch,
+        )
+    };
+
     // Phase 3: Revert virtual loss along each path, then convert logits to
     // priors and apply the real backup. Revert MUST happen before
     // `complete_simulation`'s `apply_backup` so the path's `visit_count` /
@@ -816,19 +841,7 @@ fn simulate_batch_with_eval<F>(
             .into_iter()
             .zip(prior_vals)
             .collect();
-        let leaf_value = if leaf_forcing_node_budget == 0 {
-            values[i]
-        } else {
-            leaf_forcing::override_value(
-                &pending_states[i],
-                values[i],
-                leaf_forcing_depth_cap,
-                leaf_forcing_node_budget,
-                selection.path_actions.len(),
-                root.current_player,
-            )
-        };
-        complete_simulation(root, selection, leaf_priors, leaf_value);
+        complete_simulation(root, selection, leaf_priors, leaf_values[i]);
 
         #[cfg(feature = "dedup_count")]
         {
@@ -2546,7 +2559,15 @@ mod tests {
             ..Default::default()
         };
         let off = MCTSConfig { leaf_forcing_node_budget: 0, ..base.clone() };
-        let on = MCTSConfig { leaf_forcing_node_budget: 500, ..base };
+        let on_serial = MCTSConfig {
+            leaf_forcing_node_budget: 500,
+            ..base.clone()
+        };
+        let on_parallel = MCTSConfig {
+            leaf_forcing_node_budget: 500,
+            leaf_forcing_parallel_min_batch: 2,
+            ..base
+        };
 
         let mut rng = ChaCha8Rng::seed_from_u64(7);
         let mut eval = make_eval();
@@ -2557,12 +2578,24 @@ mod tests {
         super::leaf_forcing::stats(true);
         let mut rng = ChaCha8Rng::seed_from_u64(7);
         let mut eval = make_eval();
-        let on_result = gumbel_mcts(&game, &on, &mut rng, None, &mut eval).unwrap();
+        let on_result = gumbel_mcts(&game, &on_serial, &mut rng, None, &mut eval).unwrap();
         let quiet_idx = on_result.coords.iter().position(|&c| c == quiet).unwrap();
         assert_eq!(on_result.per_child_q[quiet_idx], 1.0);
         let stats = super::leaf_forcing::stats(false);
         assert!(stats.calls >= 2);
         assert!(stats.wins >= 1);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut eval = make_eval();
+        let parallel_result =
+            gumbel_mcts(&game, &on_parallel, &mut rng, None, &mut eval).unwrap();
+        assert_eq!(parallel_result.action, on_result.action);
+        assert_eq!(parallel_result.improved_policy, on_result.improved_policy);
+        assert_eq!(parallel_result.coords, on_result.coords);
+        assert_eq!(parallel_result.visit_counts, on_result.visit_counts);
+        assert_eq!(parallel_result.per_child_q, on_result.per_child_q);
+        assert_eq!(parallel_result.per_child_prior, on_result.per_child_prior);
+        assert_eq!(parallel_result.candidate_indices, on_result.candidate_indices);
     }
 
     /// Change (A): the forcing-solver shortcut must also fire at an mr==1 root

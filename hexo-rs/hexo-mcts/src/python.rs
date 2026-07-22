@@ -302,6 +302,7 @@ impl PyMCTSConfig {
         forcing_depth_cap=0,
         forcing_node_budget=0,
         leaf_forcing_node_budget=0,
+        leaf_forcing_parallel_min_batch=0,
     ))]
     fn new(
         n_simulations: u32,
@@ -317,6 +318,7 @@ impl PyMCTSConfig {
         forcing_depth_cap: u8,
         forcing_node_budget: u64,
         leaf_forcing_node_budget: u64,
+        leaf_forcing_parallel_min_batch: usize,
     ) -> PyResult<Self> {
         if m_actions < 1 {
             return Err(PyValueError::new_err("m_actions must be >= 1"));
@@ -356,6 +358,7 @@ impl PyMCTSConfig {
                 forcing_depth_cap,
                 forcing_node_budget,
                 leaf_forcing_node_budget,
+                leaf_forcing_parallel_min_batch,
             },
         })
     }

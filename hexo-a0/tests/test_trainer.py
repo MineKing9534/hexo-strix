@@ -2380,6 +2380,7 @@ class TestPoolSubprocessArgs:
         assert "sp_mcts.disable_root_forcing" in src
         assert "--disable-root-forcing" in src
         assert "--leaf-forcing-node-budget" in src
+        assert "--leaf-forcing-parallel-min-batch" in src
 
     def test_resume_short_chunk_alignment_arithmetic(self):
         """Pure-logic check for resume realignment: burning a short first

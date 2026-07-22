@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use hexo_engine::{GameState, Player};
 
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+
 use super::forcing;
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +41,45 @@ pub struct Stats {
     pub elapsed_ns: u64,
     pub captured: u64,
     pub capture_errors: u64,
+}
+
+/// One independent leaf evaluation within an already network-evaluated batch.
+#[derive(Clone, Copy)]
+pub struct Request<'a> {
+    pub game: &'a GameState,
+    pub network_value: f64,
+    pub mcts_depth: usize,
+    pub root_player: Player,
+}
+
+/// Apply leaf forcing to a whole evaluation batch, optionally in parallel.
+///
+/// Requests are independent and results retain input order. Rayon uses its
+/// shared bounded pool; each worker receives its own thread-local solver
+/// scratch. Small batches stay serial to avoid scheduling overhead.
+pub fn override_batch(
+    requests: &[Request<'_>],
+    depth_cap: u8,
+    node_budget: u64,
+    parallel_min_batch: usize,
+) -> Vec<f64> {
+    let solve = |request: &Request<'_>| {
+        override_value(
+            request.game,
+            request.network_value,
+            depth_cap,
+            node_budget,
+            request.mcts_depth,
+            request.root_player,
+        )
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if parallel_min_batch > 0 && requests.len() >= parallel_min_batch.max(2) {
+        return requests.par_iter().map(solve).collect();
+    }
+
+    requests.iter().map(solve).collect()
 }
 
 /// Solve one leaf and return the value MCTS should back up.
@@ -335,6 +377,39 @@ mod tests {
             -0.25,
         );
         assert_eq!(override_value(&win, 0.33, 6, 0, 1, Player::P1), 0.33);
+    }
+
+    #[test]
+    fn parallel_batch_matches_serial_values_in_input_order() {
+        let win_stones: Vec<(Coord, Player)> =
+            [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]
+                .into_iter()
+                .map(|c| (c, Player::P1))
+                .collect();
+        let win = GameState::from_state(
+            &win_stones,
+            Player::P1,
+            2,
+            GameConfig::FULL_HEXO,
+        );
+        let quiet = GameState::with_config(GameConfig::FULL_HEXO);
+        let games = [&win, &quiet, &quiet, &win, &quiet, &win, &win, &quiet];
+        let requests: Vec<_> = games
+            .iter()
+            .enumerate()
+            .map(|(i, &game)| Request {
+                game,
+                network_value: -0.8 + i as f64 * 0.1,
+                mcts_depth: i % 3 + 1,
+                root_player: if i % 2 == 0 { Player::P1 } else { Player::P2 },
+            })
+            .collect();
+
+        let serial = override_batch(&requests, 8, 500, 0);
+        let parallel = override_batch(&requests, 8, 500, 2);
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel[0], 1.0);
+        assert_eq!(parallel[1], requests[1].network_value);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

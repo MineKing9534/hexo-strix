@@ -2431,6 +2431,16 @@ class Trainer:
             cmd.extend([
                 "--leaf-forcing-node-budget", str(leaf_forcing_node_budget),
             ])
+        leaf_forcing_parallel_min_batch = (
+            sp_mcts.leaf_forcing_parallel_min_batch
+            if sp_mcts.leaf_forcing_parallel_min_batch is not None
+            else self.mcts_config.leaf_forcing_parallel_min_batch
+        )
+        if leaf_forcing_parallel_min_batch:
+            cmd.extend([
+                "--leaf-forcing-parallel-min-batch",
+                str(leaf_forcing_parallel_min_batch),
+            ])
 
         # Python subprocess inference (torch.compile, ~2x faster forward pass)
         if rust_cfg.python_inference:

@@ -177,9 +177,10 @@ the leaf budget together:
 [self_play.mcts]
 disable_root_forcing = true
 leaf_forcing_node_budget = 500
+leaf_forcing_parallel_min_batch = 4  # 0 keeps leaf probes serial
 ```
 
-Both settings inherit from `[mcts]` when omitted from `[self_play.mcts]`.
+All three settings inherit from `[mcts]` when omitted from `[self_play.mcts]`.
 
 ## Play server
 

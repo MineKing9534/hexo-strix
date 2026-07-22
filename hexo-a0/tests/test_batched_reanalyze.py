@@ -70,6 +70,7 @@ class TestRustBatchedGumbelMcts:
             forcing_depth_cap=16,
             forcing_node_budget=25_000,
             leaf_forcing_node_budget=500,
+            leaf_forcing_parallel_min_batch=4,
         )
         sp_mod._rust_batched_gumbel_mcts(
             _games(1), _tiny_model(), mcts, torch.device("cpu"), n_simulations=8,
@@ -79,6 +80,7 @@ class TestRustBatchedGumbelMcts:
         assert captured["forcing_depth_cap"] == 16
         assert captured["forcing_node_budget"] == 25_000
         assert captured["leaf_forcing_node_budget"] == 500
+        assert captured["leaf_forcing_parallel_min_batch"] == 4
 
     def test_parity_with_serial_path(self):
         """Same position, same seed, same deterministic model: serial vs batched.

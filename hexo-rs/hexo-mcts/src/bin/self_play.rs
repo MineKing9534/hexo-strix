@@ -1646,6 +1646,7 @@ fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
         forcing_depth_cap: base.forcing_depth_cap,
         forcing_node_budget: base.forcing_node_budget,
         leaf_forcing_node_budget: base.leaf_forcing_node_budget,
+        leaf_forcing_parallel_min_batch: base.leaf_forcing_parallel_min_batch,
     }
 }
 
@@ -2119,6 +2120,9 @@ fn main() {
     // 0 disables leaf solving. A non-zero value proves wins at newly selected
     // MCTS leaves and overrides only those leaf values with +1.
     let mut leaf_forcing_node_budget: u64 = 0;
+    // 0 keeps leaf solving serial; non-zero parallelizes evaluated batches at
+    // or above this size on Rayon's shared pool.
+    let mut leaf_forcing_parallel_min_batch: usize = 0;
     let mut leaf_forcing_capture: Option<PathBuf> = None;
     let mut leaf_forcing_capture_limit: u64 = 10_000;
 
@@ -2277,6 +2281,10 @@ fn main() {
             }
             "--leaf-forcing-node-budget" => {
                 leaf_forcing_node_budget = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--leaf-forcing-parallel-min-batch" => {
+                leaf_forcing_parallel_min_batch = args[i + 1].parse().unwrap();
                 i += 2;
             }
             "--leaf-forcing-capture" => {
@@ -2558,6 +2566,7 @@ fn main() {
         forcing_depth_cap,
         forcing_node_budget,
         leaf_forcing_node_budget,
+        leaf_forcing_parallel_min_batch,
     });
 
     let batch_timeout = if batch_timeout_ms > 0 {
@@ -4415,6 +4424,7 @@ mod tests {
             virtual_loss: 0.5,
             disable_forcing_solver: true,
             leaf_forcing_node_budget: 500,
+            leaf_forcing_parallel_min_batch: 4,
             ..Default::default()
         };
         assert_eq!(reduced_sim_config(&base, 4).n_simulations, 16);
@@ -4430,6 +4440,7 @@ mod tests {
         assert_eq!(r.virtual_loss, 0.5);
         assert!(r.disable_forcing_solver);
         assert_eq!(r.leaf_forcing_node_budget, 500);
+        assert_eq!(r.leaf_forcing_parallel_min_batch, 4);
     }
 
     #[test]

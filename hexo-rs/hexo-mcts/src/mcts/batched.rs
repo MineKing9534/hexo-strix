@@ -303,6 +303,32 @@ where
                 if !pending_states.is_empty() {
                     let (logits_list, values) = eval_fn(&pending_states);
 
+                    let leaf_values = if config.leaf_forcing_node_budget == 0 {
+                        values
+                    } else {
+                        let depth_cap = if config.forcing_depth_cap == 0 {
+                            SELF_PLAY_DEPTH_CAP
+                        } else {
+                            config.forcing_depth_cap
+                        };
+                        let requests: Vec<_> = pending_leaves
+                            .iter()
+                            .enumerate()
+                            .map(|(i, leaf)| leaf_forcing::Request {
+                                game: &pending_states[i],
+                                network_value: values[i],
+                                mcts_depth: leaf.selection.path_actions.len(),
+                                root_player: searches[leaf.search_idx].root.current_player,
+                            })
+                            .collect();
+                        leaf_forcing::override_batch(
+                            &requests,
+                            depth_cap,
+                            config.leaf_forcing_node_budget,
+                            config.leaf_forcing_parallel_min_batch,
+                        )
+                    };
+
                     // Distribute results back to each search
                     for (i, leaf) in pending_leaves.iter().enumerate() {
                         let logits_map = &logits_list[i];
@@ -311,29 +337,11 @@ where
                         let prior_vals = super::scoring::softmax(&logit_vals);
                         let leaf_priors: HashMap<Coord, f64> =
                             coords.into_iter().zip(prior_vals).collect();
-                        let leaf_value = if config.leaf_forcing_node_budget == 0 {
-                            values[i]
-                        } else {
-                            let depth_cap = if config.forcing_depth_cap == 0 {
-                                SELF_PLAY_DEPTH_CAP
-                            } else {
-                                config.forcing_depth_cap
-                            };
-                            leaf_forcing::override_value(
-                                &pending_states[i],
-                                values[i],
-                                depth_cap,
-                                config.leaf_forcing_node_budget,
-                                leaf.selection.path_actions.len(),
-                                searches[leaf.search_idx].root.current_player,
-                            )
-                        };
-
                         complete_simulation(
                             &mut searches[leaf.search_idx].root,
                             &leaf.selection,
                             leaf_priors,
-                            leaf_value,
+                            leaf_values[i],
                         );
                     }
                 }

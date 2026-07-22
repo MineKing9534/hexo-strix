@@ -95,4 +95,9 @@ pub struct MCTSConfig {
     /// Leaf solving shares `forcing_depth_cap` with the root solver so root vs
     /// leaf experiments differ only in placement and node budget.
     pub leaf_forcing_node_budget: u64,
+    /// Minimum evaluated-leaf batch size at which independent leaf-forcing
+    /// probes run on Rayon's shared worker pool. `0` disables parallel solving
+    /// (the default and legacy behavior). Values below 2 are treated as 2.
+    /// This changes scheduling only, never solver budgets or MCTS semantics.
+    pub leaf_forcing_parallel_min_batch: usize,
 }

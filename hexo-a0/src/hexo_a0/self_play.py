@@ -49,10 +49,14 @@ def _rust_gumbel_mcts(
         graph_batch_fn = game_to_graph_batch
 
     leaf_forcing_node_budget = getattr(mcts, "leaf_forcing_node_budget", 0)
-    leaf_extra = (
-        {"leaf_forcing_node_budget": leaf_forcing_node_budget}
-        if leaf_forcing_node_budget else {}
+    leaf_forcing_parallel_min_batch = getattr(
+        mcts, "leaf_forcing_parallel_min_batch", 0,
     )
+    leaf_extra = {}
+    if leaf_forcing_node_budget:
+        leaf_extra["leaf_forcing_node_budget"] = leaf_forcing_node_budget
+    if leaf_forcing_parallel_min_batch:
+        leaf_extra["leaf_forcing_parallel_min_batch"] = leaf_forcing_parallel_min_batch
     root_forcing_extra = (
         {"disable_forcing_solver": True}
         if getattr(mcts, "disable_root_forcing", False) else {}
@@ -138,10 +142,14 @@ def _rust_batched_gumbel_mcts(
         graph_batch_fn = game_to_graph_batch
 
     leaf_forcing_node_budget = getattr(mcts, "leaf_forcing_node_budget", 0)
-    leaf_extra = (
-        {"leaf_forcing_node_budget": leaf_forcing_node_budget}
-        if leaf_forcing_node_budget else {}
+    leaf_forcing_parallel_min_batch = getattr(
+        mcts, "leaf_forcing_parallel_min_batch", 0,
     )
+    leaf_extra = {}
+    if leaf_forcing_node_budget:
+        leaf_extra["leaf_forcing_node_budget"] = leaf_forcing_node_budget
+    if leaf_forcing_parallel_min_batch:
+        leaf_extra["leaf_forcing_parallel_min_batch"] = leaf_forcing_parallel_min_batch
     root_forcing_extra = (
         {"disable_forcing_solver": True}
         if getattr(mcts, "disable_root_forcing", False) else {}
@@ -239,10 +247,14 @@ def batched_self_play_games(
 
     n_sims = n_simulations_override if n_simulations_override is not None else mcts.n_simulations
     leaf_forcing_node_budget = getattr(mcts, "leaf_forcing_node_budget", 0)
-    leaf_extra = (
-        {"leaf_forcing_node_budget": leaf_forcing_node_budget}
-        if leaf_forcing_node_budget else {}
+    leaf_forcing_parallel_min_batch = getattr(
+        mcts, "leaf_forcing_parallel_min_batch", 0,
     )
+    leaf_extra = {}
+    if leaf_forcing_node_budget:
+        leaf_extra["leaf_forcing_node_budget"] = leaf_forcing_node_budget
+    if leaf_forcing_parallel_min_batch:
+        leaf_extra["leaf_forcing_parallel_min_batch"] = leaf_forcing_parallel_min_batch
     root_forcing_extra = (
         {"disable_forcing_solver": True}
         if getattr(mcts, "disable_root_forcing", False) else {}
