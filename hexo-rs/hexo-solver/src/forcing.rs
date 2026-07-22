@@ -777,6 +777,32 @@ fn cover_class(comps: &[CellSet2]) -> u8 {
     min_hit_masks(comps, &cells[..u], &masks, alive, 4)
 }
 
+/// Number of distinct minimum two-cell covers when B == 2.
+///
+/// The forcing move generator has already built `comps` and classified it as
+/// B=2. Counting its defender replies gives proof-only leaf search an exact
+/// AND-branching-cost ordering key. The common <=64-completion path is a fixed
+/// stack bitset with no allocation; the large fallback is intentionally rare.
+fn two_cover_count(comps: &[CellSet2]) -> u32 {
+    debug_assert_eq!(cover_class(comps), 2);
+    let n = comps.len();
+    if n > 64 {
+        return min_covers2(comps).1.len().min(u32::MAX as usize) as u32;
+    }
+    let full: u64 = if n == 64 { !0 } else { (1u64 << n) - 1 };
+    let mut cells = [(0i32, 0i32); 128];
+    let mut masks = [0u64; 128];
+    let u = build_cell_masks(comps, &mut cells, &mut masks);
+    let mut count = 0u32;
+    for a in 0..u {
+        for b in a + 1..u {
+            count += u32::from(masks[a] | masks[b] == full);
+        }
+    }
+    debug_assert!(count > 0, "B=2 must have at least one two-cell cover");
+    count
+}
+
 /// min(B, cap) over the still-alive comps (bitmask), branching on the first
 /// alive comp's cells. Depth is bounded by `cap`.
 fn min_hit_masks(comps: &[CellSet2], cells: &[Coord], masks: &[u64], alive: u64, cap: u8) -> u8 {
@@ -951,6 +977,29 @@ pub fn attacker_turns_with(
     dfn_comps: &[CellSet2],
     wide: bool,
 ) -> Vec<CellSet2> {
+    attacker_turns_with_ordering(
+        board,
+        attacker,
+        placements,
+        wl,
+        radius,
+        dfn_comps,
+        wide,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attacker_turns_with_ordering(
+    board: &SolverBoard,
+    attacker: Player,
+    placements: u8,
+    wl: u8,
+    radius: i32,
+    dfn_comps: &[CellSet2],
+    wide: bool,
+    proof_ordering: bool,
+) -> Vec<CellSet2> {
     let enforce = radius < wl as i32 - 1;
     // Wide mode fuses the builder-score accumulation into the threat-table
     // strip walk (one scan instead of two); tight keeps the narrower scan.
@@ -975,9 +1024,10 @@ pub fn attacker_turns_with(
             (strong, entries.len() as u32 - strong)
         })
         .collect();
-    // (B, h_strong, move): h_strong rides along as a wide-mode-only secondary
-    // sort key — see the final sort below.
-    let mut scored: Vec<(u8, u32, CellSet2)> = Vec::new();
+    // (B, defender_cover_count, h_strong, move). For B=2, cover count is the
+    // exact number of AND children a proof must close. `h_strong` remains wide
+    // mode's historical secondary key.
+    let mut scored: Vec<(u8, u32, u32, CellSet2)> = Vec::new();
     let mut scratch: Vec<CellSet2> = Vec::new();
     if placements == 1 {
         for (hi, &c) in hot.iter().enumerate() {
@@ -991,7 +1041,8 @@ pub fn attacker_turns_with(
             }
             let b = move_b_with(&index, &[c], wl, &mut scratch);
             if b >= 2 {
-                scored.push((b, potential[hi].0, CellSet2::one(c)));
+                let covers = if b == 2 { two_cover_count(&scratch) } else { 0 };
+                scored.push((b, covers, potential[hi].0, CellSet2::one(c)));
             }
         }
     } else {
@@ -1073,23 +1124,25 @@ pub fn attacker_turns_with(
                 }
                 let b = move_b_with(&index, mv.cells(), wl, &mut scratch);
                 if b >= 2 {
-                    scored.push((b, h_strong, mv));
+                    let covers = if b == 2 { two_cover_count(&scratch) } else { 0 };
+                    scored.push((b, covers, h_strong, mv));
                 }
             }
         }
     }
     if wide {
-        // Wide: best-first by B, then strongest hot cell first — the h-outer
-        // emission loop groups pairs by hot cell in coordinate order, and with
-        // builders in the mix a group is large, so refuting every pair of a
-        // weak hot cell before reaching a strong one is expensive. Stable, so
-        // within a (B, h_strong) tie the emission order survives: hot/block
-        // partners (coord asc), then builders most-threatening-first.
-        scored.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)));
+        // Wide's historical ordering: B, then hot-cell strength.
+        scored.sort_by(|x, y| y.0.cmp(&x.0).then(y.2.cmp(&x.2)));
+    } else if proof_ordering {
+        // Tight leaf ordering: after B, try the proof with the fewest defender
+        // replies first. This is the exact immediate AND branching factor.
+        scored.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
     } else {
-        scored.sort_by(|x, y| y.0.cmp(&x.0)); // best-first (higher B), stable
+        // Keep full tight/PV APIs byte-for-byte compatible. They are not the
+        // low-budget, proof-only leaf path this ordering experiment targets.
+        scored.sort_by(|x, y| y.0.cmp(&x.0));
     }
-    scored.into_iter().map(|(_, _, m)| m).collect()
+    scored.into_iter().map(|(_, _, _, m)| m).collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1117,6 +1170,10 @@ struct SearchState {
     /// the lifetime of a single search, so the gencache/tt keys need no extra
     /// dimension for it.
     wide: bool,
+    /// Leaf-verdict-only ordering: prefer fewer defender covers for equal-B
+    /// tight moves.
+    /// Full/PV APIs keep this false so their historical first move is stable.
+    proof_ordering: bool,
     /// Research-only wall-clock deadline + cooperative cancel (see `Limits`). The
     /// production default is empty, making `tick` byte-identical to before.
     limits: Limits,
@@ -1147,6 +1204,7 @@ impl SearchState {
             atk,
             dfn,
             wide,
+            proof_ordering: false,
             limits: Limits::default(),
             support: None,
         }
@@ -1178,6 +1236,7 @@ impl SearchState {
         self.atk = atk;
         self.dfn = dfn;
         self.wide = wide;
+        self.proof_ordering = false;
         self.limits = Limits::default();
         self.support = None;
     }
@@ -1248,7 +1307,16 @@ fn attacker_turns_memo(
 ) -> Rc<Vec<CellSet2>> {
     let key = (board.hash, placements);
     if let Some(v) = s.gencache.get(&key) { return Rc::clone(v); }
-    let moves = Rc::new(attacker_turns_with(board, s.atk, placements, s.wl, s.radius, dfn_comps, s.wide));
+    let moves = Rc::new(attacker_turns_with_ordering(
+        board,
+        s.atk,
+        placements,
+        s.wl,
+        s.radius,
+        dfn_comps,
+        s.wide,
+        s.proof_ordering,
+    ));
     s.gencache.insert(key, Rc::clone(&moves));
     moves
 }
@@ -1570,6 +1638,30 @@ pub fn solve_verdict_with_scratch(
     wide: bool,
     scratch: &mut VerdictScratch,
 ) -> ForcingVerdict {
+    solve_verdict_with_scratch_ordering(game, depth_cap, node_budget, wide, false, scratch)
+}
+
+/// Leaf-specialized verdict probe that prioritizes equal-B tight moves by the
+/// number of minimum defender covers. Search semantics and proof checking are
+/// unchanged; only fixed-budget traversal order differs.
+pub fn solve_verdict_with_scratch_proof_ordered(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    scratch: &mut VerdictScratch,
+) -> ForcingVerdict {
+    solve_verdict_with_scratch_ordering(game, depth_cap, node_budget, wide, true, scratch)
+}
+
+fn solve_verdict_with_scratch_ordering(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    proof_ordering: bool,
+    scratch: &mut VerdictScratch,
+) -> ForcingVerdict {
     let placements = match prepare_search_reusing(
         game,
         node_budget,
@@ -1582,6 +1674,7 @@ pub fn solve_verdict_with_scratch(
         Ok(placements) => placements,
         Err(result) => return forcing_verdict(result),
     };
+    scratch.search.proof_ordering = proof_ordering;
     forcing_verdict(solve_from_state(
         &mut scratch.board,
         placements,

@@ -2438,6 +2438,13 @@ class Trainer:
         )
         if leaf_forcing_tight:
             cmd.append("--leaf-forcing-tight")
+        leaf_forcing_proof_ordering = (
+            sp_mcts.leaf_forcing_proof_ordering
+            if sp_mcts.leaf_forcing_proof_ordering is not None
+            else self.mcts_config.leaf_forcing_proof_ordering
+        )
+        if leaf_forcing_proof_ordering:
+            cmd.append("--leaf-forcing-proof-ordering")
         leaf_forcing_parallel_min_batch = (
             sp_mcts.leaf_forcing_parallel_min_batch
             if sp_mcts.leaf_forcing_parallel_min_batch is not None

@@ -102,6 +102,8 @@ def play_eval_game(
     opponent_mcts_leaf_forcing_node_budget: int = 0,
     mcts_leaf_forcing_tight: bool = False,
     opponent_mcts_leaf_forcing_tight: bool = False,
+    mcts_leaf_forcing_proof_ordering: bool = False,
+    opponent_mcts_leaf_forcing_proof_ordering: bool = False,
 ) -> dict:
     """Play one complete evaluation game: model vs opponent.
 
@@ -182,7 +184,8 @@ def play_eval_game(
                   forcing_depth_cap: int = 0,
                   forcing_node_budget: int = 0,
                   leaf_forcing_node_budget: int = 0,
-                  leaf_forcing_tight: bool = False):
+                  leaf_forcing_tight: bool = False,
+                  leaf_forcing_proof_ordering: bool = False):
         if sims <= 0:
             return None
         # Only pass non-default experiment kwargs. The ordinary eval path thus
@@ -198,6 +201,8 @@ def play_eval_game(
             extra["leaf_forcing_node_budget"] = leaf_forcing_node_budget
         if leaf_forcing_tight:
             extra["leaf_forcing_tight"] = True
+        if leaf_forcing_proof_ordering:
+            extra["leaf_forcing_proof_ordering"] = True
         return hexo_rs.MCTSConfig(
             n_simulations=sims, m_actions=m_actions,
             c_visit=c_visit, c_scale=c_scale,
@@ -215,6 +220,7 @@ def play_eval_game(
         mcts_forcing_node_budget,
         mcts_leaf_forcing_node_budget,
         mcts_leaf_forcing_tight,
+        mcts_leaf_forcing_proof_ordering,
     )
     opp_sims = mcts_sims if opponent_mcts_sims is None else opponent_mcts_sims
     opp_m_actions = (
@@ -230,6 +236,7 @@ def play_eval_game(
         opponent_mcts_forcing_node_budget,
         opponent_mcts_leaf_forcing_node_budget,
         opponent_mcts_leaf_forcing_tight,
+        opponent_mcts_leaf_forcing_proof_ordering,
     )
 
     game = hexo_rs.GameState(game_config)

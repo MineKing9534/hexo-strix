@@ -99,6 +99,10 @@ pub struct MCTSConfig {
     /// `false` (the default) preserves the existing wide leaf solver. This
     /// does not affect the root forcing shortcut.
     pub leaf_forcing_tight: bool,
+    /// Use proof-cost ordering inside tight verdict-only leaf probes. `false`
+    /// preserves the historical equal-B coordinate order for clean A/B tests.
+    /// Wide leaf probes are unaffected.
+    pub leaf_forcing_proof_ordering: bool,
     /// Minimum evaluated-leaf batch size at which independent leaf-forcing
     /// probes run on Rayon's shared worker pool. `0` disables parallel solving
     /// (the default and legacy behavior). Values below 2 are treated as 2.

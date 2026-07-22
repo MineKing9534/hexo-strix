@@ -1647,6 +1647,7 @@ fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
         forcing_node_budget: base.forcing_node_budget,
         leaf_forcing_node_budget: base.leaf_forcing_node_budget,
         leaf_forcing_tight: base.leaf_forcing_tight,
+        leaf_forcing_proof_ordering: base.leaf_forcing_proof_ordering,
         leaf_forcing_parallel_min_batch: base.leaf_forcing_parallel_min_batch,
     }
 }
@@ -2124,6 +2125,9 @@ fn main() {
     // False preserves the existing wide generator; true selects the cheaper
     // hot-cell-only generator for leaf probes only.
     let mut leaf_forcing_tight: bool = false;
+    // False preserves equal-B coordinate order; true prioritizes tight B=2
+    // turns with fewer mandatory defender covers.
+    let mut leaf_forcing_proof_ordering: bool = false;
     // 0 keeps leaf solving serial; non-zero parallelizes evaluated batches at
     // or above this size on Rayon's shared pool.
     let mut leaf_forcing_parallel_min_batch: usize = 0;
@@ -2289,6 +2293,10 @@ fn main() {
             }
             "--leaf-forcing-tight" => {
                 leaf_forcing_tight = true;
+                i += 1;
+            }
+            "--leaf-forcing-proof-ordering" => {
+                leaf_forcing_proof_ordering = true;
                 i += 1;
             }
             "--leaf-forcing-parallel-min-batch" => {
@@ -2575,6 +2583,7 @@ fn main() {
         forcing_node_budget,
         leaf_forcing_node_budget,
         leaf_forcing_tight,
+        leaf_forcing_proof_ordering,
         leaf_forcing_parallel_min_batch,
     });
 
@@ -4434,6 +4443,7 @@ mod tests {
             disable_forcing_solver: true,
             leaf_forcing_node_budget: 500,
             leaf_forcing_tight: true,
+            leaf_forcing_proof_ordering: true,
             leaf_forcing_parallel_min_batch: 4,
             ..Default::default()
         };
@@ -4451,6 +4461,7 @@ mod tests {
         assert!(r.disable_forcing_solver);
         assert_eq!(r.leaf_forcing_node_budget, 500);
         assert!(r.leaf_forcing_tight);
+        assert!(r.leaf_forcing_proof_ordering);
         assert_eq!(r.leaf_forcing_parallel_min_batch, 4);
     }
 

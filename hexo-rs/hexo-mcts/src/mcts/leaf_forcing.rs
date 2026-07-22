@@ -63,6 +63,7 @@ pub fn override_batch(
     node_budget: u64,
     parallel_min_batch: usize,
     tight: bool,
+    proof_ordering: bool,
 ) -> Vec<f64> {
     let solve = |request: &Request<'_>| {
         override_value(
@@ -73,6 +74,7 @@ pub fn override_batch(
             request.mcts_depth,
             request.root_player,
             tight,
+            proof_ordering,
         )
     };
 
@@ -95,6 +97,7 @@ pub fn override_value(
     mcts_depth: usize,
     root_player: Player,
     tight: bool,
+    proof_ordering: bool,
 ) -> f64 {
     if node_budget == 0 {
         return network_value;
@@ -103,13 +106,12 @@ pub fn override_value(
     #[cfg(not(target_arch = "wasm32"))]
     let started = std::time::Instant::now();
     let verdict = SCRATCH.with(|scratch| {
-        forcing::solve_verdict_with_scratch(
-            game,
-            depth_cap,
-            node_budget,
-            !tight,
-            &mut scratch.borrow_mut(),
-        )
+        let solve = if proof_ordering && tight {
+            forcing::solve_verdict_with_scratch_proof_ordered
+        } else {
+            forcing::solve_verdict_with_scratch
+        };
+        solve(game, depth_cap, node_budget, !tight, &mut scratch.borrow_mut())
     });
     #[cfg(not(target_arch = "wasm32"))]
     let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -373,15 +375,15 @@ mod tests {
         .map(|c| (c, Player::P1))
         .collect();
         let win = GameState::from_state(&stones, Player::P1, 2, GameConfig::FULL_HEXO);
-        assert_eq!(override_value(&win, -0.75, 6, 2_000, 3, Player::P1, false), 1.0);
-        assert_eq!(override_value(&win, -0.75, 6, 2_000, 3, Player::P1, true), 1.0);
+        assert_eq!(override_value(&win, -0.75, 6, 2_000, 3, Player::P1, false, false), 1.0);
+        assert_eq!(override_value(&win, -0.75, 6, 2_000, 3, Player::P1, true, true), 1.0);
 
         let quiet = GameState::with_config(GameConfig::FULL_HEXO);
         assert_eq!(
-            override_value(&quiet, -0.25, 6, 2_000, 1, Player::P2, false),
+            override_value(&quiet, -0.25, 6, 2_000, 1, Player::P2, false, false),
             -0.25,
         );
-        assert_eq!(override_value(&win, 0.33, 6, 0, 1, Player::P1, false), 0.33);
+        assert_eq!(override_value(&win, 0.33, 6, 0, 1, Player::P1, false, false), 0.33);
     }
 
     #[test]
@@ -410,8 +412,8 @@ mod tests {
             })
             .collect();
 
-        let serial = override_batch(&requests, 8, 500, 0, false);
-        let parallel = override_batch(&requests, 8, 500, 2, false);
+        let serial = override_batch(&requests, 8, 500, 0, false, true);
+        let parallel = override_batch(&requests, 8, 500, 2, false, true);
         assert_eq!(parallel, serial);
         assert_eq!(parallel[0], 1.0);
         assert_eq!(parallel[1], requests[1].network_value);
@@ -430,7 +432,7 @@ mod tests {
         ));
         configure_capture(&path, 1).unwrap();
         let game = GameState::with_config(GameConfig::FULL_HEXO);
-        let _ = override_value(&game, 0.25, 6, 500, 4, Player::P1, false);
+        let _ = override_value(&game, 0.25, 6, 500, 4, Player::P1, false, false);
         finish_capture().unwrap();
 
         let line = std::fs::read_to_string(&path).unwrap();
