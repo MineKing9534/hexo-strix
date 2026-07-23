@@ -1,0 +1,104 @@
+# KLENT reference experiment: fixed curriculum stage S1.
+#
+# S1 is full-rule HeXO (6-in-a-row) at placement radius 2. This deliberately
+# has no curriculum controller: it trains only this stage, using fresh
+# search-free KLENT self-play batches.
+#
+# Start:
+#   uv run hexo-klent train --config configs/klent/reference-s1.toml
+
+[model]
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 2
+# HeXO has no draws. Positions still alive after this many placements are
+# truncated and bootstrapped from the final frozen-network value.
+rollout_horizon = 300
+
+[algorithm]
+# Paper defaults. lambda is derived as exp(-1 / tau) = 0.8824969...
+alpha = 0.03
+beta = 0.1
+tau = 8.0
+
+[collection]
+# This roughly preserves the measured size of the original 128-game S1 batch,
+# while remaining stable as game lengths change during training.
+positions_per_iteration = 32_768
+parallel_games = 64
+inference_batch_size = 64
+# Cap shared GPU work by actual graph size; late S1 positions are much larger
+# than opening positions, so a fixed graph-count batch alone is unsafe.
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 256
+edge_budget = 250_000
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 10
+
+[[evaluation.opponents]]
+name = "random"
+kind = "random"
+games = 64
+
+[[evaluation.opponents]]
+name = "sealbot_raw"
+kind = "sealbot"
+games = 16
+depth = 2
+placement_radius = 8
+# Set above zero to evaluate KLENT through its MCTS adapter instead of using
+# the greedy raw policy.
+mcts_simulations = 0
+mcts_actions = 16
+
+[[evaluation.opponents]]
+name = "sealbot_mcts24/8"
+kind = "sealbot"
+games = 16
+depth = 2
+placement_radius = 8
+# Set above zero to evaluate KLENT through its MCTS adapter instead of using
+# the greedy raw policy.
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+iterations = 1000
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/reference-s1"
+checkpoint_interval = 10
+seed = 0

@@ -30,6 +30,17 @@ logger = logging.getLogger(__name__)
 SPRT_DAEMON_NICE = 10
 
 
+def _file_identity(path: Path) -> dict[str, int]:
+    """Identity used by the daemon to bind evidence to one champion file."""
+    st = path.stat()
+    return {
+        "device": st.st_dev,
+        "inode": st.st_ino,
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+    }
+
+
 def _deprioritise_daemon() -> None:
     """preexec_fn: lower the daemon's scheduling priority (runs in the child)."""
     try:
@@ -248,6 +259,20 @@ class SPRTWatcher:
         # or heartbeated the state at least once.
         if self._started_at is not None and ts < self._started_at:
             return None
+
+        # Evidence is valid only against the exact champion identity serialized
+        # with it. champion.pt is atomically replaced on promotion, but the
+        # daemon may need time to publish its reset (or may die before doing
+        # so). Never replay a terminal decision against a superseded champion.
+        tested_champion = payload.get("champion_identity")
+        if isinstance(tested_champion, dict):
+            try:
+                current_champion = _file_identity(self.champion_path)
+            except OSError:
+                return None
+            if tested_champion != current_champion:
+                logger.debug("Ignoring SPRT state for superseded champion identity")
+                return None
 
         # Staleness only matters when the daemon is supposed to be making
         # progress (decision == "continue"). Terminal decisions (accept_h1,

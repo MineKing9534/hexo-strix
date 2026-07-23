@@ -177,6 +177,57 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
+def _publish_waiting_state(
+    state_file: Path,
+    *,
+    state: SPRTState,
+    trainee_dir: Path,
+    champion_path: Path,
+    champion_mtime: float,
+    champion_identity: dict[str, int],
+    round_id: int,
+    candidate_epoch: int,
+    last_completed_candidate_step: int | None,
+    reject_count: int,
+    peak_history: list[int],
+) -> None:
+    """Publish a champion reset before waiting for the next candidate.
+
+    Preserve the prior test specification and bounds, but clear the terminal
+    candidate/game snapshot and bind the state file to the new champion.
+    """
+    try:
+        payload = json.loads(state_file.read_text()) if state_file.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        payload = {}
+
+    latest = _latest_checkpoint(trainee_dir)
+    latest_step = checkpoint_step(latest or "")
+    payload.update({
+        "timestamp": time.time(),
+        "trainee_path": None,
+        "candidate_path": None,
+        "candidate_step": None,
+        "latest_available_step": latest_step,
+        "candidate_lag_steps": None,
+        "round_id": round_id,
+        "candidate_epoch": candidate_epoch,
+        "candidate_mode": "fixed_round",
+        "round_status": "waiting_candidate",
+        "last_completed_candidate_step": last_completed_candidate_step,
+        "champion_path": str(champion_path),
+        "champion_mtime": champion_mtime,
+        "champion_identity": champion_identity,
+        "state": state.to_dict(),
+        "score": state.score,
+        "reject_count": reject_count,
+        "peak_history": peak_history,
+        "empirical_pair_variance": None,
+    })
+    payload.pop("last_game", None)
+    _atomic_write_json(state_file, payload)
+
+
 def _resolve_game_config(raw: dict, stage_index: int):
     """Pull win_length / placement_radius / max_moves from the requested stage."""
     stages = raw.get("curriculum", {}).get("stages", [])
@@ -738,7 +789,8 @@ def run_daemon(
         current_identity = _file_identity(champion_path)
         current_mtime = champion_path.stat().st_mtime
         if champion_identity is None or current_identity != champion_identity:
-            if champion_identity is not None:
+            champion_changed = champion_identity is not None
+            if champion_changed:
                 # The reject_count value at champion-change time is the
                 # peak of the just-completed cycle. Record it for the
                 # curriculum's auto-calibrated plateau detector.
@@ -776,6 +828,20 @@ def run_daemon(
             champion_identity = current_identity
             champion_epoch += 1
             logger.info("Loaded champion: %s (epoch %d)", champion_path, champion_epoch)
+            if champion_changed:
+                _publish_waiting_state(
+                    state_file,
+                    state=state,
+                    trainee_dir=trainee_dir,
+                    champion_path=champion_path,
+                    champion_mtime=champion_mtime,
+                    champion_identity=champion_identity,
+                    round_id=round_id,
+                    candidate_epoch=candidate_epoch,
+                    last_completed_candidate_step=last_completed_candidate_step,
+                    reject_count=reject_count,
+                    peak_history=peak_history,
+                )
 
         if restored_terminal_accept and state.decision == "accept_h1":
             # Preserve an accepted exact candidate across a daemon/trainer

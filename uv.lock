@@ -18,6 +18,7 @@ conflicts = [[
 members = [
     "hexo",
     "hexo-a0",
+    "hexo-klent",
     "hexo-rs",
 ]
 
@@ -843,6 +844,31 @@ requires-dist = [
     { name = "torch-geometric", marker = "extra == 'train'", specifier = ">=2.7" },
 ]
 provides-extras = ["viewer", "train"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.0" }]
+
+[[package]]
+name = "hexo-klent"
+version = "0.1.0"
+source = { editable = "hexo-klent" }
+dependencies = [
+    { name = "hexo-a0", extra = ["train"] },
+    { name = "hexo-rs" },
+    { name = "rich" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "hexo-a0", extras = ["train"], editable = "hexo-a0" },
+    { name = "hexo-rs", editable = "hexo-rs" },
+    { name = "rich", specifier = ">=14.0" },
+]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]

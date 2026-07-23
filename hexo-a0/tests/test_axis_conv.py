@@ -6,6 +6,7 @@ permutation of the 3 axis labels. These tests build the graph tensors by
 hand and never import ``hexo_rs``.
 """
 
+import copy
 import itertools
 
 import torch
@@ -29,6 +30,99 @@ def _random_axis_graph(num_nodes, edges, seed=0):
     edge_type = torch.tensor([t for _, _, t, _ in edges], dtype=torch.long)
     edge_dist = torch.tensor([w for _, _, _, w in edges], dtype=torch.long)
     return edge_index, edge_type, edge_dist
+
+
+def _reference_forward(
+    mod,
+    x,
+    edge_index,
+    edge_type,
+    edge_dist,
+    global_edge_index=None,
+):
+    """The original per-axis PyG implementation, retained as a parity oracle."""
+
+    dist_feat = mod.dist_embed(edge_dist.long() - 1)
+    agg = mod.axis_conv.nn[-1].bias.new_zeros(x.size(0), mod.out_dim)
+    for axis in range(mod.num_axes):
+        mask = edge_type == axis
+        agg = agg + mod.axis_conv(
+            x, edge_index[:, mask], dist_feat[mask]
+        )
+
+    if (
+        mod.use_global
+        and global_edge_index is not None
+        and global_edge_index.numel() > 0
+    ):
+        global_feat = mod.global_edge_embed.unsqueeze(0).expand(
+            global_edge_index.size(1), -1
+        )
+        agg = agg + mod.global_conv(
+            x, global_edge_index, global_feat
+        )
+
+    return mod.node_update(torch.cat([x, agg], dim=-1))
+
+
+def _assert_fused_forward_and_backward_match(global_edge_index):
+    torch.manual_seed(11)
+    fused = AxisRelationalConv(
+        in_dim=5,
+        out_dim=7,
+        window=4,
+        use_global=True,
+    ).train()
+    reference = copy.deepcopy(fused).train()
+
+    edges = [
+        (0, 1, 0, 1), (1, 0, 0, 1),
+        (1, 2, 1, 2), (2, 1, 1, 2),
+        (2, 3, 2, 3), (3, 2, 2, 3),
+        (4, 0, 1, 4), (0, 4, 1, 4),
+    ]
+    edge_index, edge_type, edge_dist = _random_axis_graph(5, edges)
+    x_fused = torch.randn(5, 5, requires_grad=True)
+    x_reference = x_fused.detach().clone().requires_grad_(True)
+
+    actual = fused(
+        x_fused,
+        edge_index,
+        edge_type,
+        edge_dist,
+        global_edge_index,
+    )
+    expected = _reference_forward(
+        reference,
+        x_reference,
+        edge_index,
+        edge_type,
+        edge_dist,
+        global_edge_index,
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+    probe = torch.randn_like(actual)
+    (actual * probe).sum().backward()
+    (expected * probe).sum().backward()
+    torch.testing.assert_close(
+        x_fused.grad, x_reference.grad, atol=2e-6, rtol=1e-5
+    )
+
+    fused_params = dict(fused.named_parameters())
+    reference_params = dict(reference.named_parameters())
+    assert list(fused_params) == list(reference_params)
+    for name, fused_param in fused_params.items():
+        reference_param = reference_params[name]
+        assert (fused_param.grad is None) == (reference_param.grad is None), name
+        if fused_param.grad is not None:
+            torch.testing.assert_close(
+                fused_param.grad,
+                reference_param.grad,
+                atol=2e-6,
+                rtol=1e-5,
+                msg=lambda msg, name=name: f"{name}: {msg}",
+            )
 
 
 def test_axis_permutation_invariance():
@@ -144,3 +238,16 @@ def test_distance_sensitivity():
     assert not torch.allclose(out1, out2, atol=1e-5), (
         "changing edge_dist did not change the output"
     )
+
+
+def test_fused_forward_and_backward_match_original_with_global_edges():
+    global_edge_index = torch.tensor(
+        [[0, 2, 4, 1], [4, 0, 2, 3]], dtype=torch.long
+    )
+    _assert_fused_forward_and_backward_match(global_edge_index)
+
+
+def test_fused_forward_and_backward_match_original_without_global_edges():
+    # In addition to numeric parity, the shared helper verifies that all global
+    # parameters retain grad=None when the old implementation skipped them.
+    _assert_fused_forward_and_backward_match(None)

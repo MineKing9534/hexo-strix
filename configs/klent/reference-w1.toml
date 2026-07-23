@@ -1,0 +1,81 @@
+# KLENT reference experiment: search-free self-play on curriculum stage W1.
+#
+# This intentionally keeps the D6-invariant representation used by the active
+# AlphaZero line while replacing the entire MCTS/replay training algorithm.
+# It is a fixed-stage experiment; curriculum advancement belongs in a later
+# iteration after the reference loop has been measured.
+#
+# Start:
+#   uv run hexo-klent train --config configs/klent/reference-w1.toml
+
+[model]
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 4
+placement_radius = 2
+# HeXO has no draws. Positions still alive after this many placements are
+# truncated and bootstrapped from the final frozen-network value.
+rollout_horizon = 30
+
+[algorithm]
+# Paper defaults. lambda is derived as exp(-1 / tau) = 0.8824969...
+alpha = 0.03
+beta = 0.1
+tau = 8.0
+
+[collection]
+# Keep the amount of fresh learning data stable as game lengths change.
+positions_per_iteration = 32_768
+# Live game lanes are independent of the transition budget.
+parallel_games = 64
+inference_batch_size = 64
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 256
+edge_budget = 250_000
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.0
+
+[evaluation]
+interval = 10
+
+[[evaluation.opponents]]
+name = "random"
+kind = "random"
+games = 64
+
+[run]
+iterations = 100
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/reference-w1"
+checkpoint_interval = 10
+seed = 0

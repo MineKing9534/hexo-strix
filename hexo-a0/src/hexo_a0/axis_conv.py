@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.nn import GINEConv
 
@@ -118,45 +119,111 @@ class AxisRelationalConv(nn.Module):
         edge_type: Tensor,
         edge_dist: Tensor,
         global_edge_index: Tensor | None = None,
+        *,
+        prebucketed: bool = False,
+        has_global_edges: bool = False,
     ) -> Tensor:
-        """Compute updated node embeddings.
+        """Compute updated node embeddings with one fixed-shape edge scatter.
 
         Args:
             x:                 Node features, shape ``(N, in_dim)``.
-            edge_index:        Axis edges, shape ``(2, E)`` (long).
-            edge_type:         Per-edge axis label in ``[0, num_axes)``,
+            edge_index:        Axis edges, or all prebucketed relation edges,
+                               shape ``(2, E)`` (long).
+            edge_type:         Per-edge axis label in ``[0, num_axes)``, or a
+                               prebucketed label in ``[0, num_axes]`` where
+                               ``num_axes`` denotes the global relation,
                                shape ``(E,)`` (long).
             edge_dist:         Per-edge unsigned hop distance in
                                ``[1, window]``, shape ``(E,)`` (long).
             global_edge_index: Optional global-relation edges, shape
                                ``(2, E_g)`` (long). Only used when the module
                                was constructed with ``use_global=True``.
+            prebucketed:       ``True`` when the caller has already appended
+                               global edges to the other tensors. This lets a
+                               multi-layer representation do that work once.
+            has_global_edges:  Whether the prebucketed tensors contain global
+                               edges. Ignored unless ``prebucketed=True``.
 
         Returns:
             Node embeddings of shape ``(N, out_dim)``.
         """
-        # One embedding lookup for all axis edges; masked per relation below.
-        dist_feat = self.dist_embed(edge_dist.long() - 1)  # (E, edge_dim)
-
-        # Symmetric SUM over the axis relations with TIED weights. Because
-        # GINEConv uses additive aggregation and the same weights are applied
-        # to every relation, relabelling the axes only permutes the summands,
-        # leaving the sum unchanged (exact axis-permutation invariance).
-        agg = self.axis_conv.nn[-1].bias.new_zeros(x.size(0), self.out_dim)
-        for k in range(self.num_axes):
-            mask = edge_type == k
-            ei_k = edge_index[:, mask]
-            ef_k = dist_feat[mask]
-            agg = agg + self.axis_conv(x, ei_k, ef_k)
-
-        # Optional global/dummy relation: separate untied branch, its own
-        # learned edge feature, NOT part of the axis sum -> cannot affect the
-        # axis-permutation symmetry.
-        if self.use_global and global_edge_index is not None and global_edge_index.numel() > 0:
-            g_feat = self.global_edge_embed.unsqueeze(0).expand(
-                global_edge_index.size(1), -1
+        if not prebucketed:
+            has_global_edges = (
+                self.use_global
+                and global_edge_index is not None
+                and global_edge_index.numel() > 0
             )
-            agg = agg + self.global_conv(x, global_edge_index, g_feat)
+            if has_global_edges:
+                num_global = global_edge_index.shape[1]
+                edge_index = torch.cat([edge_index, global_edge_index], dim=1)
+                edge_type = torch.cat(
+                    [edge_type, edge_type.new_full((num_global,), self.num_axes)]
+                )
+                # Global edges do not consume the distance embedding; one is a
+                # harmless valid placeholder for the branchless table gather.
+                edge_dist = torch.cat(
+                    [edge_dist, edge_dist.new_ones((num_global,))]
+                )
+
+        num_nodes = x.shape[0]
+        num_buckets = self.num_axes + 1 if self.use_global else self.num_axes
+        src, dst = edge_index[0], edge_index[1]
+
+        # Project the small distance table once, then gather its rows per edge.
+        # This is algebraically identical to projecting every looked-up edge
+        # embedding, but avoids a hidden_dim x hidden_dim matmul over all edges.
+        dist_table = self.axis_conv.lin(self.dist_embed.weight)
+        axis_proj = dist_table.index_select(0, (edge_dist.long() - 1))
+
+        if self.use_global and has_global_edges:
+            # The global relation uses one learned edge vector. Project it once
+            # and select it for the global bucket without splitting the edge
+            # tensors by a data-dependent boolean mask.
+            global_proj = self.global_conv.lin(
+                self.global_edge_embed
+            ).unsqueeze(0)
+            projected_edges = torch.where(
+                (edge_type == self.num_axes).unsqueeze(1),
+                global_proj,
+                axis_proj,
+            )
+        else:
+            projected_edges = axis_proj
+
+        messages = F.relu(x.index_select(0, src) + projected_edges)
+
+        # Aggregate every relation in one scatter into fixed-shape
+        # (node, relation) buckets. Data-dependent indices are compile-safe;
+        # unlike boolean edge splitting, the output shape is not data-dependent.
+        flat_bucket = dst * num_buckets + edge_type
+        buckets = x.new_zeros((num_nodes * num_buckets, self.in_dim))
+        buckets.scatter_add_(
+            0, flat_bucket.unsqueeze(1).expand_as(messages), messages
+        )
+        buckets = buckets.view(num_nodes, num_buckets, self.in_dim)
+
+        # Apply the tied axis MLP to the stacked relation buckets in one call,
+        # then take the same symmetric sum as the old three-GINE loop.
+        axis_inputs = (
+            (1.0 + self.axis_conv.eps) * x.unsqueeze(1)
+            + buckets[:, : self.num_axes, :]
+        )
+        axis_outputs = self.axis_conv.nn(
+            axis_inputs.reshape(num_nodes * self.num_axes, self.in_dim)
+        )
+        agg = axis_outputs.view(
+            num_nodes, self.num_axes, self.out_dim
+        ).sum(dim=1)
+
+        # Preserve the old empty-global behavior exactly: skipping this branch
+        # leaves global parameters with grad=None, so AdamW cannot decay them on
+        # batches where the relation is absent.
+        if self.use_global and has_global_edges:
+            global_inputs = (
+                (1.0 + self.global_conv.eps) * x
+                + buckets.select(1, self.num_axes)
+            )
+            agg = agg + self.global_conv.nn(global_inputs)
 
         # Combine residual node features with the invariant message sum.
         return self.node_update(torch.cat([x, agg], dim=-1))

@@ -1,0 +1,95 @@
+# KLENT S1 large-cadence continuation from iteration 1000.
+#
+# Six iterations add 3,145,728 positions, closely matching the 3,276,800
+# positions used by each 100-iteration small-cadence ablation. The collection
+# and fitting batch are each one quarter of the KLENT paper's reference setup,
+# preserving its ratio of 512 optimizer steps per outer iteration.
+#
+# Resume:
+#   uv run hexo-klent train \
+#     --config configs/klent/ablation-s1-large-p524288-b1024-from-1000.toml \
+#     --resume runs/klent/reference-s1/checkpoints/final.pt
+
+[model]
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 2
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.03
+beta = 0.10
+tau = 8.0
+
+[collection]
+positions_per_iteration = 524_288
+parallel_games = 64
+inference_batch_size = 64
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 1_024
+edge_budget = 250_000
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 1
+
+[[evaluation.opponents]]
+name = "base_1000"
+kind = "checkpoint"
+checkpoint = "runs/klent/reference-s1/checkpoints/final.pt"
+games = 32
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "control_1100"
+kind = "checkpoint"
+checkpoint = "runs/klent/ablations/s1-control-a003-b010-from-1000/checkpoints/final.pt"
+games = 32
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[run]
+iterations = 1006
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/ablations/s1-large-p524288-b1024-from-1000"
+checkpoint_interval = 1
+seed = 0

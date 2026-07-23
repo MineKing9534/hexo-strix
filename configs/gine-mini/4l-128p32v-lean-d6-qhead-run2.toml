@@ -119,12 +119,12 @@ forcing_node_budget = 25000
 batch_size = 512
 edge_budget = 250_000
 grad_accumulation = true
-lr = 3e-5
+lr = 1e-3
 weight_decay = 0.0001
 max_grad_norm = 1.0
 lr_schedule = "constant"
 lr_min = 2e-05
-lr_warmup_steps = 0
+lr_warmup_steps = 2000
 total_train_steps = 12000
 step_delay = 0.0
 target_reuse = 8.0
@@ -135,7 +135,7 @@ pc_loss_weight = 0.0
 horizon_loss_weight = 0.25  # weight on the short-horizon value heads' aggregate CE
 q_loss_weight = 0.5         # *** ABLATION: weight on the train-only per-move Q head's masked MSE ***
 augment_symmetries = false  # redundant: the model is exactly D6-invariant
-buffer_capacity = 500000
+buffer_capacity = 2_000_000
 reanalyze_fraction = 0
 reanalyze_sims = 24
 reanalyze_m_actions = 8
@@ -212,68 +212,67 @@ workers = 8
 
 [run]
 device = "cuda"
-checkpoint_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints"
-log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead"
+checkpoint_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/checkpoints"
+log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2"
 compile = true
 fp16 = true
 
 # --- Curriculum stages (from scratch: W1 -> S4) ---
 
-[[curriculum.stages]]
-name = "W1: 4-in-a-row, radius 2"
-log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/w1-4-2"
-training_batch_size = 512
-game_win_length = 4
-game_placement_radius = 2
-game_max_moves = 20
-convergence_mode = "random"
-win_rate_threshold = 0.90
-patience = 5
-min_steps_per_stage = 0
-confirm_advance = false
-eval_sims = 0
-eval_interval = 200
-mcts_exploration_moves = 2
-mcts_exploration_fraction = 0
-
-[[curriculum.stages]]
-name = "W2: 5-in-a-row, radius 2"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/w2-5-2"
-training_batch_size = 512
-game_win_length = 5
-game_placement_radius = 2
-game_max_moves = 30
-convergence_mode = "random"
-win_rate_threshold = 0.90
-patience = 5
-min_steps_per_stage = 1000
-confirm_advance = false
-eval_sims = 0
-eval_interval = 200
-mcts_exploration_moves = 4
-mcts_exploration_fraction = 0
+# [[curriculum.stages]]
+# name = "W1: 4-in-a-row, radius 2"
+# log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/w1-4-2"
+# training_batch_size = 512
+# game_win_length = 4
+# game_placement_radius = 2
+# game_max_moves = 20
+# convergence_mode = "random"
+# win_rate_threshold = 0.90
+# patience = 5
+# min_steps_per_stage = 0
+# confirm_advance = false
+# eval_sims = 0
+# eval_interval = 200
+# mcts_exploration_moves = 2
+# mcts_exploration_fraction = 0
+#
+# [[curriculum.stages]]
+# name = "W2: 5-in-a-row, radius 2"
+# run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/w2-5-2"
+# training_batch_size = 512
+# game_win_length = 5
+# game_placement_radius = 2
+# game_max_moves = 30
+# convergence_mode = "random"
+# win_rate_threshold = 0.90
+# patience = 5
+# min_steps_per_stage = 1000
+# confirm_advance = false
+# eval_sims = 0
+# eval_interval = 200
+# mcts_exploration_moves = 4
+# mcts_exploration_fraction = 0
 
 [[curriculum.stages]]
 name = "S1: 6-in-a-row, radius 2"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s1-6-2"
+run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/s1-6-2"
 game_placement_radius = 2
 min_steps_per_stage = 20000
-confirm_advance = false
+confirm_advance = true
+self_play_model_update_interval = 500
 
 [[curriculum.stages]]
 name = "S2: 6-in-a-row, radius 4"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s2-6-4"
+run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/s2-6-4"
 game_placement_radius = 4
 min_steps_per_stage = 20000
-confirm_advance = false
-training_lr = 1e-4
-training_lr_min = 5e-6
+confirm_advance = true
 
 [[curriculum.stages]]
 name = "S3: 6-in-a-row, radius 6"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s3-6-6"
+run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/s3-6-6"
 game_placement_radius = 6
 
 [[curriculum.stages]]
 name = "S4: 6-in-a-row, radius 8 (FULL HEXO)"
-run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead/s4-6-8"
+run_log_dir = "runs/gine-mini/4l-128p32v-lean-d6-qhead-run2/s4-6-8"

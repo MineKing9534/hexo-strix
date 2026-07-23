@@ -72,3 +72,24 @@ def test_check_reports_heartbeated_exact_candidate(tmp_path):
     assert decision.candidate_step == 2000
     assert decision.latest_available_step == 3000
     assert decision.candidate_lag_steps == 1000
+
+
+def test_check_ignores_state_bound_to_replaced_champion(tmp_path):
+    watcher = _watcher(tmp_path)
+    watcher._started_at = 200.0
+    watcher.champion_path.write_bytes(b"old champion")
+    old = watcher.champion_path.stat()
+    payload = _payload(timestamp=300.0)
+    payload["champion_identity"] = {
+        "device": old.st_dev,
+        "inode": old.st_ino,
+        "size": old.st_size,
+        "mtime_ns": old.st_mtime_ns,
+    }
+    watcher.state_file.write_text(json.dumps(payload))
+
+    replacement = tmp_path / "replacement.pt"
+    replacement.write_bytes(b"new champion")
+    replacement.replace(watcher.champion_path)
+
+    assert watcher.check() is None

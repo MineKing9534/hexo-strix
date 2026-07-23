@@ -1,0 +1,95 @@
+# KLENT S1 lower-beta continuation: generations 1001-1100.
+#
+# Resume:
+#   uv run hexo-klent train \
+#     --config configs/klent/ablation-s1-beta-005-from-1000.toml \
+#     --resume runs/klent/reference-s1/checkpoints/final.pt
+
+[model]
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 2
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.03
+beta = 0.05
+tau = 8.0
+
+[collection]
+positions_per_iteration = 32_768
+parallel_games = 64
+inference_batch_size = 64
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 256
+edge_budget = 250_000
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 10
+
+[[evaluation.opponents]]
+name = "lag_500"
+kind = "lagged"
+lag_iterations = 500
+games = 16
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_250"
+kind = "lagged"
+lag_iterations = 250
+games = 16
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_100"
+kind = "lagged"
+lag_iterations = 100
+games = 16
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+iterations = 1100
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/ablations/s1-beta-005-from-1000"
+checkpoint_interval = 10
+seed = 0

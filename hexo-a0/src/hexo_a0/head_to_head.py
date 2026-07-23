@@ -135,7 +135,7 @@ def _score_to_elo(s: float, eps: float = 1e-6) -> float:
 class LoadedCheckpoint:
     """A model loaded onto a device alongside its ModelConfig and metadata."""
     path: Path
-    model: HeXONet
+    model: torch.nn.Module
     model_config: ModelConfig
     train_steps: int | str  # "?" if absent
 
@@ -149,14 +149,25 @@ def _torch_load(path: Path):
 
 
 def load_checkpoint(path: Path, device: torch.device) -> LoadedCheckpoint:
-    """Load a HeXONet checkpoint, reconstructing its ModelConfig from the file.
+    """Load a HeXONet or KLENT checkpoint and reconstruct its ModelConfig.
 
     The checkpoint **must** carry a ``model_config`` dict so we can rebuild
     the architecture; cross-config matches have no shared fallback to lean on.
+    KLENT checkpoints are wrapped with their derived policy/Q state value.
     """
     raw = _torch_load(path)
     if not isinstance(raw, dict):
         raise ValueError(f"Checkpoint {path} is not a dict-style state file")
+    if raw.get("format") == "hexo-klent-v1":
+        from hexo_klent.mcts_adapter import adapt_checkpoint
+
+        loaded = adapt_checkpoint(raw, device)
+        return LoadedCheckpoint(
+            path=path,
+            model=loaded.model,
+            model_config=loaded.model_config,
+            train_steps=loaded.iteration,
+        )
     mc_dict = raw.get("model_config")
     if not mc_dict:
         raise ValueError(

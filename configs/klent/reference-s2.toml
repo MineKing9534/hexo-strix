@@ -1,0 +1,125 @@
+# KLENT S2 continuation from the completed S1 middle-cadence run.
+#
+# S2 keeps win length 6 and expands collection from placement radius 2 to 4.
+# The first 50 iterations add 3,276,800 S2 positions. Resume explicitly from
+# the S1 final so the new output directory remains a clean S2 run:
+#
+#   uv run hexo-klent train \
+#     --config configs/klent/reference-s2.toml \
+#     --resume runs/klent/ablations/s1-middle-p131072-b512-from-1000/checkpoints/final.pt
+#
+# To extend the run later, resume from its own latest checkpoint. The
+# --iterations value is the number of additional iterations to run:
+#
+#   uv run hexo-klent train \
+#     --config configs/klent/reference-s2.toml \
+#     --resume latest \
+#     --iterations 100
+
+[model]
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 4
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.03
+beta = 0.10
+tau = 8.0
+
+[collection]
+# A trajectory-level split of a fresh 131,072-position S2 collection at
+# iteration 1252 found that each independent ~65k half retained about 535
+# games / 352 length-adjusted effective games. The halves closely matched in
+# game phase and graph-size distributions, while >99.6% of canonical ply-8
+# openings within each half were unique. Prefer the faster policy refresh.
+positions_per_iteration = 65_536
+parallel_games = 64
+inference_batch_size = 64
+# A controlled S2 replay from iteration 1250 found that 500k was slower than
+# 250k (649 vs 706 collected positions/s), despite larger packed batches.
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 512
+# A controlled two-iteration S2 replay found that 500k doubled mean microbatch
+# size but reduced warmed fit throughput (293 vs 315 positions/s). The larger
+# graphs are compute-bound enough that 250k remains the better measured point.
+edge_budget = 250_000
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 5
+
+[[evaluation.opponents]]
+name = "strix_live_s2_154000"
+kind = "checkpoint"
+# The Strix-live production log identifies step 154,000 as the promoted S2
+# champion. Use the immutable checkpoint because self_play/champion.pt has
+# since advanced through later curriculum stages.
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00154000.pt"
+games = 32
+placement_radius = 4
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_25"
+kind = "lagged"
+# A short lag becomes S2-vs-S2 within this initial 50-iteration block. At the
+# beginning it also measures transfer against the final S1 policy, but both
+# sides still play the S2 radius-4 game.
+lag_iterations = 25
+games = 32
+placement_radius = 4
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot_r8_d2"
+kind = "sealbot"
+games = 16
+depth = 2
+# SealBot is optimized for full HeXO, so preserve its radius-8 board.
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+iterations = 1300
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/reference-s2"
+checkpoint_interval = 5
+seed = 0

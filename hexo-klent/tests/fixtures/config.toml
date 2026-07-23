@@ -1,0 +1,74 @@
+[model]
+hidden_dim = 8
+num_layers = 1
+num_heads = 1
+policy_hidden = 8
+q_hidden = 4
+graph_type = "axis"
+prune_empty_edges = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+
+[game]
+win_length = 6
+placement_radius = 2
+rollout_horizon = 12
+
+[algorithm]
+alpha = 0.03
+beta = 0.1
+tau = 8.0
+
+[collection]
+positions_per_iteration = 16
+parallel_games = 4
+inference_batch_size = 4
+inference_edge_budget = 100
+workers = 2
+batch_timeout_ms = 0.0
+
+[training]
+batch_size = 8
+edge_budget = 100
+grad_accumulation = true
+prefetch_batches = false
+learning_rate = 1e-3
+weight_decay = 0.0
+q_loss_weight = 1.0
+max_grad_norm = 1.0
+
+[evaluation]
+interval = 2
+
+[[evaluation.opponents]]
+name = "random"
+kind = "random"
+games = 4
+
+[[evaluation.opponents]]
+name = "sealbot_raw"
+kind = "sealbot"
+games = 2
+depth = 1
+placement_radius = 8
+
+[[evaluation.opponents]]
+name = "sealbot_mcts4/2"
+kind = "sealbot"
+games = 2
+depth = 1
+placement_radius = 8
+mcts_simulations = 4
+mcts_actions = 2
+
+[run]
+iterations = 2
+device = "cpu"
+precision = "float32"
+compile = false
+output_dir = "test-output"
+checkpoint_interval = 0
+seed = 7

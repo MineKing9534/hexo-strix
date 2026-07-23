@@ -299,9 +299,13 @@ class TestDefaultCurriculumToml:
 
 class TestRealConfigs:
     def test_real_configs_load_without_warnings(self, caplog):
-        """Every real config file under configs/ (recursing into subfolders) loads without unknown-key warnings."""
+        """Every AlphaZero config loads without unknown-key warnings."""
         configs_dir = Path(__file__).parents[2] / "configs"
-        toml_files = sorted(configs_dir.rglob("*.toml"))
+        toml_files = sorted(
+            path
+            for path in configs_dir.rglob("*.toml")
+            if "klent" not in path.relative_to(configs_dir).parts
+        )
         assert len(toml_files) > 0, "No config files found"
         for path in toml_files:
             caplog.clear()

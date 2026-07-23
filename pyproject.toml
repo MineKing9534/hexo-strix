@@ -39,7 +39,7 @@ conflicts = [
 ]
 
 [tool.uv.workspace]
-members = ["hexo-a0", "hexo-rs"]
+members = ["hexo-a0", "hexo-klent", "hexo-rs"]
 
 [[tool.uv.index]]
 name = "pytorch-cuda"

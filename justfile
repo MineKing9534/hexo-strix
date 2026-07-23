@@ -104,7 +104,7 @@ test-rust:
       cargo test -p hexo-mcts --features torch
 
 test-python:
-    uv run --no-sync pytest hexo-a0/tests/ --tb=short
+    uv run --no-sync pytest hexo-a0/tests/ hexo-klent/tests/ --tb=short
 
 # Run tests including GPU tests
 test-all:

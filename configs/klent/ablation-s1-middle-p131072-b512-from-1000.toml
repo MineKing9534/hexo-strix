@@ -1,0 +1,142 @@
+# KLENT S1 middle-cadence continuation from iteration 1000.
+#
+# Twenty-five iterations add exactly 3,276,800 positions, matching the
+# 100-iteration small-cadence control. This is the geometric midpoint between
+# the original 32,768/256 and paper-shaped 524,288/1,024 configurations:
+# four times the positions per policy refresh and twice the fitting batch.
+#
+# Resume:
+#   uv run hexo-klent train \
+#     --config configs/klent/ablation-s1-middle-p131072-b512-from-1000.toml \
+#     --resume runs/klent/reference-s1/checkpoints/final.pt
+
+[model]
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 2
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.03
+beta = 0.10
+tau = 8.0
+
+[collection]
+positions_per_iteration = 131_072
+parallel_games = 64
+inference_batch_size = 64
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 512
+edge_budget = 250_000
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 5
+
+[[evaluation.opponents]]
+name = "base_1000"
+kind = "checkpoint"
+checkpoint = "runs/klent/reference-s1/checkpoints/final.pt"
+games = 32
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "control_1100"
+kind = "checkpoint"
+checkpoint = "runs/klent/ablations/s1-control-a003-b010-from-1000/checkpoints/final.pt"
+games = 32
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "beta_005_1100"
+kind = "checkpoint"
+checkpoint = "runs/klent/ablations/s1-beta-005-from-1000/checkpoints/final.pt"
+games = 16
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "large_1006"
+kind = "checkpoint"
+checkpoint = "runs/klent/ablations/s1-large-p524288-b1024-from-1000/checkpoints/final.pt"
+games = 16
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "strix_jkcat_rel2_s1_80400"
+kind = "checkpoint"
+# The production S1 log identifies step 80,400 as the stage champion. Use the
+# immutable checkpoint because self_play/champion.pt now belongs to a later
+# jkcat-rel2 curriculum stage.
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00080400.pt"
+games = 16
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot_mcts24/8"
+kind = "sealbot"
+games = 16
+depth = 2
+# SealBot is optimized for full HeXO rather than KLENT's radius-2 collection
+# rules, so keep its established evaluation board at radius 8.
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+iterations = 1025
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/ablations/s1-middle-p131072-b512-from-1000"
+checkpoint_interval = 5
+seed = 0

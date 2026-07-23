@@ -1,0 +1,24 @@
+[project]
+name = "hexo-klent"
+version = "0.1.0"
+description = "Reference KLENT self-play experiment for HeXO"
+readme = "README.md"
+authors = [
+    { name = "Dan Eagle", email = "dan@tyto.cc" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "hexo-a0[train]",
+    "hexo-rs",
+    "rich>=14.0",
+]
+
+[project.scripts]
+hexo-klent = "hexo_klent.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.2,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
