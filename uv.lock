@@ -18,6 +18,7 @@ conflicts = [[
 members = [
     "hexo",
     "hexo-a0",
+    "hexo-axis-models",
     "hexo-klent",
     "hexo-rs",
 ]
@@ -849,11 +850,30 @@ provides-extras = ["viewer", "train"]
 dev = [{ name = "pytest", specifier = ">=8.0" }]
 
 [[package]]
+name = "hexo-axis-models"
+version = "0.1.0"
+source = { editable = "hexo-axis-kit/python" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'group-4-hexo-cpu') or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-cuda') or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-rocm') or (extra == 'group-4-hexo-cuda' and extra == 'group-4-hexo-rocm')" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'group-4-hexo-cpu') or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-cuda') or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-rocm') or (extra == 'group-4-hexo-cuda' and extra == 'group-4-hexo-rocm')" },
+    { name = "torch", version = "2.11.0+rocm7.2", source = { registry = "https://download.pytorch.org/whl/rocm7.2" }, marker = "(extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-cuda') or (extra != 'group-4-hexo-cuda' and extra == 'group-4-hexo-rocm') or (extra != 'group-4-hexo-cpu' and extra == 'group-4-hexo-rocm')" },
+    { name = "torch", version = "2.12.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'group-4-hexo-cuda' or (extra == 'group-4-hexo-cpu' and extra == 'group-4-hexo-rocm') or (extra != 'group-4-hexo-cpu' and extra != 'group-4-hexo-rocm')" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "numpy", specifier = ">=2.0" },
+    { name = "torch", specifier = ">=2.10" },
+]
+
+[[package]]
 name = "hexo-klent"
 version = "0.1.0"
 source = { editable = "hexo-klent" }
 dependencies = [
     { name = "hexo-a0", extra = ["train"] },
+    { name = "hexo-axis-models" },
     { name = "hexo-rs" },
     { name = "rich" },
 ]
@@ -866,6 +886,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "hexo-a0", extras = ["train"], editable = "hexo-a0" },
+    { name = "hexo-axis-models", editable = "hexo-axis-kit/python" },
     { name = "hexo-rs", editable = "hexo-rs" },
     { name = "rich", specifier = ">=14.0" },
 ]

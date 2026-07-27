@@ -1,0 +1,118 @@
+# Dense KLENT from-scratch curriculum: S2 (win length 6, radius 4).
+#
+# Start only after S1 has completed:
+#
+#   uv run hexo-klent train \
+#     --config configs/klent/dense-from-scratch/s2.toml \
+#     --resume runs/klent/dense-from-scratch/s1/checkpoints/final.pt
+#
+# The configured target is generation 1500, adding 400 S2 updates after the
+# 100 W1 + 1000 S1 updates. Continue later with `--resume latest`.
+
+[model]
+architecture = "dense_axis"
+dense_ray_radius = 5
+
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 4
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.03
+beta = 0.10
+tau = 8.0
+
+[collection]
+# S2 diversity measurements supported more frequent refreshes than S1 while
+# retaining broad opening and game-phase coverage.
+positions_per_iteration = 65_536
+parallel_games = 64
+inference_batch_size = 64
+inference_edge_budget = 1_000_000
+dense_position_cell_limit = 200_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 512
+edge_budget = 200_000
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 10
+
+[[evaluation.opponents]]
+name = "reference_s2_final"
+kind = "checkpoint"
+checkpoint = "runs/klent/reference-s2/checkpoints/final.pt"
+games = 32
+placement_radius = 4
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "strix_live_s2_154000"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00154000.pt"
+games = 32
+placement_radius = 4
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_25"
+kind = "lagged"
+lag_iterations = 25
+games = 32
+placement_radius = 4
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_100"
+kind = "lagged"
+lag_iterations = 100
+games = 32
+placement_radius = 4
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+iterations = 1_500
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/dense-from-scratch/s2"
+checkpoint_interval = 5
+seed = 0

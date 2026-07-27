@@ -39,7 +39,7 @@ conflicts = [
 ]
 
 [tool.uv.workspace]
-members = ["hexo-a0", "hexo-klent", "hexo-rs"]
+members = ["hexo-a0", "hexo-axis-kit/python", "hexo-klent", "hexo-rs"]
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
@@ -64,6 +64,7 @@ torch = [
 ]
 triton-rocm = { index = "pytorch-rocm" }
 hexo-a0 = { workspace = true }
+hexo-axis-models = { workspace = true }
 hexo-rs = { workspace = true }
 
 [tool.pytest.ini_options]

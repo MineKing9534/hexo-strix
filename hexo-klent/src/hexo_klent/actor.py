@@ -17,7 +17,13 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from hexo_klent.batching import move_batch_to_device, prepare_graph_batches
+from hexo_klent.batching import (
+    move_batch_to_device,
+    order_states_for_batching,
+    prepare_graph_batches,
+    raster_shape,
+    restore_state_order,
+)
 from hexo_klent.config import AlgorithmConfig
 from hexo_klent.model import KlentNet, improved_policy
 from hexo_klent.returns import lambda_returns
@@ -41,6 +47,7 @@ class Trajectory:
     steps: list[TrajectoryStep]
     winner: str | None = None
     truncated: bool = False
+    spatial_truncated: bool = False
     chunk_truncated: bool = False
     bootstrap_value: float | None = None
 
@@ -53,7 +60,9 @@ class CollectionStats:
     p2_wins: int
     truncations: int
     horizon_truncations: int
+    spatial_truncations: int
     chunk_truncations: int
+    max_dense_position_cells: int
     mean_game_length: float
     mean_entropy: float
     mean_normalized_entropy: float
@@ -120,6 +129,7 @@ def _collect_with_inference(
     algorithm: AlgorithmConfig,
     positions: int,
     parallel_games: int,
+    dense_position_cell_limit: int,
     seed: int | None,
     worker_processes: int,
 ) -> tuple[list[Trajectory], CollectionStats]:
@@ -155,6 +165,15 @@ def _collect_with_inference(
     abs_q_sum = 0.0
     q_span_sum = 0.0
     position_count = 0
+    max_dense_position_cells = 0
+    if dense_position_cell_limit > 0:
+        initial_height, initial_width = raster_shape(active[0][0])
+        max_dense_position_cells = initial_height * initial_width
+        if max_dense_position_cells > dense_position_cell_limit:
+            raise ValueError(
+                "dense_position_cell_limit is smaller than the initial "
+                f"raster ({max_dense_position_cells} cells)"
+            )
 
     with torch.no_grad():
         while position_count < positions:
@@ -270,6 +289,24 @@ def _collect_with_inference(
                 elif game.move_count() >= game_config.rollout_horizon:
                     trajectory.truncated = True
                     pending_bootstraps.append((game, trajectory))
+                elif dense_position_cell_limit > 0:
+                    height, width = raster_shape(game)
+                    successor_cells = height * width
+                    if successor_cells > dense_position_cell_limit:
+                        # Dense execution scales with the padded bounding box,
+                        # not the number of live nodes. This is a standard
+                        # value-bootstrap boundary, never a synthetic draw:
+                        # the just-recorded state remains exact and the
+                        # over-spread successor is used only for bootstrapping.
+                        trajectory.truncated = True
+                        trajectory.spatial_truncated = True
+                        pending_bootstraps.append((game, trajectory))
+                    else:
+                        max_dense_position_cells = max(
+                            max_dense_position_cells,
+                            successor_cells,
+                        )
+                        next_active.append((game, trajectory))
                 else:
                     next_active.append((game, trajectory))
 
@@ -330,8 +367,11 @@ def _collect_with_inference(
     p1_wins = sum(item.winner == "P1" for item in completed)
     p2_wins = sum(item.winner == "P2" for item in completed)
     truncations = sum(item.truncated for item in completed)
+    spatial_truncations = sum(item.spatial_truncated for item in completed)
     chunk_truncations = sum(item.chunk_truncated for item in completed)
-    horizon_truncations = truncations - chunk_truncations
+    horizon_truncations = (
+        truncations - spatial_truncations - chunk_truncations
+    )
     bootstrap_values = [
         abs(float(trajectory.bootstrap_value))
         for trajectory in completed
@@ -351,7 +391,9 @@ def _collect_with_inference(
         p2_wins=p2_wins,
         truncations=truncations,
         horizon_truncations=horizon_truncations,
+        spatial_truncations=spatial_truncations,
         chunk_truncations=chunk_truncations,
+        max_dense_position_cells=max_dense_position_cells,
         mean_game_length=sum(lengths) / max(len(lengths), 1),
         mean_entropy=entropy_sum / denominator,
         mean_normalized_entropy=normalized_entropy_sum / denominator,
@@ -385,6 +427,8 @@ def collect_games(
     parallel_games: int,
     inference_batch_size: int,
     device: torch.device,
+    inference_edge_budget: int = 0,
+    dense_position_cell_limit: int = 0,
     precision: str = "float32",
     seed: int | None = None,
 ) -> tuple[list[Trajectory], CollectionStats]:
@@ -401,20 +445,27 @@ def collect_games(
         q_values: list[Tensor] = []
         for start in range(0, len(states), inference_batch_size):
             chunk = states[start : start + inference_batch_size]
-            [(batch_cpu, _state_slice)] = prepare_graph_batches(
-                chunk,
-                model_config=model_config,
-                edge_budget=0,
+            ordered, source_indices = order_states_for_batching(
+                chunk, model_config
             )
-            batch = move_batch_to_device(batch_cpu, device)
-            with _autocast(device, precision):
-                output = model.forward_batch(batch)
-            counts = [
-                int(item)
-                for item in output.legal_counts.detach().cpu().tolist()
-            ]
-            logits.extend(output.policy_logits.split(counts))
-            q_values.extend(output.q_values.split(counts))
+            ordered_logits: list[Tensor] = []
+            ordered_q: list[Tensor] = []
+            for batch_cpu, _state_slice in prepare_graph_batches(
+                ordered,
+                model_config=model_config,
+                edge_budget=inference_edge_budget,
+            ):
+                batch = move_batch_to_device(batch_cpu, device)
+                with torch.inference_mode(), _autocast(device, precision):
+                    output = model.forward_batch(batch)
+                counts = [
+                    int(item)
+                    for item in output.legal_counts.detach().cpu().tolist()
+                ]
+                ordered_logits.extend(output.policy_logits.split(counts))
+                ordered_q.extend(output.q_values.split(counts))
+            logits.extend(restore_state_order(ordered_logits, source_indices))
+            q_values.extend(restore_state_order(ordered_q, source_indices))
         return logits, q_values
 
     try:
@@ -424,6 +475,7 @@ def collect_games(
             algorithm=algorithm,
             positions=positions,
             parallel_games=parallel_games,
+            dense_position_cell_limit=dense_position_cell_limit,
             seed=seed,
             worker_processes=1,
         )
@@ -437,6 +489,7 @@ class _CollectTask:
     algorithm: AlgorithmConfig
     positions: int
     parallel_games: int
+    dense_position_cell_limit: int
     seed: int | None
 
 
@@ -541,6 +594,7 @@ def _actor_worker_main(
                 algorithm=task.algorithm,
                 positions=task.positions,
                 parallel_games=task.parallel_games,
+                dense_position_cell_limit=task.dense_position_cell_limit,
                 seed=task.seed,
                 worker_processes=1,
             )
@@ -596,7 +650,12 @@ def _merge_worker_results(
         p2_wins=sum(item.p2_wins for item in stats),
         truncations=truncations,
         horizon_truncations=sum(item.horizon_truncations for item in stats),
+        spatial_truncations=sum(item.spatial_truncations for item in stats),
         chunk_truncations=sum(item.chunk_truncations for item in stats),
+        max_dense_position_cells=max(
+            (item.max_dense_position_cells for item in stats),
+            default=0,
+        ),
         mean_game_length=(
             sum(item.mean_game_length * item.games for item in stats)
             / max(games, 1)
@@ -699,31 +758,38 @@ class SharedInferenceActors:
         response_queues: list,
     ) -> None:
         states = [state for request in requests for state in request.states]
+        ordered_states, source_indices = order_states_for_batching(
+            states, model_config
+        )
         graph_batches = []
-        for start in range(0, len(states), inference_batch_size):
+        for start in range(0, len(ordered_states), inference_batch_size):
             graph_batches.extend(
                 prepare_graph_batches(
-                    states[start : start + inference_batch_size],
+                    ordered_states[start : start + inference_batch_size],
                     model_config=model_config,
                     edge_budget=inference_edge_budget,
                 )
             )
 
-        legal_counts: list[int] = []
-        logits_parts: list[Tensor] = []
-        q_parts: list[Tensor] = []
+        ordered_logits: list[Tensor] = []
+        ordered_q: list[Tensor] = []
         for batch_cpu, _state_slice in graph_batches:
             batch = move_batch_to_device(batch_cpu, device)
-            with _autocast(device, precision):
+            with torch.inference_mode(), _autocast(device, precision):
                 output = model.forward_batch(batch)
-            legal_counts.extend(
+            counts = [
                 int(item)
                 for item in output.legal_counts.detach().cpu().tolist()
+            ]
+            ordered_logits.extend(
+                output.policy_logits.detach().float().cpu().split(counts)
             )
-            logits_parts.append(
-                output.policy_logits.detach().float().cpu()
+            ordered_q.extend(
+                output.q_values.detach().float().cpu().split(counts)
             )
-            q_parts.append(output.q_values.detach().float().cpu())
+        logits_parts = restore_state_order(ordered_logits, source_indices)
+        q_parts = restore_state_order(ordered_q, source_indices)
+        legal_counts = [int(part.numel()) for part in logits_parts]
         logits = torch.cat(logits_parts).numpy()
         q_values = torch.cat(q_parts).numpy()
 
@@ -763,6 +829,7 @@ class SharedInferenceActors:
         device: torch.device,
         precision: str,
         seed: int | None,
+        dense_position_cell_limit: int = 0,
     ) -> tuple[list[Trajectory], CollectionStats]:
         """Collect one frozen generation while serving all actor requests."""
 
@@ -792,6 +859,7 @@ class SharedInferenceActors:
                     algorithm=algorithm,
                     positions=shard_positions,
                     parallel_games=shard_lanes,
+                    dense_position_cell_limit=dense_position_cell_limit,
                     seed=None if seed is None else seed + index * 1_000_003,
                 )
             )
@@ -942,6 +1010,7 @@ def collect_games_parallel(
     workers: int,
     batch_timeout_ms: float,
     device: torch.device,
+    dense_position_cell_limit: int = 0,
     precision: str = "float32",
     seed: int | None = None,
     actors: SharedInferenceActors | None = None,
@@ -957,6 +1026,8 @@ def collect_games_parallel(
             positions=positions,
             parallel_games=parallel_games,
             inference_batch_size=inference_batch_size,
+            inference_edge_budget=inference_edge_budget,
+            dense_position_cell_limit=dense_position_cell_limit,
             device=device,
             precision=precision,
             seed=seed,
@@ -974,6 +1045,7 @@ def collect_games_parallel(
             parallel_games=parallel_games,
             inference_batch_size=inference_batch_size,
             inference_edge_budget=inference_edge_budget,
+            dense_position_cell_limit=dense_position_cell_limit,
             batch_timeout_ms=batch_timeout_ms,
             device=device,
             precision=precision,

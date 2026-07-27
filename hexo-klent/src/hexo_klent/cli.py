@@ -66,9 +66,17 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     train = subparsers.add_parser("train", help="run synchronous KLENT training")
     train.add_argument("--config", required=True, help="TOML configuration")
-    train.add_argument(
+    checkpoint_source = train.add_mutually_exclusive_group()
+    checkpoint_source.add_argument(
         "--resume",
         help="checkpoint path to resume, or 'latest' in run.output_dir",
+    )
+    checkpoint_source.add_argument(
+        "--init-from",
+        help=(
+            "production Axis-GINE Q-head checkpoint used to initialize a new "
+            "dense KLENT run"
+        ),
     )
     train.add_argument("--device", help="override run.device")
     train.add_argument("--output-dir", help="override run.output_dir")
@@ -174,6 +182,7 @@ def main(argv: list[str] | None = None) -> None:
                 config,
                 tensorboard=not args.no_tensorboard,
                 resume=resume,
+                init_from=args.init_from,
                 display=dashboard,
             )
             trainer.run(args.iterations)

@@ -2,13 +2,30 @@ use rustc_hash::FxHashMap as HashMap;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 
 use hexo_engine::game::{GameConfig, GameState, MoveError};
 use hexo_engine::types::{Coord, Player};
 
 use crate::mcts::gumbel_mcts;
 use crate::mcts::MCTSConfig;
+
+/// Keep MCTS structurally valid after a Python evaluator failure so the
+/// wrapper can return the original Python exception instead of panicking while
+/// descending through an expanded node with no children.
+fn fallback_eval(states: &[GameState]) -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+    let logits = states
+        .iter()
+        .map(|state| {
+            state
+                .legal_moves()
+                .into_iter()
+                .map(|action| (action, 0.0))
+                .collect()
+        })
+        .collect();
+    (logits, vec![0.0; states.len()])
+}
 
 fn player_str(p: Player) -> &'static str {
     match p {
@@ -418,8 +435,7 @@ fn py_gumbel_mcts(
             Ok(r) => r,
             Err(e) => {
                 eval_error = Some(e);
-                let dummy = states.iter().map(|_| HashMap::default()).collect();
-                return (dummy, vec![0.0; states.len()]);
+                return fallback_eval(states);
             }
         };
 
@@ -429,8 +445,7 @@ fn py_gumbel_mcts(
             Ok(v) => v,
             Err(e) => {
                 eval_error = Some(e.into());
-                let dummy = states.iter().map(|_| HashMap::default()).collect();
-                return (dummy, vec![0.0; states.len()]);
+                return fallback_eval(states);
             }
         };
 
@@ -576,8 +591,7 @@ fn py_gumbel_mcts_with_stats(
             Ok(r) => r,
             Err(e) => {
                 eval_error = Some(e);
-                let dummy = states.iter().map(|_| HashMap::default()).collect();
-                return (dummy, vec![0.0; states.len()]);
+                return fallback_eval(states);
             }
         };
 
@@ -586,8 +600,7 @@ fn py_gumbel_mcts_with_stats(
             Ok(v) => v,
             Err(e) => {
                 eval_error = Some(e.into());
-                let dummy = states.iter().map(|_| HashMap::default()).collect();
-                return (dummy, vec![0.0; states.len()]);
+                return fallback_eval(states);
             }
         };
 
@@ -683,8 +696,7 @@ fn py_gumbel_mcts_with_diagnostics(
             Ok(r) => r,
             Err(e) => {
                 eval_error = Some(e);
-                let dummy = states.iter().map(|_| HashMap::default()).collect();
-                return (dummy, vec![0.0; states.len()]);
+                return fallback_eval(states);
             }
         };
 
@@ -693,8 +705,7 @@ fn py_gumbel_mcts_with_diagnostics(
             Ok(v) => v,
             Err(e) => {
                 eval_error = Some(e.into());
-                let dummy = states.iter().map(|_| HashMap::default()).collect();
-                return (dummy, vec![0.0; states.len()]);
+                return fallback_eval(states);
             }
         };
 
@@ -1582,6 +1593,137 @@ fn py_game_states_to_axis_batch_bytes(
     Ok(dict.into())
 }
 
+/// Rasterise a batch of states into the dense HXR1 wire format.
+///
+/// Positions with different crop buckets are centred and zero-padded to the
+/// largest shape in the request, preserving input and legal-action order.
+#[pyfunction(
+    name = "game_states_to_raster_batch_hxr1",
+    signature = (states, ray_radius=5, prune_empty_edges=true)
+)]
+fn py_game_states_to_raster_batch_hxr1(
+    py: Python<'_>,
+    states: Vec<Py<PyGameState>>,
+    ray_radius: u8,
+    prune_empty_edges: bool,
+) -> PyResult<Py<PyBytes>> {
+    use hexo_raster::{build_raster, RasterBatch, RasterSpec};
+    use rayon::prelude::*;
+
+    let inner_states = collect_inner_states(py, &states)?;
+    let encoded = py
+        .detach(|| {
+            let spec = RasterSpec {
+                ray_radius,
+                prune_empty_edges,
+                ..RasterSpec::default()
+            };
+            let positions = inner_states
+                .par_iter()
+                .map(|state| build_raster(state, &spec))
+                .collect::<Result<Vec<_>, _>>()?;
+            RasterBatch::from_positions(&positions).map(|batch| batch.encode_hxr1())
+        })
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(PyBytes::new(py, &encoded).unbind())
+}
+
+/// Rasterise states into contiguous, same-shape HXR1 microbatches.
+///
+/// The returned tuples are `(payload, start, end)`, where `[start, end)` is a
+/// slice of the input states. A new batch starts whenever the crop bucket
+/// changes or adding another position would exceed `cell_budget`. Keeping
+/// unlike shapes separate prevents one spatially wide game from padding every
+/// other position in an inference request.
+#[pyfunction(
+    name = "game_states_to_raster_batches_hxr1",
+    signature = (states, ray_radius=5, prune_empty_edges=true, cell_budget=0)
+)]
+fn py_game_states_to_raster_batches_hxr1(
+    py: Python<'_>,
+    states: Vec<Py<PyGameState>>,
+    ray_radius: u8,
+    prune_empty_edges: bool,
+    cell_budget: usize,
+) -> PyResult<Vec<(Py<PyBytes>, usize, usize)>> {
+    use hexo_raster::{
+        build_raster, raster_dimensions, RasterBatch, RasterError, RasterSpec,
+    };
+    use rayon::prelude::*;
+
+    let inner_states = collect_inner_states(py, &states)?;
+    let encoded = py
+        .detach(|| {
+            let spec = RasterSpec {
+                ray_radius,
+                prune_empty_edges,
+                ..RasterSpec::default()
+            };
+            let shapes = inner_states
+                .par_iter()
+                .map(|state| raster_dimensions(state, &spec))
+                .collect::<Result<Vec<_>, _>>()?;
+            if shapes.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut ranges = Vec::new();
+            let mut start = 0;
+            let mut cells_in_batch = 0usize;
+            let mut shape = shapes[0];
+            for (index, &position_shape) in shapes.iter().enumerate() {
+                let position_cells =
+                    usize::from(position_shape.0) * usize::from(position_shape.1);
+                if cell_budget > 0 && position_cells > cell_budget {
+                    return Err(RasterError::PositionCellBudgetExceeded {
+                        width: position_shape.0,
+                        height: position_shape.1,
+                        cells: position_cells,
+                        budget: cell_budget,
+                    });
+                }
+                let shape_changed = index > start && position_shape != shape;
+                let budget_exceeded = index > start
+                    && cell_budget > 0
+                    && cells_in_batch.saturating_add(position_cells) > cell_budget;
+                if shape_changed || budget_exceeded {
+                    ranges.push((start, index));
+                    start = index;
+                    cells_in_batch = 0;
+                    shape = position_shape;
+                }
+                cells_in_batch = cells_in_batch.saturating_add(position_cells);
+            }
+            ranges.push((start, shapes.len()));
+
+            // Materialise and encode one already-budgeted range at a time.
+            // Building every raster in an outer training chunk before
+            // applying the budget can exhaust memory when shuffled late-game
+            // positions have wide, mostly-empty bounding boxes.
+            ranges
+                .into_iter()
+                .map(|(range_start, range_end)| {
+                    let positions = inner_states[range_start..range_end]
+                        .par_iter()
+                        .map(|state| build_raster(state, &spec))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let payload =
+                        RasterBatch::from_positions(&positions)?
+                            .encode_hxr1();
+                    Ok((payload, range_start, range_end))
+                })
+                .collect::<Result<Vec<_>, RasterError>>()
+        })
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+
+    Ok(encoded
+        .into_iter()
+        .map(|(payload, start, end)| {
+            (PyBytes::new(py, &payload).unbind(), start, end)
+        })
+        .collect())
+}
+
 /// Collate D6-augmented AXIS graphs for a batch of states into flat
 /// native-endian byte buffers (same layout as `game_states_to_axis_batch_bytes`),
 /// plus per-state policy permutations for training-time reconstruction.
@@ -1898,6 +2040,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_game_to_graph_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_states_to_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_states_to_axis_batch_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(py_game_states_to_raster_batch_hxr1, m)?)?;
+    m.add_function(wrap_pyfunction!(py_game_states_to_raster_batches_hxr1, m)?)?;
     m.add_function(wrap_pyfunction!(py_augment_axis_states_to_batch_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_axis_graph_raw, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_axis_graph_batch, m)?)?;

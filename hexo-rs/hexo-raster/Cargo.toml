@@ -1,0 +1,11 @@
+[package]
+name = "hexo-raster"
+version = "0.1.0"
+edition = "2024"
+authors = ["SootyOwl", "OpenAI"]
+description = "Dense axial-raster and blocker-aware ray-mask representation for HeXO"
+license = "MIT"
+publish = false
+
+[dependencies]
+hexo-engine = { path = "../hexo-engine" }

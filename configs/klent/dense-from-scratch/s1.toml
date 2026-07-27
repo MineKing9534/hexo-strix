@@ -1,0 +1,145 @@
+# Dense KLENT from-scratch curriculum: S1 (win length 6, radius 2).
+#
+# Start only after W1 has completed. `--resume` carries the dense model,
+# optimizer, generation 100, and W1 checkpoint history into this new output:
+#
+#   uv run hexo-klent train \
+#     --config configs/klent/dense-from-scratch/s1.toml \
+#     --resume runs/klent/dense-from-scratch/w1/checkpoints/final.pt
+#
+# The configured target is generation 1040: 40 W1 updates followed by 1000
+# S1 updates. Continue an interrupted S1 run with `--resume latest`.
+
+[model]
+architecture = "dense_axis"
+dense_ray_radius = 5
+
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 2
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.03
+beta = 0.10
+tau = 8.0
+
+[collection]
+# The established middle-cadence S1 run gave better positional coverage while
+# remaining practical; the dense backend makes its larger fresh batch cheaper.
+positions_per_iteration = 131_072
+parallel_games = 64
+inference_batch_size = 64
+inference_edge_budget = 1_000_000
+dense_position_cell_limit = 200_000
+workers = 8
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 512
+edge_budget = 200_000
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 10
+
+[[evaluation.opponents]]
+name = "random"
+kind = "random"
+games = 64
+
+[[evaluation.opponents]]
+name = "reference_s1_final"
+kind = "checkpoint"
+checkpoint = "runs/klent/reference-s1/checkpoints/final.pt"
+games = 32
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_25"
+kind = "lagged"
+lag_iterations = 25
+games = 32
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_100"
+kind = "lagged"
+lag_iterations = 100
+games = 32
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot-d2_raw"
+kind = "sealbot"
+games = 16
+depth = 2
+placement_radius = 8
+mcts_simulations = 0
+mcts_actions = 16
+
+[[evaluation.opponents]]
+name = "sealbot-d2_mcts24/8"
+kind = "sealbot"
+games = 16
+depth = 2
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "strix_jkcat_rel2_s1_80400"
+kind = "checkpoint"
+# The production S1 log identifies step 80,400 as the stage champion. Use the
+# immutable checkpoint because self_play/champion.pt now belongs to a later
+# jkcat-rel2 curriculum stage.
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00080400.pt"
+games = 16
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[run]
+iterations = 1_040
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/dense-from-scratch/s1"
+checkpoint_interval = 5
+seed = 0

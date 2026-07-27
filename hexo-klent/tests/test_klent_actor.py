@@ -7,6 +7,7 @@ from hexo_a0.config import ModelConfig
 from hexo_klent.actor import (
     SharedInferenceActors,
     _actor_worker_main,
+    _collect_with_inference,
     collect_games,
     collect_games_parallel,
     flatten_trajectories,
@@ -95,6 +96,45 @@ def test_collect_games_produces_exact_position_budget_with_fresh_targets():
     assert stats.mean_q_span == pytest.approx(0.0)
 
 
+def test_collection_model_forward_runs_in_inference_mode():
+    model_config = tiny_model_config()
+    model = KlentNet(model_config)
+    original_forward = model.forward_batch
+    inference_states = []
+
+    def recording_forward(batch):
+        inference_states.append(
+            (
+                torch.is_grad_enabled(),
+                torch.is_inference_mode_enabled(),
+            )
+        )
+        return original_forward(batch)
+
+    model.forward_batch = recording_forward
+    collect_games(
+        model,
+        model_config=model_config,
+        game_config=GameConfig(
+            win_length=2,
+            placement_radius=1,
+            rollout_horizon=2,
+        ),
+        algorithm=AlgorithmConfig(),
+        positions=4,
+        parallel_games=2,
+        inference_batch_size=2,
+        device=torch.device("cpu"),
+        seed=11,
+    )
+
+    assert inference_states
+    assert all(
+        not grad_enabled and inference_enabled
+        for grad_enabled, inference_enabled in inference_states
+    )
+
+
 def test_rollout_horizon_bootstraps_instead_of_creating_a_draw():
     model_config = tiny_model_config()
     model = KlentNet(model_config)
@@ -155,6 +195,57 @@ def test_position_boundary_bootstraps_live_games():
     assert stats.mean_abs_bootstrap_value == pytest.approx(0.25)
     assert sorted(len(trajectory.steps) for trajectory in trajectories) == [1, 2]
     assert all(trajectory.chunk_truncated for trajectory in trajectories)
+    assert all(
+        abs(trajectory.steps[-1].return_target) == pytest.approx(0.25)
+        for trajectory in trajectories
+    )
+
+
+def test_dense_spatial_boundary_bootstraps_wandering_games():
+    def frontier_inference(states):
+        logits = []
+        q_values = []
+        for state in states:
+            legal = state.legal_moves()
+            frontier = max(
+                range(len(legal)),
+                key=lambda index: (
+                    abs(legal[index][0]) + abs(legal[index][1]),
+                    legal[index],
+                ),
+            )
+            state_logits = torch.full((len(legal),), -100.0)
+            state_logits[frontier] = 100.0
+            logits.append(state_logits)
+            q_values.append(torch.full((len(legal),), 0.25))
+        return logits, q_values
+
+    trajectories, stats = _collect_with_inference(
+        frontier_inference,
+        game_config=GameConfig(
+            win_length=6,
+            placement_radius=6,
+            rollout_horizon=20,
+        ),
+        algorithm=AlgorithmConfig(),
+        positions=2,
+        parallel_games=2,
+        dense_position_cell_limit=17 * 17,
+        seed=29,
+        worker_processes=1,
+    )
+
+    assert stats.positions == 2
+    assert stats.truncations == 2
+    assert stats.horizon_truncations == 0
+    assert stats.spatial_truncations == 2
+    assert stats.chunk_truncations == 0
+    assert stats.max_dense_position_cells == 17 * 17
+    assert all(trajectory.spatial_truncated for trajectory in trajectories)
+    assert all(
+        trajectory.bootstrap_value == pytest.approx(0.25)
+        for trajectory in trajectories
+    )
     assert all(
         abs(trajectory.steps[-1].return_target) == pytest.approx(0.25)
         for trajectory in trajectories

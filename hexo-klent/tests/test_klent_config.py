@@ -89,6 +89,50 @@ def test_parallel_games_cannot_exceed_position_budget(tmp_path):
         load_config(path)
 
 
+def test_dense_axis_backend_loads_strict_compatible_schema(tmp_path):
+    path = tmp_path / "dense.toml"
+    path.write_text(
+        "[model]\n"
+        'architecture = "dense_axis"\n'
+        "dense_ray_radius = 5\n"
+        'graph_type = "axis"\n'
+        "axis_relational = true\n"
+        "threat_features = true\n"
+        "relative_stone_encoding = true\n"
+        "compact_stone_onehot = true\n"
+        "node_coords = false\n"
+        'moves_scope = "node"\n'
+        "pre_norm = true\n"
+        "dropout = 0.0\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.model.architecture == "dense_axis"
+    assert config.model.dense_ray_radius == 5
+
+
+def test_dense_axis_rejects_incomplete_ray_radius(tmp_path):
+    path = tmp_path / "dense-short-rays.toml"
+    path.write_text(
+        "[model]\n"
+        'architecture = "dense_axis"\n'
+        "dense_ray_radius = 4\n"
+        'graph_type = "axis"\n'
+        "axis_relational = true\n"
+        "threat_features = true\n"
+        "relative_stone_encoding = true\n"
+        "compact_stone_onehot = true\n"
+        "node_coords = false\n"
+        'moves_scope = "node"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="dense_ray_radius to cover"):
+        load_config(path)
+
+
 def test_sealbot_opponent_requires_fixed_depth(tmp_path):
     path = tmp_path / "sealbot-without-depth.toml"
     path.write_text(

@@ -1,0 +1,85 @@
+# Dense KLENT from-scratch curriculum: W1 (win length 4, radius 2).
+#
+# This is the only stage that starts without a checkpoint:
+#
+#   uv run hexo-klent train \
+#     --config configs/klent/dense-from-scratch/w1.toml
+#
+# Continue W1 later with `--resume latest`. Advance to S1 by following the
+# command at the top of s1.toml. Generation numbers remain continuous across
+# stages so lagged opponents can resolve checkpoints from curriculum history.
+
+[model]
+architecture = "dense_axis"
+dense_ray_radius = 5
+
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 4
+placement_radius = 2
+# HeXO has no draws. A still-live position at the horizon is bootstrapped.
+rollout_horizon = 30
+
+[algorithm]
+alpha = 0.03
+beta = 0.10
+tau = 8.0
+
+[collection]
+positions_per_iteration = 32_768
+parallel_games = 64
+inference_batch_size = 64
+# Dense budgets count padded raster cells rather than graph edges.
+inference_edge_budget = 1_000_000
+dense_position_cell_limit = 200_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 512
+# This bounds dense forward/backward microbatches; gradient accumulation keeps
+# each optimizer step at the configured 512-position batch size.
+edge_budget = 200_000
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.0
+
+[evaluation]
+interval = 10
+
+[[evaluation.opponents]]
+name = "random"
+kind = "random"
+games = 64
+
+[run]
+iterations = 40
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/dense-from-scratch/w1"
+checkpoint_interval = 10
+seed = 0

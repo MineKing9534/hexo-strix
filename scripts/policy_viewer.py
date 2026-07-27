@@ -45,6 +45,17 @@ _model_config_dict: dict = {}  # Set from parsed TOML at startup
 def _load_model(ckpt_path: str):
     _ensure_imports()
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if ckpt.get("format") == "hexo-klent-v1":
+        # KLENT checkpoints carry a policy/Q network rather than HeXONet's
+        # policy/value heads. Reuse the evaluation adapter so the viewer sees
+        # the same derived state value as self-play and MCTS:
+        # V(s) = E_{pi_improved}[Q(s, a)]. This also reconstructs the dense
+        # raster backend when model.architecture == "dense_axis".
+        from hexo_klent.mcts_adapter import adapt_checkpoint
+
+        loaded = adapt_checkpoint(ckpt, torch.device("cpu"))
+        return loaded.model, loaded.model_config
+
     # Prefer the checkpoint's embedded model_config (authoritative for graph
     # flags like threat_features/relative_stone_encoding); fall back to TOML.
     mc = _config_mod.model_config_from_checkpoint(ckpt, _model_config_dict)
@@ -65,6 +76,37 @@ def _make_graph_fn(mc):
             g, prune_empty_edges=prune, threat_features=threat, relative_stones=rel)
     return lambda g: _graph_mod.game_to_graph(
         g, threat_features=threat, relative_stones=rel)
+
+
+def _make_state_eval_fn(model, mc):
+    """Bridge graph, dense, production, and KLENT models to state batches."""
+
+    _ensure_imports()
+    from hexo_a0.evaluate import make_eval_fn
+
+    return make_eval_fn(
+        model,
+        torch.device("cpu"),
+        graph_type=mc.graph_type,
+        prune_empty_edges=getattr(mc, "prune_empty_edges", False),
+        threat_features=getattr(mc, "threat_features", False),
+        relative_stones=getattr(mc, "relative_stone_encoding", False),
+        graph_fn=_make_graph_fn(mc),
+        model_config=mc,
+    )
+
+
+def _evaluate_states(model, mc, states):
+    """Return tensor policy chunks and scalar values in source-state order."""
+
+    states = list(states)
+    logits, values = _make_state_eval_fn(model, mc)(states)
+    if len(logits) != len(states) or len(values) != len(states):
+        raise RuntimeError("model evaluation count does not match state count")
+    return (
+        [torch.as_tensor(chunk, dtype=torch.float32) for chunk in logits],
+        torch.as_tensor(values, dtype=torch.float32),
+    )
 
 
 def _build_state(moves, win_length, placement_radius, max_moves,
@@ -115,9 +157,6 @@ def _run_mcts(model, mc, state, mcts_sims, mcts_m_actions):
     See `gumbel_mcts_with_diagnostics` in the Rust bindings.
     """
     _ensure_imports()
-    from torch_geometric.data import Batch
-
-    graph_fn = _make_graph_fn(mc)
 
     mcts_config = _hexo_rs.MCTSConfig(
         n_simulations=mcts_sims,
@@ -129,29 +168,7 @@ def _run_mcts(model, mc, state, mcts_sims, mcts_m_actions):
         disable_gumbel_noise=True,
     )
 
-    def eval_fn(states):
-        data_list = [graph_fn(s) for s in states]
-        batch = Batch.from_data_list(data_list).to("cpu")
-        with torch.inference_mode():
-            try:
-                policy_logits_list, values = model.forward_batch(batch)
-            except Exception as e:
-                # Fallback: evaluate one at a time
-                policy_logits_list = []
-                values_list = []
-                for d in data_list:
-                    with torch.no_grad():
-                        logits, val = model(
-                            d.x, d.edge_index, d.legal_mask,
-                            stone_mask=d.stone_mask,
-                            edge_attr=getattr(d, "edge_attr", None),
-                        )
-                    policy_logits_list.append(logits.tolist())
-                    values_list.append(float(val.item()))
-                return (policy_logits_list, values_list)
-        logits_list = [p.tolist() for p in policy_logits_list]
-        values_list = [float(v.item()) for v in values]
-        return (logits_list, values_list)
+    eval_fn = _make_state_eval_fn(model, mc)
 
     (_action, improved_policy, visit_counts, per_child_q,
      _per_child_prior, candidate_indices,
@@ -160,15 +177,9 @@ def _run_mcts(model, mc, state, mcts_sims, mcts_m_actions):
     legal_moves = state.legal_moves()
 
     # Get value from raw network for the root position
-    data = graph_fn(state)
-    with torch.no_grad():
-        _, value = model(
-            data.x, data.edge_index, data.legal_mask,
-            stone_mask=data.stone_mask,
-            edge_attr=getattr(data, "edge_attr", None),
-        )
+    _root_logits, root_values = _evaluate_states(model, mc, [state])
 
-    return (improved_policy, value.item(), [list(c) for c in legal_moves],
+    return (improved_policy, root_values[0].item(), [list(c) for c in legal_moves],
             list(visit_counts), list(per_child_q), list(candidate_indices))
 
 
@@ -197,15 +208,12 @@ def _analyze(moves, checkpoint, win_length, placement_radius, max_moves,
     data = _make_graph_fn(mc)(state)
 
     # Always get raw logits + value from the network
-    with torch.no_grad():
-        raw_logits, raw_value = model(
-            data.x, data.edge_index, data.legal_mask,
-            stone_mask=data.stone_mask,
-            edge_attr=getattr(data, "edge_attr", None),
-        )
+    raw_chunks, raw_values = _evaluate_states(model, mc, [state])
+    raw_logits = raw_chunks[0]
+    raw_value = raw_values[0]
     logits_list = raw_logits.tolist()          # list[float]
     value = float(raw_value.item())            # float
-    legal_coords = data.coords[data.legal_mask].tolist()  # list[[q,r]]
+    legal_coords = [list(coord) for coord in state.legal_moves()]
 
     q_hat = None       # per-legal-move Q(root, action), root-player perspective
     candidate_set = None  # bool per legal move: received search budget
@@ -358,11 +366,9 @@ def _analyze_trajectory(moves, checkpoint, win_length, placement_radius, max_mov
     prefix (the frontend flips to a fixed P1 reference for the bar).
     """
     _ensure_imports()
-    from torch_geometric.data import Batch
 
     model, mc = _load_model(checkpoint)
     cfg = _hexo_rs.GameConfig(win_length, placement_radius, max_moves)
-    graph_fn = _make_graph_fn(mc)
 
     # Build one state per prefix length 1..N. The seed at moves[0]=(0,0) is the
     # engine-placed P1 opening; constructing GameState already applies it.
@@ -381,23 +387,31 @@ def _analyze_trajectory(moves, checkpoint, win_length, placement_radius, max_mov
     non_terminal_idx = [i for i, s in enumerate(prefix_states) if not s.is_terminal()]
     non_term_values: dict[int, float] = {}
     if non_terminal_idx:
-        graphs = [graph_fn(prefix_states[i]) for i in non_terminal_idx]
+        non_terminal_states = [
+            prefix_states[i] for i in non_terminal_idx
+        ]
         try:
-            batch = Batch.from_data_list(graphs).to("cpu")
-            with torch.inference_mode():
-                _logits_list, values = model.forward_batch(batch)
+            _logits_list, values = _evaluate_states(
+                model,
+                mc,
+                non_terminal_states,
+            )
             for idx, v in zip(non_terminal_idx, values):
                 non_term_values[idx] = float(v.item() if hasattr(v, "item") else v)
         except Exception:
-            # forward_batch can fail on edge-case batch shapes; fall back to per-state.
-            for idx, d in zip(non_terminal_idx, graphs):
-                with torch.no_grad():
-                    _logits, val = model(
-                        d.x, d.edge_index, d.legal_mask,
-                        stone_mask=d.stone_mask,
-                        edge_attr=getattr(d, "edge_attr", None),
-                    )
-                non_term_values[idx] = float(val.item())
+            # Preserve the viewer's historical per-state fallback for unusual
+            # batch shapes while routing both graph and raster backends through
+            # the same compatibility bridge.
+            for idx, state_item in zip(
+                non_terminal_idx,
+                non_terminal_states,
+            ):
+                _logits, values = _evaluate_states(
+                    model,
+                    mc,
+                    [state_item],
+                )
+                non_term_values[idx] = float(values[0].item())
 
     trajectory = []
     for i, st in enumerate(prefix_states):
@@ -451,17 +465,11 @@ def _ai_move(moves, checkpoint, win_length, placement_radius, max_moves,
         best_coord = legal_coords[best_idx]
         best_prob = improved_policy[best_idx]
     else:
-        data = _make_graph_fn(mc)(state)
-
-        with torch.no_grad():
-            logits, value_t = model(
-                data.x, data.edge_index, data.legal_mask,
-                stone_mask=data.stone_mask,
-                edge_attr=getattr(data, "edge_attr", None),
-            )
+        logits_chunks, values = _evaluate_states(model, mc, [state])
+        logits = logits_chunks[0]
         probs = torch.softmax(logits, dim=-1)
-        legal_coords = data.coords[data.legal_mask].tolist()
-        value = value_t.item()
+        legal_coords = [list(coord) for coord in state.legal_moves()]
+        value = values[0].item()
         best_idx = int(probs.argmax().item())
         best_coord = legal_coords[best_idx]
         best_prob = probs[best_idx].item()
@@ -481,10 +489,28 @@ def _list_checkpoints(ckpt_dir: str):
         return []
     pts = sorted(d.glob("checkpoint_*.pt"), key=lambda p: p.name)
     out = [str(p) for p in pts]
+    final = d / "final.pt"
+    if final.exists():
+        out.append(str(final))
     champion = d / "self_play" / "champion.pt"
     if champion.exists():
         out.append(str(champion))
     return out
+
+
+def _checkpoint_dir_from_config(raw: dict, override: str | None) -> str:
+    """Resolve production and KLENT checkpoint-directory conventions."""
+
+    if override:
+        return override
+    run = raw.get("run", {})
+    checkpoint_dir = run.get("checkpoint_dir")
+    if checkpoint_dir:
+        return str(checkpoint_dir)
+    output_dir = run.get("output_dir")
+    if output_dir:
+        return str(Path(output_dir) / "checkpoints")
+    return "checkpoints"
 
 
 def _check_terminal(moves, win_length, placement_radius, max_moves):
@@ -2604,7 +2630,7 @@ def main():
 
     raw = tomllib.loads(Path(args.config).read_text())
     _model_config_dict = raw.get("model", {})
-    ckpt_dir = args.checkpoint_dir or raw.get("run", {}).get("checkpoint_dir", "checkpoints")
+    ckpt_dir = _checkpoint_dir_from_config(raw, args.checkpoint_dir)
     Handler.checkpoint_dir = ckpt_dir
 
     server = HTTPServer(("127.0.0.1", args.port), Handler)

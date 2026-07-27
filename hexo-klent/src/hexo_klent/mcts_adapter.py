@@ -10,9 +10,14 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from hexo_a0.config import ModelConfig, model_config_from_checkpoint
-from hexo_klent.config import AlgorithmConfig
-from hexo_klent.model import BatchOutput, KlentNet, improved_policy
+from hexo_a0.config import ModelConfig
+from hexo_klent.config import AlgorithmConfig, KlentModelConfig
+from hexo_klent.model import (
+    BatchOutput,
+    KlentNet,
+    improved_policy,
+    make_klent_net,
+)
 
 
 class KlentMCTSAdapter(nn.Module):
@@ -97,6 +102,18 @@ class LoadedKlentMCTS:
     iteration: int | str
 
 
+def _model_config_from_checkpoint(
+    checkpoint: dict[str, Any],
+) -> KlentModelConfig:
+    raw = checkpoint.get("model_config", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    known = {field.name for field in dataclasses.fields(KlentModelConfig)}
+    return KlentModelConfig(
+        **{key: value for key, value in raw.items() if key in known}
+    )
+
+
 def _algorithm_from_checkpoint(checkpoint: dict[str, Any]) -> AlgorithmConfig:
     config = checkpoint.get("config")
     raw = config.get("algorithm", {}) if isinstance(config, dict) else {}
@@ -118,9 +135,9 @@ def adapt_checkpoint(
     if not isinstance(state_dict, dict):
         raise ValueError("KLENT checkpoint has no model_state_dict")
 
-    model_config = model_config_from_checkpoint(checkpoint)
+    model_config = _model_config_from_checkpoint(checkpoint)
     algorithm = _algorithm_from_checkpoint(checkpoint)
-    network = KlentNet(model_config).to(device)
+    network = make_klent_net(model_config).to(device)
     clean_state = {
         key.removeprefix("_orig_mod."): value
         for key, value in state_dict.items()

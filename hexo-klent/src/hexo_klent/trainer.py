@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -22,18 +23,207 @@ from hexo_klent.actor import (
     collect_games_parallel,
     flatten_trajectories,
 )
-from hexo_klent.batching import move_batch_to_device, prepare_graph_batches
+from hexo_klent.batching import (
+    move_batch_to_device,
+    prepare_graph_batches,
+    raster_shape,
+)
 from hexo_klent.config import Config
 from hexo_klent.evaluation import (
     CheckpointOpponentCache,
     evaluate_opponent,
 )
-from hexo_klent.model import KlentNet
+from hexo_klent.model import (
+    DenseAxisKlentNet,
+    KlentNet,
+    compile_klent_forward,
+    is_dense_axis_config,
+    load_production_axis_weights,
+    make_klent_net,
+)
 
 if TYPE_CHECKING:
     from hexo_klent.tui import TrainingDashboard
 
 logger = logging.getLogger(__name__)
+
+_GIB = float(1024**3)
+_CACHE_CLEAR_RESERVED_MB_ENV = "HEXO_CACHE_CLEAR_RESERVED_MB"
+_CACHE_CLEAR_CHECK_EVERY_ENV = "HEXO_CACHE_CLEAR_CHECK_EVERY"
+_DEFAULT_CACHE_CLEAR_RESERVED_MB = 8192.0
+_DEFAULT_CACHE_CLEAR_CHECK_EVERY = 128
+
+
+class _CudaCachePressureGate:
+    """Release inactive CUDA/ROCm blocks during a long fit under pressure."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        threshold_bytes: int,
+        check_every: int,
+    ) -> None:
+        self.device = device
+        self.threshold_bytes = max(0, int(threshold_bytes))
+        self.check_every = max(1, int(check_every))
+        self.enabled = (
+            device.type == "cuda" and self.threshold_bytes > 0
+        )
+        self.steps = 0
+        self.checks = 0
+        self.clears = 0
+        self.released_bytes = 0
+        self.max_reserved_bytes = 0
+
+    @classmethod
+    def from_environment(
+        cls,
+        device: torch.device,
+    ) -> "_CudaCachePressureGate":
+        try:
+            threshold_mb = float(
+                os.environ.get(
+                    _CACHE_CLEAR_RESERVED_MB_ENV,
+                    str(_DEFAULT_CACHE_CLEAR_RESERVED_MB),
+                )
+            )
+        except ValueError:
+            logger.warning(
+                "invalid %s=%r; using %.0f MB",
+                _CACHE_CLEAR_RESERVED_MB_ENV,
+                os.environ.get(_CACHE_CLEAR_RESERVED_MB_ENV),
+                _DEFAULT_CACHE_CLEAR_RESERVED_MB,
+            )
+            threshold_mb = _DEFAULT_CACHE_CLEAR_RESERVED_MB
+        try:
+            check_every = int(
+                os.environ.get(
+                    _CACHE_CLEAR_CHECK_EVERY_ENV,
+                    str(_DEFAULT_CACHE_CLEAR_CHECK_EVERY),
+                )
+            )
+        except ValueError:
+            logger.warning(
+                "invalid %s=%r; using %d",
+                _CACHE_CLEAR_CHECK_EVERY_ENV,
+                os.environ.get(_CACHE_CLEAR_CHECK_EVERY_ENV),
+                _DEFAULT_CACHE_CLEAR_CHECK_EVERY,
+            )
+            check_every = _DEFAULT_CACHE_CLEAR_CHECK_EVERY
+        if check_every <= 0:
+            logger.warning(
+                "%s must be positive; using %d",
+                _CACHE_CLEAR_CHECK_EVERY_ENV,
+                _DEFAULT_CACHE_CLEAR_CHECK_EVERY,
+            )
+            check_every = _DEFAULT_CACHE_CLEAR_CHECK_EVERY
+        return cls(
+            device,
+            threshold_bytes=int(max(0.0, threshold_mb) * 1_000_000),
+            check_every=check_every,
+        )
+
+    def step(self) -> bool:
+        """Check reserve at the configured cadence and clear above threshold."""
+
+        if not self.enabled:
+            return False
+        self.steps += 1
+        if self.steps % self.check_every:
+            return False
+
+        self.checks += 1
+        reserved_before = torch.cuda.memory_reserved(self.device)
+        self.max_reserved_bytes = max(
+            self.max_reserved_bytes,
+            reserved_before,
+        )
+        if reserved_before <= self.threshold_bytes:
+            return False
+
+        allocated = torch.cuda.memory_allocated(self.device)
+        torch.cuda.empty_cache()
+        reserved_after = torch.cuda.memory_reserved(self.device)
+        released = max(0, reserved_before - reserved_after)
+        self.clears += 1
+        self.released_bytes += released
+        logger.info(
+            "cuda_cache pressure_clear=%d allocated=%.2fGiB "
+            "reserved=%.2f->%.2fGiB released=%.2fGiB",
+            self.clears,
+            allocated / _GIB,
+            reserved_before / _GIB,
+            reserved_after / _GIB,
+            released / _GIB,
+        )
+        return True
+
+    def metrics(self) -> dict[str, float]:
+        """Return stable training metrics on accelerator and CPU runs."""
+
+        return {
+            "allocator_pressure_checks": float(self.checks),
+            "allocator_pressure_clears": float(self.clears),
+            "allocator_pressure_released_gib": (
+                self.released_bytes / _GIB
+            ),
+            "allocator_pressure_max_reserved_gib": (
+                self.max_reserved_bytes / _GIB
+            ),
+            "allocator_pressure_threshold_gib": (
+                self.threshold_bytes / _GIB
+            ),
+            "allocator_pressure_check_every": float(self.check_every),
+        }
+
+
+def _release_cuda_cache(
+    device: torch.device,
+    *,
+    phase: str,
+) -> dict[str, float]:
+    """Release inactive allocator blocks and report phase memory pressure.
+
+    ROCm exposes unified-memory allocations through the CUDA-compatible torch
+    API. Variable dense crop shapes can leave large inactive blocks reserved
+    by its caching allocator even though the tensors themselves are dead.
+    Collection, fitting, and evaluation are synchronous phases, so their
+    boundaries are safe points to return those blocks to the system.
+    """
+
+    if device.type != "cuda":
+        return {}
+
+    allocated = torch.cuda.memory_allocated(device)
+    reserved_before = torch.cuda.memory_reserved(device)
+    peak_allocated = torch.cuda.max_memory_allocated(device)
+    peak_reserved = torch.cuda.max_memory_reserved(device)
+    torch.cuda.empty_cache()
+    reserved_after = torch.cuda.memory_reserved(device)
+    torch.cuda.reset_peak_memory_stats(device)
+
+    released = max(0, reserved_before - reserved_after)
+    logger.info(
+        "cuda_cache phase=%s allocated=%.2fGiB reserved=%.2f->%.2fGiB "
+        "released=%.2fGiB peak_allocated=%.2fGiB peak_reserved=%.2fGiB",
+        phase,
+        allocated / _GIB,
+        reserved_before / _GIB,
+        reserved_after / _GIB,
+        released / _GIB,
+        peak_allocated / _GIB,
+        peak_reserved / _GIB,
+    )
+    prefix = f"memory/{phase}"
+    return {
+        f"{prefix}_allocated_gib": allocated / _GIB,
+        f"{prefix}_reserved_before_gib": reserved_before / _GIB,
+        f"{prefix}_reserved_after_gib": reserved_after / _GIB,
+        f"{prefix}_cache_released_gib": released / _GIB,
+        f"{prefix}_peak_allocated_gib": peak_allocated / _GIB,
+        f"{prefix}_peak_reserved_gib": peak_reserved / _GIB,
+    }
 
 
 def _segmented_log_softmax(
@@ -120,6 +310,12 @@ def _prepare_training_chunk(
     edge_budget: int,
 ):
     """Build, edge-pack, and collate one outer sample chunk on CPU."""
+
+    if is_dense_axis_config(model_config):
+        # Collection order interleaves games at different crop buckets. A
+        # stable local sort turns those into useful dense batches without
+        # changing the outer shuffle or any target/state correspondence.
+        samples = sorted(samples, key=lambda sample: raster_shape(sample.state))
 
     prepared = []
     for batch, state_slice in prepare_graph_batches(
@@ -246,6 +442,7 @@ def train_epoch(
     microbatches = 0
     optimizer_steps = 0
     model.train()
+    cache_pressure = _CudaCachePressureGate.from_environment(device)
 
     for prepared_outer_batch in (
         _prepared_training_batches(
@@ -313,6 +510,20 @@ def train_epoch(
                 totals["q_loss"].add_(q_loss.detach() * count)
                 totals["total_loss"].add_(total_loss.detach() * count)
                 target_top1_total += target_top1
+                del (
+                    batch,
+                    target_policy,
+                    segment_ids,
+                    chosen,
+                    target_q,
+                    output,
+                    log_policy,
+                    policy_loss,
+                    predicted_q,
+                    q_loss,
+                    total_loss,
+                )
+                cache_pressure.step()
 
             if max_grad_norm > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -369,6 +580,7 @@ def train_epoch(
         "total_loss": total_loss_total / seen,
         **gradient_stats,
         "played_action_target_top1": target_top1_total / seen,
+        **cache_pressure.metrics(),
     }
 
 
@@ -381,8 +593,11 @@ class Trainer:
         *,
         tensorboard: bool = True,
         resume: str | Path | None = None,
+        init_from: str | Path | None = None,
         display: TrainingDashboard | None = None,
     ) -> None:
+        if resume is not None and init_from is not None:
+            raise ValueError("resume and init_from are mutually exclusive")
         self.config = config
         self.display = display
         self.device = torch.device(config.run.device)
@@ -394,7 +609,7 @@ class Trainer:
             random.seed(config.run.seed)
             torch.manual_seed(config.run.seed)
 
-        self.model = KlentNet(config.model).to(self.device)
+        self.model = make_klent_net(config.model).to(self.device)
         if (
             config.run.compile
             and self.device.type == "cuda"
@@ -406,10 +621,7 @@ class Trainer:
                 "TORCHINDUCTOR_CACHE_DIR",
                 "/tmp/torchinductor_hexo/klent",
             )
-            self.model._forward_batch_core = torch.compile(
-                self.model._forward_batch_core,
-                dynamic=True,
-            )
+            compile_klent_forward(self.model)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.training.learning_rate,
@@ -424,6 +636,7 @@ class Trainer:
         self._actors = None
         self._checkpoint_opponents = CheckpointOpponentCache()
         self._checkpoint_history_dirs = [self.checkpoint_dir.resolve()]
+        self.initial_checkpoint: dict[str, object] | None = None
         try:
             if tensorboard:
                 from torch.utils.tensorboard import SummaryWriter
@@ -431,6 +644,8 @@ class Trainer:
                 self.writer = SummaryWriter(self.output_dir / "tensorboard")
             if resume is not None:
                 self.load_checkpoint(resume)
+            elif init_from is not None:
+                self.initialize_from_production(init_from)
             if config.collection.workers > 1:
                 self._actors = SharedInferenceActors(
                     config.collection.workers
@@ -456,7 +671,73 @@ class Trainer:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.iteration = int(checkpoint["iteration"])
+        initial_checkpoint = checkpoint.get("initial_checkpoint")
+        if isinstance(initial_checkpoint, dict):
+            self.initial_checkpoint = initial_checkpoint
         logger.info("resumed %s at iteration %d", path, self.iteration)
+
+    def initialize_from_production(self, path: str | Path) -> None:
+        """Initialize dense KLENT from a production Axis-GINE Q-head model."""
+
+        if not isinstance(self.model, DenseAxisKlentNet):
+            raise ValueError(
+                "production checkpoint conversion requires "
+                "model.architecture='dense_axis'"
+            )
+        from hexo_a0.config import model_config_from_checkpoint
+
+        path = Path(path).expanduser().resolve()
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"production checkpoint {path} is not a dict")
+        source_config = model_config_from_checkpoint(checkpoint)
+        if not bool(getattr(source_config, "q_head", False)):
+            raise ValueError("production checkpoint does not contain a trained Q head")
+        compatibility_fields = (
+            "hidden_dim",
+            "num_layers",
+            "pre_norm",
+            "dropout",
+            "use_layer_scale",
+            "use_jk",
+            "jk_mode",
+            "policy_hidden",
+            "q_hidden",
+            "graph_type",
+            "prune_empty_edges",
+            "threat_features",
+            "relative_stone_encoding",
+            "axis_relational",
+            "axis_window",
+            "compact_stone_onehot",
+            "node_coords",
+            "moves_scope",
+        )
+        mismatches = [
+            f"{name}: source={getattr(source_config, name)!r}, "
+            f"target={getattr(self.config.model, name)!r}"
+            for name in compatibility_fields
+            if getattr(source_config, name) != getattr(self.config.model, name)
+        ]
+        if mismatches:
+            raise ValueError(
+                "production checkpoint architecture does not match dense KLENT: "
+                + "; ".join(mismatches)
+            )
+        report = load_production_axis_weights(self.model, checkpoint)
+        self.initial_checkpoint = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "train_steps": checkpoint.get("train_steps"),
+            "copied_tensors": len(report.copied),
+        }
+        logger.info(
+            "initialized dense KLENT from %s (%d tensors, train_steps=%s); "
+            "optimizer starts fresh",
+            path,
+            len(report.copied),
+            checkpoint.get("train_steps", "?"),
+        )
 
     def save_checkpoint(self, *, final: bool = False) -> Path:
         name = (
@@ -474,6 +755,7 @@ class Trainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "config": dataclasses.asdict(self.config),
                 "model_config": dataclasses.asdict(self.config.model),
+                "initial_checkpoint": self.initial_checkpoint,
                 "checkpoint_history_dirs": [
                     str(path) for path in self._checkpoint_history_dirs
                 ],
@@ -517,6 +799,8 @@ class Trainer:
     def run_iteration(self) -> dict[str, float]:
         next_iteration = self.iteration + 1
         iteration_started = time.monotonic()
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
         seed = (
             None
             if self.config.run.seed is None
@@ -543,12 +827,19 @@ class Trainer:
             inference_edge_budget=(
                 self.config.collection.inference_edge_budget
             ),
+            dense_position_cell_limit=(
+                self.config.collection.dense_position_cell_limit
+            ),
             workers=self.config.collection.workers,
             batch_timeout_ms=self.config.collection.batch_timeout_ms,
             device=self.device,
             precision=self.config.run.precision,
             seed=seed,
             actors=self._actors,
+        )
+        memory_metrics = _release_cuda_cache(
+            self.device,
+            phase="collection",
         )
         samples = flatten_trajectories(trajectories)
         if self.display is not None:
@@ -572,6 +863,12 @@ class Trainer:
             seed=seed,
             prefetch_batches=self.config.training.prefetch_batches,
         )
+        memory_metrics.update(
+            _release_cuda_cache(
+                self.device,
+                phase="training",
+            )
+        )
 
         metrics: dict[str, float] = {
             "iteration": float(next_iteration),
@@ -583,6 +880,7 @@ class Trainer:
                 collection.positions / collection.elapsed_seconds
             ),
             **{f"training/{key}": value for key, value in training.items()},
+            **memory_metrics,
         }
         # Cross-entropy includes the improved target policy's irreducible
         # entropy. Subtracting it leaves the average forward KL from the
@@ -706,6 +1004,12 @@ class Trainer:
                     result.truncations,
                     result.win_rate_decided,
                 )
+            metrics.update(
+                _release_cuda_cache(
+                    self.device,
+                    phase="evaluation",
+                )
+            )
 
         if self.display is not None:
             self.display.set_phase(
@@ -730,7 +1034,7 @@ class Trainer:
             self.display.update_metrics(metrics)
         logger.info(
             "iteration=%d games=%d positions=%d "
-            "truncations=%d(horizon=%d chunk=%d) workers=%d "
+            "truncations=%d(horizon=%d spatial=%d chunk=%d) workers=%d "
             "policy=%.4f excess_kl=%.4f q=%.4f reverse_kl=%.4f "
             "collect=%.1fs fit=%.1fs total=%.1fs",
             self.iteration,
@@ -738,6 +1042,7 @@ class Trainer:
             collection.positions,
             collection.truncations,
             collection.horizon_truncations,
+            collection.spatial_truncations,
             collection.chunk_truncations,
             collection.worker_processes,
             training["policy_loss"],

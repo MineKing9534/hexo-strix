@@ -775,6 +775,7 @@ dependencies = [
  "ctrlc",
  "getrandom 0.3.4",
  "hexo-engine",
+ "hexo-raster",
  "hexo-solver",
  "libc",
  "pyo3",
@@ -798,6 +799,13 @@ dependencies = [
  "pyo3",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
+]
+
+[[package]]
+name = "hexo-raster"
+version = "0.1.0"
+dependencies = [
+ "hexo-engine",
 ]
 
 [[package]]

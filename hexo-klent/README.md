@@ -38,14 +38,15 @@ request-coalescing window. Actors own no GPU state; the learner's frozen model
 serves collection before the same model switches back to fitting.
 Axis positions are built once into Rust-collated outer batches, then sliced at
 the configured edge-budget boundaries; this preserves the same optimizer
-microbatches without tensorising one PyG object per position.
-`run.compile = true` compiles the shared GNN core once and reuses it for
-inference and fitting. `training.prefetch_batches = true` prepares the next
-CPU graph chunk while the GPU fits the current one. Use `--workers N` for a
+microbatches without tensorising one PyG object per position. `run.compile =
+true` compiles the shared GNN core. The experimental dense backend specializes
+its expensive relational blocks by fixed raster size while keeping batch size
+dynamic. `training.prefetch_batches = true` prepares the next CPU graph or
+raster chunk while the GPU fits the current one. Use `--workers N` for a
 command-line override. JSONL metrics include collection and fitting elapsed
-times plus their position/example throughput. They report horizon and
-collection-chunk truncations separately; both use frozen-network bootstrap
-values.
+times plus their position/example throughput. They report horizon, dense
+spatial, and collection-chunk truncations separately; all three use
+frozen-network bootstrap values rather than draw targets.
 
 `training.batch_size` is the effective optimizer batch. The edge budget may
 split it into smaller GPU microbatches, but `training.grad_accumulation = true`
@@ -53,6 +54,70 @@ weights each microbatch by its share of examples and performs clipping plus one
 AdamW update only after the complete outer batch. This keeps optimizer batch
 size and update count stable as self-play positions grow. Set it to `false`
 only for an explicit per-microbatch optimization ablation.
+
+## Dense axis compatibility backend
+
+`model.architecture = "dense_axis"` selects the HXR1 raster representation and
+the checkpoint-compatible dense transcription of the production
+axis-relational GINE model. Its fixed ray radius must cover
+`game.win_length - 1`. For this backend the existing `inference_edge_budget`
+and `training.edge_budget` knobs count padded raster cells, not graph edges.
+States are grouped by raster size before inference and fitting. Rust plans
+those groups from dimensions first and materializes only one budgeted group at
+a time, so the CPU never constructs a complete 512-position raster chunk at
+once.
+
+HeXO's placement radius is local to each existing stone, not a fixed board
+boundary. A wandering game can therefore have a very large, mostly empty
+bounding box. `collection.dense_position_cell_limit` ends a lane before its
+next stored position would exceed that footprint. This is an ordinary KLENT
+truncation: the successor is evaluated once with the frozen policy to
+bootstrap returns, and no draw is introduced. Set the limit no higher than
+`training.edge_budget`; the metrics
+`collection/spatial_truncations` and
+`collection/max_dense_position_cells` expose how often the guard matters and
+how close retained positions come to it. Zero disables the guard.
+
+Initialize a new S3 run from the trained production D6 Q-head checkpoint:
+
+```console
+uv run hexo-klent train \
+  --config configs/klent/dense-axis-s3-from-d6-qhead.toml \
+  --init-from runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt
+```
+
+`--init-from` is valid only for a new dense run and is mutually exclusive with
+`--resume`. It converts the relational representation plus policy and Q heads,
+requires every target tensor to match, records the source path/SHA256/training
+step in KLENT checkpoints, and starts a fresh AdamW optimizer. Resume uses the
+ordinary dense KLENT checkpoint and does not repeat conversion. Dense
+checkpoints work with periodic evaluation, Gumbel MCTS, and the standalone
+head-to-head/SPRT command.
+
+The dense compatibility backend uses a custom Triton destination-gather with a
+custom fused backward on CUDA/ROCm; CPU execution retains the readable
+shift/mask reference. Its per-cell GINE MLPs are evaluated only at active
+stone/legal cells and scattered back into the raster, so bucket padding does
+not waste matrix-multiply work. Checkpoint parameter names, shapes, and
+optimizer state remain unchanged.
+
+On matched 33x33 S3 positions on the Framework Desktop APU, warmed BF16 fit
+improved from about 118 positions/s before fusion to about 387 positions/s at
+batch 512 (3.28x). Batch 1024 was effectively tied at about 388/s, so the
+supplied config retains an effective optimizer batch of 512 but bounds each
+forward/backward microbatch at 200,000 padded cells. The compiled
+sparse graph model remains faster on this matched workload at about 581/s:
+the fused line kernel must still visit padded cells even though the MLPs no
+longer do. Steady search-free collection measured about 1,477 positions/s
+with one in-process actor and about 1,417/s in the production-shaped
+four-actor/64-lane setup. These are warmed rates; the first encounter with a
+new raster bucket includes one-time compilation.
+
+FP16 is not materially beneficial on this gfx1151 APU. A matched
+pre-compaction batch-512 fit measured about 292 positions/s versus 290/s for
+BF16, a gain below 1%, while FP16's first compiler specialization was much
+slower and its exponent range is narrower. KLENT therefore keeps BF16 as the
+default.
 
 Ctrl-C is handled by the parent process: it stops and reaps the persistent
 actors, closes TensorBoard, and exits with status 130 without child-process
@@ -202,6 +267,33 @@ on the number of legal actions and the configured `alpha` and `beta`.
 | `training/clip_fraction` | `clipped_optimizer_steps / optimizer_steps`. |
 | `training/mean_clip_scale` | Mean multiplier implied by clipping across every optimizer step: `min(1, max_grad_norm / raw_norm)`. Unclipped steps contribute `1`; lower values mean stronger limiting. |
 | `training/played_action_target_top1` | Fraction of sampled self-play actions that happened to equal the stored improved policy's argmax. This measures target-policy concentration/sampling, not model classification accuracy. |
+
+### Accelerator memory
+
+On CUDA and ROCm devices, each synchronous phase boundary releases unused
+caching-allocator blocks and records `memory/<phase>_...` metrics, where
+`<phase>` is `collection`, `training`, or a scheduled `evaluation`. The
+`allocated_gib` value is memory still held by live tensors.
+`reserved_before_gib` and `reserved_after_gib` show the allocator reserve
+immediately before and after `empty_cache()`, while `cache_released_gib` is
+their difference. `peak_allocated_gib` and `peak_reserved_gib` are the
+high-water marks since the preceding phase boundary.
+
+Long fits also check the allocator reserve every 128 microbatches. When it
+exceeds 8192 MB, KLENT releases inactive blocks immediately instead of waiting
+for the end of the fit. This avoids unified-memory host OOMs while retaining
+the normal fast path below the pressure threshold. The cadence and threshold
+share production's `HEXO_CACHE_CLEAR_CHECK_EVERY` and
+`HEXO_CACHE_CLEAR_RESERVED_MB` environment overrides; a non-positive threshold
+disables in-fit clearing. `training/allocator_pressure_checks`,
+`allocator_pressure_clears`, `allocator_pressure_released_gib`, and
+`allocator_pressure_max_reserved_gib` report its activity.
+
+A large `reserved_before_gib` is harmless when `reserved_after_gib` falls back
+to the small live working set. A rising `reserved_after_gib` indicates
+genuinely persistent device allocations. The TUI's `GPU CACHE` signal shows
+post-fit and peak reserve together; it enters `WATCH` above 32 GiB peak or
+8 GiB post-fit, and escalates above 64 GiB peak or 16 GiB post-fit.
 
 ### Evaluation
 

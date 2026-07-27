@@ -256,6 +256,16 @@ def test_health_is_factual_and_surfaces_watch_states(tmp_path):
     dashboard.update_metrics(_metrics(iteration=4.0, mean_abs_q=0.95))
     assert dashboard._health()[0] == "WATCH"
 
+    cache_pressure = _metrics(iteration=5.0)
+    cache_pressure["memory/training_reserved_after_gib"] = 0.1
+    cache_pressure["memory/training_peak_reserved_gib"] = 93.5
+    dashboard.update_metrics(cache_pressure)
+    health, _style, signals = dashboard._health()
+    assert health == "WATCH"
+    assert ("GPU CACHE", "0.1G/94G PEAK") in [
+        (name, value) for name, value, _signal_style in signals
+    ]
+
 
 def test_resume_history_deduplicates_and_discards_stale_future(tmp_path):
     metrics_path = tmp_path / "metrics.jsonl"

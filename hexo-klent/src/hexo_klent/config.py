@@ -14,6 +14,14 @@ from hexo_a0.config import ModelConfig
 
 
 @dataclass
+class KlentModelConfig(ModelConfig):
+    """KLENT network plus its execution representation."""
+
+    architecture: str = "graph"
+    dense_ray_radius: int = 5
+
+
+@dataclass
 class GameConfig:
     """HeXO rules plus the finite horizon used to bound a rollout.
 
@@ -50,6 +58,11 @@ class CollectionConfig:
     parallel_games: int = 64
     inference_batch_size: int = 64
     inference_edge_budget: int = 250_000
+    # Dense rasters scale with the spatial bounding box rather than the number
+    # of active cells. End a wandering lane at this exact, bootstrapped
+    # truncation boundary before it can create an unsafe fit example. Zero
+    # disables the boundary (and remains the graph-backend default).
+    dense_position_cell_limit: int = 0
     workers: int = 1
     batch_timeout_ms: float = 2.0
 
@@ -116,7 +129,7 @@ class RunConfig:
 class Config:
     """Complete reference experiment configuration."""
 
-    model: ModelConfig = field(default_factory=ModelConfig)
+    model: KlentModelConfig = field(default_factory=KlentModelConfig)
     game: GameConfig = field(default_factory=GameConfig)
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     collection: CollectionConfig = field(default_factory=CollectionConfig)
@@ -127,7 +140,7 @@ class Config:
 
 _T = TypeVar("_T")
 _SECTIONS: dict[str, type[Any]] = {
-    "model": ModelConfig,
+    "model": KlentModelConfig,
     "game": GameConfig,
     "algorithm": AlgorithmConfig,
     "collection": CollectionConfig,
@@ -209,6 +222,18 @@ def _validate(cfg: Config) -> None:
         raise ValueError("collection.inference_batch_size must be positive")
     if cfg.collection.inference_edge_budget < 0:
         raise ValueError("collection.inference_edge_budget cannot be negative")
+    if cfg.collection.dense_position_cell_limit < 0:
+        raise ValueError(
+            "collection.dense_position_cell_limit cannot be negative"
+        )
+    if (
+        cfg.collection.dense_position_cell_limit > 0
+        and cfg.model.architecture != "dense_axis"
+    ):
+        raise ValueError(
+            "collection.dense_position_cell_limit is only valid for "
+            "model.architecture='dense_axis'"
+        )
     if cfg.collection.workers <= 0:
         raise ValueError("collection.workers must be positive")
     if cfg.collection.batch_timeout_ms < 0:
@@ -312,6 +337,40 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             "model.axis_window must be at least game.win_length - 1"
         )
+    if cfg.model.architecture not in {"graph", "dense_axis"}:
+        raise ValueError(
+            "model.architecture must be 'graph' or 'dense_axis'"
+        )
+    if not 1 <= cfg.model.dense_ray_radius <= 5:
+        raise ValueError("model.dense_ray_radius must be between 1 and 5")
+    if cfg.model.architecture == "dense_axis":
+        if cfg.game.win_length - 1 > cfg.model.dense_ray_radius:
+            raise ValueError(
+                "dense_axis requires model.dense_ray_radius to cover "
+                "game.win_length - 1"
+            )
+        required = {
+            "graph_type": "axis",
+            "axis_relational": True,
+            "threat_features": True,
+            "relative_stone_encoding": True,
+            "compact_stone_onehot": True,
+            "node_coords": False,
+            "moves_scope": "node",
+            "pre_norm": True,
+            "dropout": 0.0,
+        }
+        for name, expected in required.items():
+            actual = getattr(cfg.model, name)
+            if actual != expected:
+                raise ValueError(
+                    f"dense_axis requires model.{name}={expected!r}, "
+                    f"got {actual!r}"
+                )
+        if cfg.model.use_jk and cfg.model.jk_mode not in {"sum", "cat"}:
+            raise ValueError(
+                "dense_axis supports JK modes 'sum' and 'cat'"
+            )
 
 
 def load_config(path: str | Path) -> Config:

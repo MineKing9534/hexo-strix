@@ -660,6 +660,7 @@ class TrainingDashboard:
                     ("DATA PLANE", "WAIT", _MUTED),
                     ("GRADIENTS", "WAIT", _MUTED),
                     ("Q RANGE", "WAIT", _MUTED),
+                    ("GPU CACHE", "WAIT", _MUTED),
                 ],
             )
 
@@ -682,6 +683,7 @@ class TrainingDashboard:
                     ("DATA PLANE", "WAIT", _MUTED),
                     ("GRAD CLIP", "WAIT", _MUTED),
                     ("Q RANGE", "WAIT", _MUTED),
+                    ("GPU CACHE", "WAIT", _MUTED),
                 ],
             )
 
@@ -738,6 +740,34 @@ class TrainingDashboard:
             and math.isfinite(mean_abs_q)
             and mean_abs_q >= 0.90
         )
+        reserved_after_fit = latest.get(
+            "memory/training_reserved_after_gib"
+        )
+        peak_reserved_fit = latest.get(
+            "memory/training_peak_reserved_gib"
+        )
+        cache_measured = (
+            reserved_after_fit is not None
+            and peak_reserved_fit is not None
+            and math.isfinite(reserved_after_fit)
+            and math.isfinite(peak_reserved_fit)
+        )
+        cache_watch = cache_measured and (
+            reserved_after_fit > 8.0 or peak_reserved_fit > 32.0
+        )
+        cache_hot = cache_measured and (
+            reserved_after_fit > 16.0 or peak_reserved_fit > 64.0
+        )
+        if cache_measured:
+            cache_status = (
+                f"{reserved_after_fit:.1f}G/{peak_reserved_fit:.0f}G PEAK"
+            )
+            cache_style = (
+                _RED if cache_hot else _AMBER if cache_watch else _MINT
+            )
+        else:
+            cache_status = "UNMEASURED"
+            cache_style = _MUTED
 
         signals = [
             (
@@ -760,10 +790,15 @@ class TrainingDashboard:
                 "HOT" if q_hot else "NOMINAL",
                 _AMBER if q_hot else _MINT,
             ),
+            (
+                "GPU CACHE",
+                cache_status,
+                cache_style,
+            ),
         ]
         if not finite or not data_exact:
             return "FAULT", _RED, signals
-        if clip_watch or q_hot:
+        if clip_watch or q_hot or cache_watch:
             return "WATCH", _AMBER, signals
         return "NOMINAL", _MINT, signals
 
@@ -984,11 +1019,23 @@ class TrainingDashboard:
                     f"{_integer(latest.get('collection/p1_wins'))} / "
                     f"{_integer(latest.get('collection/p2_wins'))}"
                 ),
-                "TRUNC H / C",
+                "TRUNC H / S / C",
                 (
                     f"{_integer(latest.get('collection/horizon_truncations'))}"
                     " / "
+                    f"{_integer(latest.get('collection/spatial_truncations'))}"
+                    " / "
                     f"{_integer(latest.get('collection/chunk_truncations'))}"
+                ),
+            ),
+            (
+                "DENSE CELL PEAK",
+                _integer(
+                    latest.get("collection/max_dense_position_cells")
+                ),
+                "DENSE CELL LIMIT",
+                _integer(
+                    self.config.collection.dense_position_cell_limit
                 ),
             ),
             (

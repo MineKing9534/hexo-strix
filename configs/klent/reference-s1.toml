@@ -73,7 +73,7 @@ kind = "random"
 games = 64
 
 [[evaluation.opponents]]
-name = "sealbot_raw"
+name = "sealbot-d2_raw"
 kind = "sealbot"
 games = 16
 depth = 2
@@ -84,7 +84,7 @@ mcts_simulations = 0
 mcts_actions = 16
 
 [[evaluation.opponents]]
-name = "sealbot_mcts24/8"
+name = "sealbot-d2_mcts24/8"
 kind = "sealbot"
 games = 16
 depth = 2
@@ -93,6 +93,20 @@ placement_radius = 8
 # the greedy raw policy.
 mcts_simulations = 24
 mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "strix_jkcat_rel2_s1_80400"
+kind = "checkpoint"
+# The production S1 log identifies step 80,400 as the stage champion. Use the
+# immutable checkpoint because self_play/champion.pt now belongs to a later
+# jkcat-rel2 curriculum stage.
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00080400.pt"
+games = 16
+placement_radius = 2
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
 
 [run]
 iterations = 1000

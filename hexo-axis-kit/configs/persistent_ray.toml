@@ -1,0 +1,29 @@
+# Architecture manifest for hexo_axis_models.PersistentRayAxisNet.
+# Start from a converted AxisGineCompatNet checkpoint and load with strict=false.
+
+architecture = "persistent_ray_axis"
+plane_count = 8
+scalar_count = 5
+hidden_dim = 128
+num_layers = 4
+line_radius = 5
+distance_bins = 8
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+value_hidden = 32
+value_bins = 65
+value_horizons = [4, 12, 32]
+
+ray_channels = 12
+ray_update_hidden = 48
+ray_branch_scale = 1.0
+exact_graft_init = true
+ray_after_layers = [0, 1, 2, 3]
+
+[representation]
+buckets = [[9, 9], [17, 17], [25, 25], [33, 33], [41, 41], [49, 49], [65, 65], [81, 81], [97, 97], [129, 129]]
+ray_radius = 5
+prune_empty_edges = true
+win_length_scale = 7.0
+placement_radius_scale = 8.0

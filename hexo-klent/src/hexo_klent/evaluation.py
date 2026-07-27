@@ -13,9 +13,14 @@ from typing import Any, Iterator
 import torch
 
 from hexo_klent.actor import _autocast, _rust_game_config
-from hexo_klent.batching import move_batch_to_device, prepare_graph_batches
+from hexo_klent.batching import (
+    move_batch_to_device,
+    order_states_for_batching,
+    prepare_graph_batches,
+    restore_state_order,
+)
 from hexo_klent.config import AlgorithmConfig
-from hexo_klent.model import KlentNet
+from hexo_klent.model import KlentNet, is_dense_axis_config
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,66 @@ class CheckpointOpponentCache:
         """Release all cached CPU models."""
 
         self._loaded.clear()
+
+
+def _klent_policy_chunks(
+    model: KlentNet,
+    states: list[object],
+    *,
+    model_config,
+    device: torch.device,
+    precision: str,
+) -> list[torch.Tensor]:
+    """Evaluate a KLENT model across one or more crop-compatible batches."""
+
+    ordered_states, source_indices = order_states_for_batching(
+        states, model_config
+    )
+    chunks: list[torch.Tensor] = []
+    for batch_cpu, _state_slice in prepare_graph_batches(
+        ordered_states,
+        model_config=model_config,
+        edge_budget=0,
+    ):
+        batch = move_batch_to_device(batch_cpu, device)
+        with _autocast(device, precision):
+            output = model.forward_batch(batch)
+        counts = [
+            int(item) for item in output.legal_counts.detach().cpu().tolist()
+        ]
+        chunks.extend(output.policy_logits.split(counts))
+    return restore_state_order(chunks, source_indices)
+
+
+def _compatible_outputs(
+    model: torch.nn.Module,
+    states: list[object],
+    *,
+    model_config,
+    device: torch.device,
+    precision: str,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Evaluate an A0 model or KLENT MCTS adapter over raster shape runs."""
+
+    ordered_states, source_indices = order_states_for_batching(
+        states, model_config
+    )
+    policy_chunks: list[torch.Tensor] = []
+    value_chunks: list[torch.Tensor] = []
+    for batch_cpu, _state_slice in prepare_graph_batches(
+        ordered_states,
+        model_config=model_config,
+        edge_budget=0,
+    ):
+        batch = move_batch_to_device(batch_cpu, device)
+        with torch.inference_mode(), _autocast(device, precision):
+            policy_logits, values = model.forward_batch(batch)
+        policy_chunks.extend(policy_logits)
+        value_chunks.extend(values.unbind())
+    return (
+        restore_state_order(policy_chunks, source_indices),
+        restore_state_order(value_chunks, source_indices),
+    )
 
 
 def resolve_lagged_checkpoint(
@@ -161,19 +226,33 @@ def _compatible_mcts_move_selector(
         return None
 
     import hexo_rs
-    from hexo_a0.evaluate import make_eval_fn
-    from hexo_a0.graph import graph_fn_from_model_config
+    if is_dense_axis_config(model_config):
+        def model_eval_fn(states):
+            logits, values = _compatible_outputs(
+                model,
+                list(states),
+                model_config=model_config,
+                device=device,
+                precision=precision,
+            )
+            return (
+                [chunk.tolist() for chunk in logits],
+                [float(value) for value in values],
+            )
+    else:
+        from hexo_a0.evaluate import make_eval_fn
+        from hexo_a0.graph import graph_fn_from_model_config
 
-    graph_fn = graph_fn_from_model_config(model_config)
-    model_eval_fn = make_eval_fn(
-        model,
-        device,
-        graph_type=model_config.graph_type,
-        prune_empty_edges=model_config.prune_empty_edges,
-        threat_features=model_config.threat_features,
-        relative_stones=model_config.relative_stone_encoding,
-        graph_fn=graph_fn,
-    )
+        graph_fn = graph_fn_from_model_config(model_config)
+        model_eval_fn = make_eval_fn(
+            model,
+            device,
+            graph_type=model_config.graph_type,
+            prune_empty_edges=model_config.prune_empty_edges,
+            threat_features=model_config.threat_features,
+            relative_stones=model_config.relative_stone_encoding,
+            graph_fn=graph_fn,
+        )
 
     def eval_fn(states):
         # make_eval_fn predates KLENT's configurable inference precision.
@@ -291,18 +370,13 @@ def evaluate_vs_random(
 
                 if model_indices:
                     states = [records[index]["game"] for index in model_indices]
-                    [(batch_cpu, _state_slice)] = prepare_graph_batches(
+                    chunks = _klent_policy_chunks(
+                        model,
                         states,
                         model_config=model_config,
-                        edge_budget=0,
+                        device=device,
+                        precision=precision,
                     )
-                    batch = move_batch_to_device(batch_cpu, device)
-                    with _autocast(device, precision):
-                        output = model.forward_batch(batch)
-                    counts = [
-                        int(item) for item in output.legal_counts.cpu().tolist()
-                    ]
-                    chunks = output.policy_logits.split(counts)
                     for index, logits in zip(
                         model_indices, chunks, strict=True
                     ):
@@ -448,19 +522,13 @@ def evaluate_vs_checkpoint(
                         states = [
                             records[index]["game"] for index in model_indices
                         ]
-                        [(batch_cpu, _state_slice)] = prepare_graph_batches(
+                        chunks = _klent_policy_chunks(
+                            model,
                             states,
                             model_config=model_config,
-                            edge_budget=0,
+                            device=device,
+                            precision=precision,
                         )
-                        batch = move_batch_to_device(batch_cpu, device)
-                        with _autocast(device, precision):
-                            output = model.forward_batch(batch)
-                        counts = [
-                            int(item)
-                            for item in output.legal_counts.cpu().tolist()
-                        ]
-                        chunks = output.policy_logits.split(counts)
                         for index, logits in zip(
                             model_indices, chunks, strict=True
                         ):
@@ -474,16 +542,13 @@ def evaluate_vs_checkpoint(
                             records[index]["game"]
                             for index in opponent_indices
                         ]
-                        [(batch_cpu, _state_slice)] = prepare_graph_batches(
+                        policy_logits, _values = _compatible_outputs(
+                            opponent,
                             states,
                             model_config=opponent_config,
-                            edge_budget=0,
+                            device=device,
+                            precision=precision,
                         )
-                        batch = move_batch_to_device(batch_cpu, device)
-                        with _autocast(device, precision):
-                            policy_logits, _values = opponent.forward_batch(
-                                batch
-                            )
                         for index, logits in zip(
                             opponent_indices, policy_logits, strict=True
                         ):
@@ -702,18 +767,13 @@ def evaluate_vs_sealbot(
 
                 if model_indices:
                     states = [records[index]["game"] for index in model_indices]
-                    [(batch_cpu, _state_slice)] = prepare_graph_batches(
+                    chunks = _klent_policy_chunks(
+                        model,
                         states,
                         model_config=model_config,
-                        edge_budget=0,
+                        device=device,
+                        precision=precision,
                     )
-                    batch = move_batch_to_device(batch_cpu, device)
-                    with _autocast(device, precision):
-                        output = model.forward_batch(batch)
-                    counts = [
-                        int(item) for item in output.legal_counts.cpu().tolist()
-                    ]
-                    chunks = output.policy_logits.split(counts)
                     for index, logits in zip(
                         model_indices, chunks, strict=True
                     ):

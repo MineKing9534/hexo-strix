@@ -7,15 +7,15 @@ from torch_geometric.data import Batch
 
 import hexo_rs
 from hexo_a0.config import ModelConfig
-from hexo_a0.evaluate import make_eval_fn
+from hexo_a0.evaluate import make_eval_fn, sample_opening
 from hexo_a0.graph import (
     graph_batch_fn_from_model_config,
     graph_fn_from_model_config,
 )
 from hexo_a0.head_to_head import load_checkpoint
-from hexo_klent.config import AlgorithmConfig
+from hexo_klent.config import AlgorithmConfig, KlentModelConfig
 from hexo_klent.mcts_adapter import KlentMCTSAdapter
-from hexo_klent.model import KlentNet
+from hexo_klent.model import KlentNet, make_klent_net
 
 
 def tiny_model_config() -> ModelConfig:
@@ -32,6 +32,29 @@ def tiny_model_config() -> ModelConfig:
         axis_window=8,
         compact_stone_onehot=True,
         node_coords=False,
+    )
+
+
+def tiny_dense_model_config() -> KlentModelConfig:
+    return KlentModelConfig(
+        architecture="dense_axis",
+        dense_ray_radius=5,
+        hidden_dim=8,
+        num_layers=1,
+        num_heads=1,
+        policy_hidden=8,
+        q_hidden=4,
+        pre_norm=True,
+        dropout=0.0,
+        graph_type="axis",
+        prune_empty_edges=True,
+        threat_features=True,
+        relative_stone_encoding=True,
+        axis_relational=True,
+        axis_window=8,
+        compact_stone_onehot=True,
+        node_coords=False,
+        moves_scope="node",
     )
 
 
@@ -52,11 +75,19 @@ def test_adapter_derives_value_from_improved_policy_q_expectation():
     torch.testing.assert_close(values, torch.full((2,), 0.25))
 
 
-def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(tmp_path):
-    config = tiny_model_config()
+@pytest.mark.parametrize("architecture", ["graph", "dense_axis"])
+def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(
+    tmp_path,
+    architecture,
+):
+    config = (
+        tiny_dense_model_config()
+        if architecture == "dense_axis"
+        else tiny_model_config()
+    )
     algorithm = AlgorithmConfig()
-    network = KlentNet(config)
-    checkpoint_path = tmp_path / "klent.pt"
+    network = make_klent_net(config)
+    checkpoint_path = tmp_path / f"klent-{architecture}.pt"
     torch.save(
         {
             "format": "hexo-klent-v1",
@@ -78,8 +109,10 @@ def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(tmp_path):
         threat_features=loaded.model_config.threat_features,
         relative_stones=loaded.model_config.relative_stone_encoding,
         graph_fn=graph_fn,
+        model_config=loaded.model_config,
     )
-    game = hexo_rs.GameState(hexo_rs.GameConfig(6, 1, 12))
+    game_config = hexo_rs.GameConfig(6, 1, 12)
+    game = hexo_rs.GameState(game_config)
     mcts_config = hexo_rs.MCTSConfig(
         n_simulations=4,
         m_actions=2,
@@ -96,3 +129,14 @@ def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(tmp_path):
     assert action in game.legal_moves()
     assert len(improved) == game.legal_move_count()
     assert sum(improved) == pytest.approx(1.0)
+
+    opening = sample_opening(
+        loaded.model,
+        game_config,
+        torch.device("cpu"),
+        k=2,
+        temperature=0.5,
+        seed=4,
+        model_config=loaded.model_config,
+    )
+    assert len(opening) == 2

@@ -10,6 +10,65 @@ from hexo_a0.graph import (
     graph_batch_fn_from_model_config,
 )
 from hexo_a0.model import legacy_edges_to_lean, legacy_lean_columns
+from hexo_axis_models import decode_hxr1
+from hexo_klent.model import is_dense_axis_config
+
+_RASTER_BUCKETS = (9, 17, 25, 33, 41, 49, 65, 81, 97, 129)
+
+
+def raster_shape(state: object) -> tuple[int, int]:
+    """Return the exact default Rust crop bucket for one non-terminal state."""
+
+    coords = [
+        coord for coord, _player in state.placed_stones()
+    ]
+    coords.extend(state.legal_moves())
+    if not coords:
+        raise ValueError("cannot determine raster shape for an empty state")
+    q_values, r_values = zip(*coords, strict=True)
+    span_q = max(q_values) - min(q_values) + 1
+    span_r = max(r_values) - min(r_values) + 1
+    for bucket in _RASTER_BUCKETS:
+        if bucket >= span_q and bucket >= span_r:
+            return bucket, bucket
+
+    def round_bucket(span: int) -> int:
+        return 1 if span <= 1 else 1 + 8 * ((span - 1 + 7) // 8)
+
+    return round_bucket(span_q), round_bucket(span_r)
+
+
+def order_states_for_batching(
+    states: list[object],
+    model_config,
+) -> tuple[list[object], list[int]]:
+    """Group dense crop buckets and retain the original state indices."""
+
+    if not is_dense_axis_config(model_config):
+        return states, list(range(len(states)))
+    source_indices = sorted(
+        range(len(states)),
+        key=lambda index: raster_shape(states[index]),
+    )
+    return [states[index] for index in source_indices], source_indices
+
+
+def restore_state_order(
+    ordered_items: list[object],
+    source_indices: list[int],
+) -> list[object]:
+    """Undo ``order_states_for_batching`` for per-state model outputs."""
+
+    if len(ordered_items) != len(source_indices):
+        raise ValueError("ordered items and source indices must have equal length")
+    restored: list[object | None] = [None] * len(source_indices)
+    for source_index, item in zip(
+        source_indices, ordered_items, strict=True
+    ):
+        restored[source_index] = item
+    if any(item is None for item in restored):
+        raise ValueError("source indices are not a complete permutation")
+    return list(restored)
 
 
 def _packed_ranges(
@@ -153,6 +212,31 @@ def _axis_batches(
     return prepared
 
 
+def _raster_batches(
+    states: list[object],
+    *,
+    model_config,
+    cell_budget: int,
+) -> list[tuple[object, slice]]:
+    """Build contiguous same-shape dense batches within a compute-cell budget."""
+
+    import hexo_rs
+
+    encoded_batches = hexo_rs.game_states_to_raster_batches_hxr1(
+        states,
+        int(getattr(model_config, "dense_ray_radius", 5)),
+        bool(model_config.prune_empty_edges),
+        max(0, cell_budget),
+    )
+    return [
+        (
+            decode_hxr1(encoded),
+            slice(start, end),
+        )
+        for encoded, start, end in encoded_batches
+    ]
+
+
 def prepare_graph_batches(
     states: list[object],
     *,
@@ -171,6 +255,15 @@ def prepare_graph_batches(
 
     if not states:
         return []
+
+    if is_dense_axis_config(model_config):
+        # ``edge_budget`` is the established KLENT microbatch budget knob. For
+        # a dense backend its equivalent unit is padded raster cells.
+        return _raster_batches(
+            states,
+            model_config=model_config,
+            cell_budget=edge_budget,
+        )
 
     if (
         model_config.graph_type == "axis"
@@ -201,6 +294,6 @@ def prepare_graph_batches(
 
 
 def move_batch_to_device(batch, device: torch.device):
-    """Move a prepared PyG batch to a device."""
+    """Move a prepared graph or raster batch to a device."""
 
     return batch.to(device)

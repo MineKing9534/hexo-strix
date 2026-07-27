@@ -47,6 +47,20 @@ def sample_opening(model, game_config, device, k, temperature, seed,
     import hexo_rs
 
     graph_fn = _graph_fn_for(model_config)
+    dense_eval_fn = None
+    if getattr(model_config, "architecture", "graph") == "dense_axis":
+        dense_eval_fn = make_eval_fn(
+            model,
+            device,
+            graph_type=model_config.graph_type,
+            prune_empty_edges=model_config.prune_empty_edges,
+            threat_features=getattr(model_config, "threat_features", False),
+            relative_stones=getattr(
+                model_config, "relative_stone_encoding", False
+            ),
+            graph_fn=graph_fn,
+            model_config=model_config,
+        )
     for attempt in range(max_resamples):
         # Derived per-attempt seed keeps the result deterministic in `seed`
         # while letting rejected attempts explore a different line.
@@ -57,7 +71,8 @@ def sample_opening(model, game_config, device, k, temperature, seed,
             if game.is_terminal():
                 break
             move = _model_move(model, game, device,
-                               temperature=temperature, graph_fn=graph_fn)
+                               temperature=temperature, graph_fn=graph_fn,
+                               eval_fn=dense_eval_fn)
             game.apply_move(move[0], move[1])
             opening.append((int(move[0]), int(move[1])))
         if len(opening) == k and not game.is_terminal():
@@ -171,11 +186,13 @@ def play_eval_game(
     eval_fn = make_eval_fn(
         model, device, graph_type=graph_type, prune_empty_edges=prune,
         threat_features=threat, relative_stones=rel, graph_fn=graph_fn,
+        model_config=model_config,
     )
     opp_eval_fn = (
         make_eval_fn(
             opponent, device, graph_type=opp_graph_type, prune_empty_edges=opp_prune,
             threat_features=opp_threat, relative_stones=opp_rel, graph_fn=opp_graph_fn,
+            model_config=opponent_config,
         )
         if isinstance(opponent, torch.nn.Module) else None
     )
@@ -348,6 +365,7 @@ def make_eval_fn(
     threat_features: bool,
     relative_stones: bool,
     graph_fn,
+    model_config=None,
 ):
     """Build a batched ``states -> (logits_list, values_list)`` fn for gumbel_mcts.
 
@@ -356,7 +374,42 @@ def make_eval_fn(
     Rust-precomputed index tensors). Hex models keep the per-graph
     ``graph_fn`` + PyG-collation path.
     """
-    if graph_type == "axis":
+    if getattr(model_config, "architecture", "graph") == "dense_axis":
+        # Keep hexo-a0 independent of KLENT during ordinary production use.
+        # The lazy import is reached only for a dense KLENT checkpoint.
+        from hexo_klent.batching import (
+            move_batch_to_device,
+            order_states_for_batching,
+            prepare_graph_batches,
+            restore_state_order,
+        )
+
+        def eval_fn(states):
+            ordered, source_indices = order_states_for_batching(
+                list(states), model_config
+            )
+            ordered_logits = []
+            ordered_values = []
+            with torch.inference_mode():
+                for batch_cpu, _state_slice in prepare_graph_batches(
+                    ordered,
+                    model_config=model_config,
+                    edge_budget=0,
+                ):
+                    batch = move_batch_to_device(batch_cpu, device)
+                    policy_logits_list, values = model.forward_batch(batch)
+                    ordered_logits.extend(
+                        logits.detach().cpu().tolist()
+                        for logits in policy_logits_list
+                    )
+                    ordered_values.extend(
+                        float(value) for value in values.detach().cpu()
+                    )
+            return (
+                restore_state_order(ordered_logits, source_indices),
+                restore_state_order(ordered_values, source_indices),
+            )
+    elif graph_type == "axis":
         def eval_fn(states):
             batch, aux = axis_states_to_batch(
                 states, prune_empty_edges=prune_empty_edges,
@@ -407,7 +460,14 @@ def _choose_move(
             model, game, device, graph_fn, mcts_config,
             pending_forced=pending_forced, eval_fn=eval_fn,
         )
-    return _model_move(model, game, device, temperature=temperature, graph_fn=graph_fn)
+    return _model_move(
+        model,
+        game,
+        device,
+        temperature=temperature,
+        graph_fn=graph_fn,
+        eval_fn=eval_fn,
+    )
 
 
 def _mcts_argmax_move(
@@ -468,6 +528,7 @@ def _model_move(
     device: torch.device,
     temperature: float = 0.0,
     graph_fn=None,
+    eval_fn=None,
 ) -> tuple[int, int]:
     """Select a move using the model's policy logits.
 
@@ -476,15 +537,19 @@ def _model_move(
                      >0 = sample from softmax(logits/temperature).
         graph_fn: Graph builder function. Defaults to game_to_graph.
     """
-    if graph_fn is None:
-        graph_fn = game_to_graph
-    data = graph_fn(game)
-    batch = Batch.from_data_list([data]).to(device)
+    if eval_fn is not None:
+        logits_list, _values = eval_fn([game])
+        logits = torch.as_tensor(logits_list[0], device=device)
+    else:
+        if graph_fn is None:
+            graph_fn = game_to_graph
+        data = graph_fn(game)
+        batch = Batch.from_data_list([data]).to(device)
 
-    with torch.inference_mode():
-        policy_logits_list, _values = model.forward_batch(batch)
+        with torch.inference_mode():
+            policy_logits_list, _values = model.forward_batch(batch)
 
-    logits = policy_logits_list[0]
+        logits = policy_logits_list[0]
 
     if temperature <= 0.0:
         best_idx = int(logits.argmax().item())

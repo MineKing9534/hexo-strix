@@ -20,8 +20,10 @@ from hexo_klent.config import (
 )
 from hexo_klent.trainer import (
     Trainer,
+    _CudaCachePressureGate,
     _flat_training_targets,
     _gradient_clip_statistics,
+    _release_cuda_cache,
     _segmented_log_softmax,
     train_epoch,
 )
@@ -116,6 +118,119 @@ def test_gradient_clip_statistics_report_frequency_distribution_and_scale():
     assert metrics["clipped_optimizer_steps"] == 2.0
     assert metrics["clip_fraction"] == pytest.approx(0.5)
     assert metrics["mean_clip_scale"] == pytest.approx(0.6875)
+
+
+def test_release_cuda_cache_reports_and_releases_reserved_memory(monkeypatch):
+    gib = 1024**3
+    empty_cache_calls = []
+    reset_calls = []
+    reserved = iter([12 * gib, 3 * gib])
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_allocated",
+        lambda device: 2 * gib,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_reserved",
+        lambda device: next(reserved),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "max_memory_allocated",
+        lambda device: 7 * gib,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "max_memory_reserved",
+        lambda device: 14 * gib,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: empty_cache_calls.append(True),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "reset_peak_memory_stats",
+        lambda device: reset_calls.append(device),
+    )
+
+    metrics = _release_cuda_cache(
+        torch.device("cuda"),
+        phase="training",
+    )
+
+    assert empty_cache_calls == [True]
+    assert reset_calls == [torch.device("cuda")]
+    assert metrics == pytest.approx(
+        {
+            "memory/training_allocated_gib": 2.0,
+            "memory/training_reserved_before_gib": 12.0,
+            "memory/training_reserved_after_gib": 3.0,
+            "memory/training_cache_released_gib": 9.0,
+            "memory/training_peak_allocated_gib": 7.0,
+            "memory/training_peak_reserved_gib": 14.0,
+        }
+    )
+
+
+def test_release_cuda_cache_is_a_noop_on_cpu(monkeypatch):
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: pytest.fail("CPU cache release called torch.cuda"),
+    )
+
+    assert (
+        _release_cuda_cache(torch.device("cpu"), phase="training")
+        == {}
+    )
+
+
+def test_cuda_cache_pressure_gate_clears_only_over_threshold(monkeypatch):
+    gib = 1024**3
+    reserved = iter([10 * gib, 2 * gib, 7 * gib])
+    empty_cache_calls = []
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_reserved",
+        lambda device: next(reserved),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_allocated",
+        lambda device: 1 * gib,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: empty_cache_calls.append(True),
+    )
+    gate = _CudaCachePressureGate(
+        torch.device("cuda"),
+        threshold_bytes=8 * gib,
+        check_every=2,
+    )
+
+    assert gate.step() is False
+    assert gate.step() is True
+    assert gate.step() is False
+    assert gate.step() is False
+
+    assert empty_cache_calls == [True]
+    assert gate.metrics() == pytest.approx(
+        {
+            "allocator_pressure_checks": 2.0,
+            "allocator_pressure_clears": 1.0,
+            "allocator_pressure_released_gib": 8.0,
+            "allocator_pressure_max_reserved_gib": 10.0,
+            "allocator_pressure_threshold_gib": 8.0,
+            "allocator_pressure_check_every": 2.0,
+        }
+    )
 
 
 def test_gradient_clip_statistics_are_neutral_when_clipping_is_disabled():

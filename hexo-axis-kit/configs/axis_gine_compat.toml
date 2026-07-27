@@ -1,0 +1,25 @@
+# Architecture manifest for hexo_axis_models.AxisGineCompatNet.
+# This is not consumed by hexo-a0's current ModelConfig without an adapter.
+
+architecture = "axis_gine_compat"
+plane_count = 8
+scalar_count = 5
+hidden_dim = 128
+num_layers = 4
+line_radius = 5
+distance_bins = 8
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+value_hidden = 32
+value_bins = 65
+value_horizons = [4, 12, 32]
+use_layer_scale = false
+use_extra_conditioning = false
+
+[representation]
+buckets = [[9, 9], [17, 17], [25, 25], [33, 33], [41, 41], [49, 49], [65, 65], [81, 81], [97, 97], [129, 129]]
+ray_radius = 5
+prune_empty_edges = true
+win_length_scale = 7.0
+placement_radius_scale = 8.0
