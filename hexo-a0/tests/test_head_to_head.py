@@ -111,6 +111,48 @@ class TestHeadToHeadSmoke:
         assert summary["checkpoint_a"] == str(a)
         assert summary["checkpoint_b"] == str(b)
 
+    def test_pair_variance_stays_fixed_after_lucky_opening_pairs(
+        self, tmp_path, monkeypatch
+    ):
+        """A short all-win streak must not collapse variance and self-accept."""
+
+        from hexo_a0 import head_to_head as h2h
+
+        a = tmp_path / "a.pt"
+        b = tmp_path / "b.pt"
+        _save_tiny_checkpoint(a, MC_A)
+        _save_tiny_checkpoint(b, MC_B)
+
+        def candidate_always_wins(*_args, model_side, **_kwargs):
+            return {
+                "winner": model_side,
+                "moves": 1,
+                "move_log": [(0, 0)],
+            }
+
+        monkeypatch.setattr(h2h, "play_eval_game", candidate_always_wins)
+        summary = run_head_to_head(
+            checkpoint_a=a,
+            checkpoint_b=b,
+            win_length=4,
+            radius=2,
+            max_moves=20,
+            mcts_sims=0,
+            mcts_m_actions=4,
+            device_str="cpu",
+            sprt_alpha=0.05,
+            sprt_beta=0.05,
+            pair_variance=0.35,
+            max_games=5,
+            seed=0,
+        )
+
+        assert summary["games"] == 5
+        assert summary["decision"] == "continue"
+        assert summary["pair_variance"] == pytest.approx(0.35)
+        assert summary["empirical_pair_variance"] == pytest.approx(0.0)
+        assert summary["llr"] == pytest.approx(0.5428571428571433)
+
 
 class TestHeadToHeadStateFile:
     def test_state_file_written_each_game(self, tmp_path):
@@ -193,6 +235,7 @@ class TestCliRegistration:
         assert ns.device == "cpu"
         assert ns.sprt_s0 == pytest.approx(0.50)
         assert ns.sprt_s1 == pytest.approx(0.55)
+        assert ns.pair_variance == pytest.approx(0.5)
         assert ns.max_games == 1000
         assert ns.state_file is None
         assert ns.a_forcing_mode == "root"

@@ -71,11 +71,19 @@ def _parser() -> argparse.ArgumentParser:
         "--resume",
         help="checkpoint path to resume, or 'latest' in run.output_dir",
     )
+    train.add_argument(
+        "--resume-configured-lr",
+        action="store_true",
+        help=(
+            "when resuming, preserve optimizer state but replace its restored "
+            "learning rate with training.learning_rate from the config"
+        ),
+    )
     checkpoint_source.add_argument(
         "--init-from",
         help=(
-            "production Axis-GINE Q-head checkpoint used to initialize a new "
-            "dense KLENT run"
+            "compatible production Axis-GINE Q-head or dense KLENT "
+            "checkpoint used to initialize a new KLENT run"
         ),
     )
     train.add_argument("--device", help="override run.device")
@@ -162,6 +170,8 @@ def main(argv: list[str] | None = None) -> None:
         if args.iterations is not None and args.iterations <= 0:
             raise SystemExit("--iterations must be positive")
         resume = _resolve_resume(args.resume, config.run.output_dir)
+        if args.resume_configured_lr and resume is None:
+            raise SystemExit("--resume-configured-lr requires --resume")
 
         use_tui = sys.stdout.isatty() if args.tui is None else args.tui
         dashboard = None
@@ -182,6 +192,7 @@ def main(argv: list[str] | None = None) -> None:
                 config,
                 tensorboard=not args.no_tensorboard,
                 resume=resume,
+                resume_configured_lr=args.resume_configured_lr,
                 init_from=args.init_from,
                 display=dashboard,
             )

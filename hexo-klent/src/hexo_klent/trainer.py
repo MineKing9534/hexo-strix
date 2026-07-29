@@ -6,8 +6,11 @@ import dataclasses
 import hashlib
 import json
 import logging
+import math
 import os
 import random
+import re
+import resource
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -28,7 +31,7 @@ from hexo_klent.batching import (
     prepare_graph_batches,
     raster_shape,
 )
-from hexo_klent.config import Config
+from hexo_klent.config import Config, KlentModelConfig, TrainingConfig
 from hexo_klent.evaluation import (
     CheckpointOpponentCache,
     evaluate_opponent,
@@ -36,9 +39,12 @@ from hexo_klent.evaluation import (
 from hexo_klent.model import (
     DenseAxisKlentNet,
     KlentNet,
+    PersistentRayKlentNet,
     compile_klent_forward,
     is_dense_axis_config,
+    load_dense_klent_graft,
     load_production_axis_weights,
+    load_production_graph_weights,
     make_klent_net,
 )
 
@@ -52,6 +58,48 @@ _CACHE_CLEAR_RESERVED_MB_ENV = "HEXO_CACHE_CLEAR_RESERVED_MB"
 _CACHE_CLEAR_CHECK_EVERY_ENV = "HEXO_CACHE_CLEAR_CHECK_EVERY"
 _DEFAULT_CACHE_CLEAR_RESERVED_MB = 8192.0
 _DEFAULT_CACHE_CLEAR_CHECK_EVERY = 128
+_MIN_COMPILER_NOFILE = 65_536
+_BEST_SO_FAR_FORMAT = "hexo-klent-best-so-far-v1"
+
+
+def _checkpoint_iteration_from_path(path: str | Path) -> int | None:
+    """Return the KLENT generation encoded in a checkpoint filename."""
+
+    match = re.fullmatch(r"checkpoint_(\d+)\.pt", Path(path).name)
+    return int(match.group(1)) if match is not None else None
+
+
+def _ensure_compiler_nofile_limit() -> tuple[int, int]:
+    """Give Inductor/Triton enough descriptors for compile-time autotuning."""
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard == resource.RLIM_INFINITY:
+        target = max(soft, _MIN_COMPILER_NOFILE)
+    else:
+        target = min(hard, max(soft, _MIN_COMPILER_NOFILE))
+    if target > soft:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        soft = target
+    logger.info("compiler_nofile soft=%d hard=%d", soft, hard)
+    return soft, hard
+
+
+def _learning_rate_for_iteration(
+    training: TrainingConfig,
+    iteration: int,
+) -> float:
+    """Return the generation-level linear warm-up learning rate."""
+
+    if iteration <= 0:
+        raise ValueError("iteration must be positive")
+    warmup = training.learning_rate_warmup_iterations
+    if warmup <= 1 or iteration >= warmup:
+        return training.learning_rate
+    progress = (iteration - 1) / (warmup - 1)
+    factor = training.learning_rate_warmup_start_factor + progress * (
+        1.0 - training.learning_rate_warmup_start_factor
+    )
+    return training.learning_rate * factor
 
 
 class _CudaCachePressureGate:
@@ -229,44 +277,99 @@ def _release_cuda_cache(
 def _segmented_log_softmax(
     logits: torch.Tensor,
     segment_ids: torch.Tensor,
-    num_segments: int,
+    segment_lengths: torch.Tensor,
+    max_segment_length: int,
 ) -> torch.Tensor:
-    """Compute independent stable log-softmaxes over flat segments."""
+    """Compute stable log-softmaxes over contiguous flat segments.
 
-    if logits.ndim != 1 or segment_ids.ndim != 1:
-        raise ValueError("logits and segment_ids must be one-dimensional")
+    ``scatter_reduce(..., reduce="amax")`` intermittently segfaults in the
+    ROCm runtime on this workload, as does ``segment_reduce``.  Legal actions
+    are already contiguous, so gather them into a compact padded matrix, use
+    the mature row-wise log-softmax kernel, and gather the valid prefixes back.
+    """
+
+    if (
+        logits.ndim != 1
+        or segment_ids.ndim != 1
+        or segment_lengths.ndim != 1
+    ):
+        raise ValueError(
+            "logits, segment_ids, and segment_lengths must be one-dimensional"
+        )
     if logits.numel() != segment_ids.numel():
         raise ValueError("logits and segment_ids must have equal length")
-    if num_segments <= 0:
-        raise ValueError("num_segments must be positive")
+    if segment_lengths.numel() <= 0:
+        raise ValueError("segment_lengths must not be empty")
+    if max_segment_length <= 0:
+        raise ValueError("max_segment_length must be positive")
 
-    # Detaching the per-segment shift is mathematically neutral and avoids
-    # differentiating through the amax reduction. The remaining expression is
-    # exactly the usual numerically stable log-softmax.
-    maxima = torch.full(
-        (num_segments,),
-        -torch.inf,
-        dtype=logits.dtype,
-        device=logits.device,
-    ).scatter_reduce(
-        0,
-        segment_ids,
-        logits.detach(),
-        reduce="amax",
-        include_self=True,
+    num_segments = segment_lengths.numel()
+    offsets = segment_lengths.cumsum(0) - segment_lengths
+    columns = torch.arange(
+        max_segment_length,
+        dtype=segment_lengths.dtype,
+        device=segment_lengths.device,
     )
-    shifted = logits - maxima.index_select(0, segment_ids)
-    normalizers = torch.zeros(
-        num_segments,
-        dtype=logits.dtype,
-        device=logits.device,
-    ).scatter_add(0, segment_ids, shifted.exp())
-    return shifted - normalizers.log().index_select(0, segment_ids)
+    valid = columns.unsqueeze(0) < segment_lengths.unsqueeze(1)
+    padded_indices = offsets.unsqueeze(1) + columns.unsqueeze(0)
+    padded_logits = logits.index_select(
+        0,
+        padded_indices.clamp_max(logits.numel() - 1).reshape(-1),
+    ).reshape(num_segments, max_segment_length)
+    padded_log_policy = F.log_softmax(
+        padded_logits.masked_fill(~valid, -torch.inf),
+        dim=1,
+    )
+    flat_offsets = offsets.index_select(0, segment_ids)
+    within_segment = torch.arange(
+        logits.numel(),
+        dtype=segment_ids.dtype,
+        device=segment_ids.device,
+    ) - flat_offsets
+    return padded_log_policy[segment_ids, within_segment]
+
+
+def _segmented_argmax(
+    values: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    max_segment_length: int,
+) -> torch.Tensor:
+    """Return relative argmax indices for contiguous flat segments."""
+
+    if values.ndim != 1 or segment_lengths.ndim != 1:
+        raise ValueError("values and segment_lengths must be one-dimensional")
+    if segment_lengths.numel() <= 0:
+        raise ValueError("segment_lengths must not be empty")
+    if max_segment_length <= 0:
+        raise ValueError("max_segment_length must be positive")
+    if int(segment_lengths.sum().item()) != values.numel():
+        raise ValueError("segment lengths must sum to the number of values")
+
+    offsets = segment_lengths.cumsum(0) - segment_lengths
+    columns = torch.arange(
+        max_segment_length,
+        dtype=segment_lengths.dtype,
+        device=segment_lengths.device,
+    )
+    valid = columns.unsqueeze(0) < segment_lengths.unsqueeze(1)
+    padded_indices = offsets.unsqueeze(1) + columns.unsqueeze(0)
+    padded_values = values.index_select(
+        0,
+        padded_indices.clamp_max(values.numel() - 1).reshape(-1),
+    ).reshape(segment_lengths.numel(), max_segment_length)
+    return padded_values.masked_fill(~valid, -torch.inf).argmax(dim=1)
 
 
 def _flat_training_targets(
     samples: list[TrajectoryStep],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    torch.Tensor,
+]:
     """Pack variable-length policy and selected-action targets on CPU."""
 
     counts = torch.tensor(
@@ -300,7 +403,7 @@ def _flat_training_targets(
         int(sample.target_policy.argmax().item()) == sample.action_index
         for sample in samples
     )
-    return target_policy, segment_ids, chosen, target_q, target_top1
+    return target_policy, segment_ids, chosen, target_q, target_top1, counts
 
 
 def _prepare_training_chunk(
@@ -379,6 +482,326 @@ def _prepared_training_batches(
         yield future.result()
 
 
+def _policy_diagnostic_slice(
+    samples: list[TrajectoryStep],
+    limit: int,
+) -> list[TrajectoryStep]:
+    """Select a deterministic collection-wide slice for policy tracking."""
+
+    if limit <= 0 or not samples:
+        return []
+    if len(samples) <= limit:
+        return list(samples)
+
+    stride = len(samples) / limit
+    return [
+        samples[min(len(samples) - 1, int((index + 0.5) * stride))]
+        for index in range(limit)
+    ]
+
+
+def _stored_policy_target_kl(
+    samples: list[TrajectoryStep],
+) -> float | None:
+    """Return collection-time target/prior KL when every sample records it."""
+
+    values = [sample.target_prior_kl for sample in samples]
+    if not values or any(value is None for value in values):
+        return None
+    return sum(float(value) for value in values) / len(values)
+
+
+def _measure_policy_target_diagnostics(
+    model: KlentNet,
+    samples: list[TrajectoryStep],
+    *,
+    model_config,
+    device: torch.device,
+    precision: str,
+    batch_size: int,
+    edge_budget: int,
+) -> tuple[float, float]:
+    """Measure target KL and target/current top-1 agreement without updates."""
+
+    if not samples:
+        raise ValueError("policy target diagnostic requires samples")
+
+    was_training = model.training
+    total_kl = torch.zeros((), device=device)
+    top1_agreements = torch.zeros((), device=device, dtype=torch.long)
+    seen = 0
+    model.eval()
+    try:
+        with torch.inference_mode():
+            for prepared_outer_batch in _prepared_training_batches(
+                samples,
+                batch_size=batch_size,
+                model_config=model_config,
+                edge_budget=edge_budget,
+                prefetch=False,
+            ):
+                for batch_cpu, packed_samples, packed_targets in (
+                    prepared_outer_batch
+                ):
+                    (
+                        target_policy_cpu,
+                        segment_ids_cpu,
+                        _chosen_cpu,
+                        _target_q_cpu,
+                        _target_top1,
+                        segment_lengths_cpu,
+                    ) = packed_targets
+                    batch = move_batch_to_device(batch_cpu, device)
+                    target_policy = target_policy_cpu.to(device)
+                    segment_ids = segment_ids_cpu.to(device)
+                    segment_lengths = segment_lengths_cpu.to(device)
+                    count = len(packed_samples)
+                    with _autocast(device, precision):
+                        output = model.forward_batch(batch)
+                    if output.policy_logits.numel() != target_policy.numel():
+                        raise RuntimeError(
+                            "stored target policies no longer match legal moves"
+                        )
+                    log_policy = _segmented_log_softmax(
+                        output.policy_logits.float(),
+                        segment_ids,
+                        segment_lengths,
+                        int(segment_lengths_cpu.max().item()),
+                    )
+                    max_segment_length = int(
+                        segment_lengths_cpu.max().item()
+                    )
+                    target_argmax = _segmented_argmax(
+                        target_policy,
+                        segment_lengths,
+                        max_segment_length,
+                    )
+                    current_argmax = _segmented_argmax(
+                        output.policy_logits.float(),
+                        segment_lengths,
+                        max_segment_length,
+                    )
+                    top1_agreements.add_(
+                        (target_argmax == current_argmax).sum()
+                    )
+                    total_kl.add_(
+                        (
+                            target_policy
+                            * (
+                                target_policy.clamp_min(1e-12).log()
+                                - log_policy
+                            )
+                        ).sum()
+                    )
+                    seen += count
+                    del (
+                        batch,
+                        target_policy,
+                        segment_ids,
+                        segment_lengths,
+                        output,
+                        log_policy,
+                        target_argmax,
+                        current_argmax,
+                    )
+    finally:
+        model.train(was_training)
+
+    values = torch.stack((total_kl, top1_agreements.float())).cpu().tolist()
+    mean_kl = float(values[0]) / seen
+    if math.isfinite(mean_kl):
+        mean_kl = max(0.0, mean_kl)
+    return mean_kl, float(values[1]) / seen
+
+
+def _measure_policy_q_trunk_gradients(
+    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+    samples: list[TrajectoryStep],
+    *,
+    model_config,
+    device: torch.device,
+    precision: str,
+    batch_size: int,
+    edge_budget: int,
+    q_loss_weight: float,
+) -> dict[str, float]:
+    """Compare policy and weighted-Q gradients across the diagnostic slice.
+
+    This deliberately excludes both output heads. The cosine therefore
+    measures whether the two losses agree about the shared representation,
+    which is the only route by which the Q objective can rewrite policy
+    features. Gradients are accumulated as example-weighted means across all
+    edge-budgeted microbatches. Using the complete deterministic slice avoids
+    mistaking one small graph-shape-dependent microbatch for a generation-wide
+    interaction, while leaving the optimizer and model parameters unchanged.
+    """
+
+    if not samples:
+        raise ValueError("trunk gradient diagnostic requires samples")
+
+    excluded = {
+        id(parameter)
+        for head in (model.policy_head, model.q_head)
+        for parameter in head.parameters()
+    }
+    trunk_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in excluded
+    ]
+    if not trunk_parameters:
+        raise RuntimeError("model has no shared policy/Q trunk parameters")
+
+    started_at = time.monotonic()
+    was_training = model.training
+    model.eval()
+    try:
+        policy_gradient_sums = [
+            torch.zeros_like(parameter, dtype=torch.float32)
+            for parameter in trunk_parameters
+        ]
+        q_gradient_sums = [
+            torch.zeros_like(parameter, dtype=torch.float32)
+            for parameter in trunk_parameters
+        ]
+        seen = 0
+        fit_q_is_selected = isinstance(model, KlentNet)
+        for prepared in _prepared_training_batches(
+            samples,
+            batch_size=batch_size,
+            model_config=model_config,
+            edge_budget=edge_budget,
+            prefetch=False,
+        ):
+            for batch_cpu, packed_samples, packed_targets in prepared:
+                (
+                    target_policy_cpu,
+                    segment_ids_cpu,
+                    chosen_cpu,
+                    target_q_cpu,
+                    _target_top1,
+                    segment_lengths_cpu,
+                ) = packed_targets
+                batch = move_batch_to_device(batch_cpu, device)
+                target_policy = target_policy_cpu.to(device)
+                segment_ids = segment_ids_cpu.to(device)
+                chosen = chosen_cpu.to(device)
+                target_q = target_q_cpu.to(device)
+                segment_lengths = segment_lengths_cpu.to(device)
+                count = len(packed_samples)
+
+                def component_losses() -> tuple[torch.Tensor, torch.Tensor]:
+                    # Independent calls are intentional. Compiled AOTAutograd
+                    # may donate saved buffers to backward, which forbids
+                    # retaining one compiled graph for two autograd.grad calls
+                    # on ROCm/CUDA.
+                    with _autocast(device, precision):
+                        if fit_q_is_selected:
+                            output = model.forward_fit(batch, chosen)
+                        else:
+                            output = model.forward_batch(batch)
+                        log_policy = _segmented_log_softmax(
+                            output.policy_logits.float(),
+                            segment_ids,
+                            segment_lengths,
+                            int(segment_lengths_cpu.max().item()),
+                        )
+                        policy_loss = (
+                            -(target_policy * log_policy).sum() / count
+                        )
+                        predicted_q = (
+                            output.q_values
+                            if fit_q_is_selected
+                            else output.q_values.index_select(0, chosen)
+                        ).float()
+                        weighted_q_loss = q_loss_weight * F.mse_loss(
+                            predicted_q,
+                            target_q,
+                        )
+                    return policy_loss, weighted_q_loss
+
+                policy_loss, unused_q_loss = component_losses()
+                del unused_q_loss
+                policy_gradients = torch.autograd.grad(
+                    policy_loss,
+                    trunk_parameters,
+                    allow_unused=True,
+                )
+                del policy_loss
+                unused_policy_loss, weighted_q_loss = component_losses()
+                del unused_policy_loss
+                q_gradients = torch.autograd.grad(
+                    weighted_q_loss,
+                    trunk_parameters,
+                    allow_unused=True,
+                )
+                del weighted_q_loss
+                for index, (policy_gradient, q_gradient) in enumerate(
+                    zip(policy_gradients, q_gradients, strict=True)
+                ):
+                    if policy_gradient is not None:
+                        policy_gradient_sums[index].add_(
+                            policy_gradient.detach().float(),
+                            alpha=count,
+                        )
+                    if q_gradient is not None:
+                        q_gradient_sums[index].add_(
+                            q_gradient.detach().float(),
+                            alpha=count,
+                        )
+                seen += count
+                del (
+                    batch,
+                    target_policy,
+                    segment_ids,
+                    chosen,
+                    target_q,
+                    segment_lengths,
+                    policy_gradients,
+                    q_gradients,
+                )
+
+        if seen != len(samples):
+            raise RuntimeError(
+                "trunk gradient diagnostic did not consume every sample: "
+                f"seen={seen}, expected={len(samples)}"
+            )
+        policy_sq = torch.zeros((), device=device)
+        q_sq = torch.zeros((), device=device)
+        dot = torch.zeros((), device=device)
+        inverse_seen = 1.0 / seen
+        for policy_gradient, q_gradient in zip(
+            policy_gradient_sums,
+            q_gradient_sums,
+            strict=True,
+        ):
+            policy_gradient.mul_(inverse_seen)
+            q_gradient.mul_(inverse_seen)
+            policy_sq.add_(policy_gradient.square().sum())
+            q_sq.add_(q_gradient.square().sum())
+            dot.add_((policy_gradient * q_gradient).sum())
+
+        policy_norm = policy_sq.sqrt()
+        q_norm = q_sq.sqrt()
+        denominator = policy_norm * q_norm
+        cosine = torch.where(
+            denominator > 0,
+            dot / denominator,
+            torch.zeros_like(dot),
+        ).clamp(-1.0, 1.0)
+        values = torch.stack((policy_norm, q_norm, cosine)).cpu().tolist()
+    finally:
+        model.train(was_training)
+
+    return {
+        "trunk_gradient_diagnostic_examples": float(seen),
+        "trunk_gradient_diagnostic_seconds": time.monotonic() - started_at,
+        "policy_trunk_grad_norm": float(values[0]),
+        "q_trunk_grad_norm": float(values[1]),
+        "policy_q_trunk_grad_cosine": float(values[2]),
+    }
+
+
 def _gradient_clip_statistics(
     grad_norms: torch.Tensor,
     max_grad_norm: float,
@@ -403,6 +826,112 @@ def _gradient_clip_statistics(
         "clip_fraction": float(clipped.float().mean().item()),
         "mean_clip_scale": float(clip_scales.mean().item()),
     }
+
+
+def _global_l2_norm(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Return one L2 norm across a homogeneous list of device tensors."""
+
+    if not tensors:
+        raise ValueError("cannot measure an empty tensor list")
+    per_tensor = torch._foreach_norm(tensors, 2.0)
+    return torch.linalg.vector_norm(
+        torch.stack([value.float() for value in per_tensor])
+    )
+
+
+def _optimizer_update_statistics(
+    update_norms: torch.Tensor,
+    update_to_weight_ratios: torch.Tensor,
+) -> dict[str, float]:
+    """Summarize exact parameter movement across optimizer steps."""
+
+    if (
+        update_norms.ndim != 1
+        or update_to_weight_ratios.ndim != 1
+        or update_norms.numel() == 0
+        or update_norms.shape != update_to_weight_ratios.shape
+    ):
+        raise ValueError("optimizer update samples must be paired 1-D tensors")
+    norms = update_norms.detach().float().cpu()
+    ratios = update_to_weight_ratios.detach().float().cpu()
+    return {
+        "mean_parameter_update_norm": float(norms.mean().item()),
+        "parameter_update_norm_p95": float(
+            torch.quantile(norms, 0.95).item()
+        ),
+        "mean_update_to_weight_ratio": float(ratios.mean().item()),
+        "update_to_weight_ratio_p95": float(
+            torch.quantile(ratios, 0.95).item()
+        ),
+    }
+
+
+def _seed_fit_compilation(
+    model: KlentNet,
+    optimizer: torch.optim.Optimizer,
+    prepared_outer_batch,
+    *,
+    device: torch.device,
+    precision: str,
+    q_loss_weight: float,
+) -> None:
+    """Compile FIT at a representative graph size without updating weights."""
+
+    target_nodes = int(getattr(model, "_fit_compile_seed_nodes", 0))
+    if target_nodes <= 0 or bool(
+        getattr(model, "_fit_compile_seeded", False)
+    ):
+        return
+    batch_cpu, packed_samples, packed_targets = min(
+        prepared_outer_batch,
+        key=lambda item: abs(int(item[0].x.shape[0]) - target_nodes),
+    )
+    (
+        target_policy_cpu,
+        segment_ids_cpu,
+        chosen_cpu,
+        target_q_cpu,
+        _target_top1,
+        segment_lengths_cpu,
+    ) = packed_targets
+    count = len(packed_samples)
+    optimizer.zero_grad(set_to_none=True)
+    fork_devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()]
+        if device.type == "cuda"
+        else []
+    )
+    try:
+        # A compile seed must not consume dropout or other model RNG relative
+        # to the real exactly-once epoch.
+        with torch.random.fork_rng(devices=fork_devices):
+            batch = move_batch_to_device(batch_cpu, device)
+            target_policy = target_policy_cpu.to(device)
+            segment_ids = segment_ids_cpu.to(device)
+            chosen = chosen_cpu.to(device)
+            target_q = target_q_cpu.to(device)
+            segment_lengths = segment_lengths_cpu.to(device)
+            with _autocast(device, precision):
+                output = model.forward_fit(batch, chosen)
+                if output.policy_logits.numel() != target_policy.numel():
+                    raise RuntimeError(
+                        "stored target policies no longer match legal moves"
+                    )
+                log_policy = _segmented_log_softmax(
+                    output.policy_logits.float(),
+                    segment_ids,
+                    segment_lengths,
+                    int(segment_lengths_cpu.max().item()),
+                )
+                policy_loss = -(target_policy * log_policy).sum() / count
+                q_loss = F.mse_loss(output.q_values.float(), target_q)
+                total_loss = policy_loss + q_loss_weight * q_loss
+            total_loss.backward()
+        model._fit_compile_seeded = True
+    finally:
+        # No optimizer step: parameters and optimizer state are bit-for-bit
+        # unchanged, and the real epoch still sees every example exactly once.
+        optimizer.zero_grad(set_to_none=True)
 
 
 def train_epoch(
@@ -437,12 +966,61 @@ def train_epoch(
         "total_loss": torch.zeros((), device=device),
     }
     grad_norms: list[torch.Tensor] = []
+    update_norms: list[torch.Tensor] = []
+    update_to_weight_ratios: list[torch.Tensor] = []
+    tracked_parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+        if parameter.requires_grad
+    ]
+    if not tracked_parameters:
+        raise ValueError("optimizer has no trainable parameters")
+    # Reuse one model-sized snapshot across all steps. This records exact
+    # AdamW movement without retaining one model copy per optimizer update.
+    parameter_snapshot = [
+        torch.empty_like(
+            parameter,
+            memory_format=torch.preserve_format,
+        )
+        for parameter in tracked_parameters
+    ]
     target_top1_total = 0
     seen = 0
+    updated_examples = 0
+    skipped_nonfinite_examples = 0
     microbatches = 0
+    attempted_optimizer_steps = 0
+    nonfinite_optimizer_steps = 0
     optimizer_steps = 0
     model.train()
     cache_pressure = _CudaCachePressureGate.from_environment(device)
+
+    if (
+        isinstance(model, KlentNet)
+        and int(getattr(model, "_fit_compile_seed_nodes", 0)) > 0
+        and not bool(getattr(model, "_fit_compile_seeded", False))
+    ):
+        # Build the seed without prefetch so compilation cannot retain the next
+        # outer graph batch while Inductor benchmarks candidate GEMMs.
+        seed_outer_batch = next(
+            _prepared_training_batches(
+                shuffled[:batch_size],
+                batch_size=batch_size,
+                model_config=model_config,
+                edge_budget=edge_budget,
+                prefetch=False,
+            )
+        )
+        _seed_fit_compilation(
+            model,
+            optimizer,
+            seed_outer_batch,
+            device=device,
+            precision=precision,
+            q_loss_weight=q_loss_weight,
+        )
+        del seed_outer_batch
 
     for prepared_outer_batch in (
         _prepared_training_batches(
@@ -466,6 +1044,12 @@ def train_epoch(
             if group_examples <= 0:
                 raise RuntimeError("prepared an empty optimizer batch")
             optimizer.zero_grad(set_to_none=True)
+            group_totals = {
+                "policy_loss": torch.zeros((), device=device),
+                "q_loss": torch.zeros((), device=device),
+                "total_loss": torch.zeros((), device=device),
+            }
+            group_target_top1 = 0
 
             for batch_cpu, packed_samples, packed_targets in optimizer_group:
                 (
@@ -474,15 +1058,21 @@ def train_epoch(
                     chosen_cpu,
                     target_q_cpu,
                     target_top1,
+                    segment_lengths_cpu,
                 ) = packed_targets
                 batch = move_batch_to_device(batch_cpu, device)
                 target_policy = target_policy_cpu.to(device)
                 segment_ids = segment_ids_cpu.to(device)
                 chosen = chosen_cpu.to(device)
                 target_q = target_q_cpu.to(device)
+                segment_lengths = segment_lengths_cpu.to(device)
                 count = len(packed_samples)
                 with _autocast(device, precision):
-                    output = model.forward_batch(batch)
+                    fit_q_is_selected = isinstance(model, KlentNet)
+                    if fit_q_is_selected:
+                        output = model.forward_fit(batch, chosen)
+                    else:
+                        output = model.forward_batch(batch)
                     if output.policy_logits.numel() != target_policy.numel():
                         raise RuntimeError(
                             "stored target policies no longer match legal moves"
@@ -490,13 +1080,16 @@ def train_epoch(
                     log_policy = _segmented_log_softmax(
                         output.policy_logits.float(),
                         segment_ids,
-                        count,
+                        segment_lengths,
+                        int(segment_lengths_cpu.max().item()),
                     )
                     policy_loss = (
                         -(target_policy * log_policy).sum() / count
                     )
-                    predicted_q = output.q_values.index_select(
-                        0, chosen
+                    predicted_q = (
+                        output.q_values
+                        if fit_q_is_selected
+                        else output.q_values.index_select(0, chosen)
                     ).float()
                     q_loss = F.mse_loss(predicted_q, target_q)
                     total_loss = policy_loss + q_loss_weight * q_loss
@@ -506,14 +1099,19 @@ def train_epoch(
                 (total_loss * (count / group_examples)).backward()
                 seen += count
                 microbatches += 1
-                totals["policy_loss"].add_(policy_loss.detach() * count)
-                totals["q_loss"].add_(q_loss.detach() * count)
-                totals["total_loss"].add_(total_loss.detach() * count)
-                target_top1_total += target_top1
+                group_totals["policy_loss"].add_(
+                    policy_loss.detach() * count
+                )
+                group_totals["q_loss"].add_(q_loss.detach() * count)
+                group_totals["total_loss"].add_(
+                    total_loss.detach() * count
+                )
+                group_target_top1 += target_top1
                 del (
                     batch,
                     target_policy,
                     segment_ids,
+                    segment_lengths,
                     chosen,
                     target_q,
                     output,
@@ -539,9 +1137,64 @@ def train_epoch(
                         ]
                     )
                 )
+            attempted_optimizer_steps += 1
+            finite_group = bool(
+                torch.isfinite(
+                    torch.stack(
+                        (
+                            grad_norm.detach().float(),
+                            group_totals["policy_loss"].float(),
+                            group_totals["q_loss"].float(),
+                            group_totals["total_loss"].float(),
+                        )
+                    )
+                )
+                .all()
+                .item()
+            )
+            if not finite_group:
+                nonfinite_optimizer_steps += 1
+                skipped_nonfinite_examples += group_examples
+                optimizer.zero_grad(set_to_none=True)
+                logger.warning(
+                    "discarding non-finite optimizer group step=%d examples=%d",
+                    attempted_optimizer_steps,
+                    group_examples,
+                )
+                continue
+
+            for name, value in group_totals.items():
+                totals[name].add_(value)
+            target_top1_total += group_target_top1
+            updated_examples += group_examples
+            with torch.no_grad():
+                torch._foreach_copy_(
+                    parameter_snapshot,
+                    tracked_parameters,
+                )
+                parameter_norm = _global_l2_norm(parameter_snapshot)
             optimizer.step()
+            with torch.no_grad():
+                torch._foreach_sub_(
+                    parameter_snapshot,
+                    tracked_parameters,
+                )
+                update_norm = _global_l2_norm(parameter_snapshot)
+                update_to_weight_ratio = update_norm / parameter_norm.clamp_min(
+                    torch.finfo(parameter_norm.dtype).tiny
+                )
             optimizer_steps += 1
             grad_norms.append(grad_norm.detach())
+            update_norms.append(update_norm.detach())
+            update_to_weight_ratios.append(
+                update_to_weight_ratio.detach()
+            )
+
+    if optimizer_steps == 0:
+        raise RuntimeError(
+            "all optimizer groups had non-finite losses or gradients; "
+            "no parameters were updated"
+        )
 
     summary = torch.cat(
         (
@@ -564,22 +1217,33 @@ def train_epoch(
         summary[3:],
         max_grad_norm,
     )
+    update_stats = _optimizer_update_statistics(
+        torch.stack(update_norms),
+        torch.stack(update_to_weight_ratios),
+    )
     elapsed_seconds = time.monotonic() - started_at
 
     return {
         "examples": float(seen),
+        "updated_examples": float(updated_examples),
+        "skipped_nonfinite_examples": float(skipped_nonfinite_examples),
         "microbatches": float(microbatches),
+        "attempted_optimizer_steps": float(attempted_optimizer_steps),
+        "nonfinite_optimizer_steps": float(nonfinite_optimizer_steps),
         "optimizer_steps": float(optimizer_steps),
         "mean_microbatch_size": seen / microbatches,
-        "mean_optimizer_batch_size": seen / optimizer_steps,
-        "mean_microbatches_per_step": microbatches / optimizer_steps,
+        "mean_optimizer_batch_size": updated_examples / optimizer_steps,
+        "mean_microbatches_per_step": (
+            microbatches / attempted_optimizer_steps
+        ),
         "elapsed_seconds": elapsed_seconds,
         "examples_per_second": seen / elapsed_seconds,
-        "policy_loss": policy_loss_total / seen,
-        "q_loss": q_loss_total / seen,
-        "total_loss": total_loss_total / seen,
+        "policy_loss": policy_loss_total / updated_examples,
+        "q_loss": q_loss_total / updated_examples,
+        "total_loss": total_loss_total / updated_examples,
         **gradient_stats,
-        "played_action_target_top1": target_top1_total / seen,
+        **update_stats,
+        "played_action_target_top1": target_top1_total / updated_examples,
         **cache_pressure.metrics(),
     }
 
@@ -593,11 +1257,14 @@ class Trainer:
         *,
         tensorboard: bool = True,
         resume: str | Path | None = None,
+        resume_configured_lr: bool = False,
         init_from: str | Path | None = None,
         display: TrainingDashboard | None = None,
     ) -> None:
         if resume is not None and init_from is not None:
             raise ValueError("resume and init_from are mutually exclusive")
+        if resume_configured_lr and resume is None:
+            raise ValueError("resume_configured_lr requires a resume checkpoint")
         self.config = config
         self.display = display
         self.device = torch.device(config.run.device)
@@ -621,7 +1288,14 @@ class Trainer:
                 "TORCHINDUCTOR_CACHE_DIR",
                 "/tmp/torchinductor_hexo/klent",
             )
-            compile_klent_forward(self.model)
+            _ensure_compiler_nofile_limit()
+            compile_klent_forward(
+                self.model,
+                fit_max_autotune=config.training.fit_max_autotune,
+                fit_compile_seed_nodes=(
+                    config.training.fit_compile_seed_nodes
+                ),
+            )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.training.learning_rate,
@@ -643,7 +1317,10 @@ class Trainer:
 
                 self.writer = SummaryWriter(self.output_dir / "tensorboard")
             if resume is not None:
-                self.load_checkpoint(resume)
+                self.load_checkpoint(
+                    resume,
+                    use_configured_learning_rate=resume_configured_lr,
+                )
             elif init_from is not None:
                 self.initialize_from_production(init_from)
             if config.collection.workers > 1:
@@ -654,7 +1331,12 @@ class Trainer:
             self.close()
             raise
 
-    def load_checkpoint(self, path: str | Path) -> None:
+    def load_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        use_configured_learning_rate: bool = False,
+    ) -> None:
         path = Path(path).expanduser().resolve()
         source_checkpoint_dir = path.parent
         if source_checkpoint_dir not in self._checkpoint_history_dirs:
@@ -670,6 +1352,20 @@ class Trainer:
                     self._checkpoint_history_dirs.append(resolved)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if use_configured_learning_rate:
+            configured_lr = self.config.training.learning_rate
+            restored_lrs = [
+                float(group["lr"]) for group in self.optimizer.param_groups
+            ]
+            for group in self.optimizer.param_groups:
+                group["lr"] = configured_lr
+                if "initial_lr" in group:
+                    group["initial_lr"] = configured_lr
+            logger.info(
+                "overrode resumed optimizer learning rate %s -> %.6g",
+                restored_lrs,
+                configured_lr,
+            )
         self.iteration = int(checkpoint["iteration"])
         initial_checkpoint = checkpoint.get("initial_checkpoint")
         if isinstance(initial_checkpoint, dict):
@@ -677,25 +1373,27 @@ class Trainer:
         logger.info("resumed %s at iteration %d", path, self.iteration)
 
     def initialize_from_production(self, path: str | Path) -> None:
-        """Initialize dense KLENT from a production Axis-GINE Q-head model."""
+        """Initialize KLENT from a compatible trained checkpoint."""
 
-        if not isinstance(self.model, DenseAxisKlentNet):
+        if not isinstance(
+            self.model,
+            (KlentNet, DenseAxisKlentNet, PersistentRayKlentNet),
+        ):
             raise ValueError(
-                "production checkpoint conversion requires "
-                "model.architecture='dense_axis'"
+                "checkpoint initialization requires a graph or dense-axis "
+                "model architecture"
             )
-        from hexo_a0.config import model_config_from_checkpoint
 
         path = Path(path).expanduser().resolve()
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(checkpoint, dict):
-            raise ValueError(f"production checkpoint {path} is not a dict")
-        source_config = model_config_from_checkpoint(checkpoint)
-        if not bool(getattr(source_config, "q_head", False)):
-            raise ValueError("production checkpoint does not contain a trained Q head")
+            raise ValueError(f"initial checkpoint {path} is not a dict")
+
         compatibility_fields = (
             "hidden_dim",
             "num_layers",
+            "num_heads",
+            "conv_type",
             "pre_norm",
             "dropout",
             "use_layer_scale",
@@ -713,6 +1411,76 @@ class Trainer:
             "node_coords",
             "moves_scope",
         )
+        if checkpoint.get("format") == "hexo-klent-v1":
+            if not isinstance(self.model, PersistentRayKlentNet):
+                raise ValueError(
+                    "a KLENT checkpoint may be used with --init-from only "
+                    "to graft persistent_ray_axis from dense_axis"
+                )
+            raw_config = checkpoint.get("model_config", {})
+            if not isinstance(raw_config, dict):
+                raise ValueError(
+                    "KLENT initial checkpoint has no model_config"
+                )
+            known = {
+                field.name
+                for field in dataclasses.fields(KlentModelConfig)
+            }
+            source_config = KlentModelConfig(
+                **{
+                    key: value
+                    for key, value in raw_config.items()
+                    if key in known
+                }
+            )
+            if source_config.architecture != "dense_axis":
+                raise ValueError(
+                    "persistent-ray graft source must use "
+                    "model.architecture='dense_axis'"
+                )
+            fields = (*compatibility_fields, "dense_ray_radius")
+            mismatches = [
+                f"{name}: source={getattr(source_config, name)!r}, "
+                f"target={getattr(self.config.model, name)!r}"
+                for name in fields
+                if getattr(source_config, name)
+                != getattr(self.config.model, name)
+            ]
+            if mismatches:
+                raise ValueError(
+                    "dense KLENT checkpoint does not match persistent-ray "
+                    "target: " + "; ".join(mismatches)
+                )
+            copied = load_dense_klent_graft(self.model, checkpoint)
+            self.initial_checkpoint = {
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "iteration": checkpoint.get("iteration"),
+                "copied_tensors": len(copied),
+                "graft": "persistent_ray_axis",
+            }
+            logger.info(
+                "initialized persistent-ray KLENT from %s "
+                "(%d tensors, source iteration=%s); optimizer starts fresh",
+                path,
+                len(copied),
+                checkpoint.get("iteration", "?"),
+            )
+            return
+
+        from hexo_a0.config import model_config_from_checkpoint
+
+        if (
+            isinstance(self.model, PersistentRayKlentNet)
+            and not self.model.config.exact_graft_init
+        ):
+            raise ValueError(
+                "production checkpoint grafting requires "
+                "model.exact_graft_init=true"
+            )
+        source_config = model_config_from_checkpoint(checkpoint)
+        if not bool(getattr(source_config, "q_head", False)):
+            raise ValueError("production checkpoint does not contain a trained Q head")
         mismatches = [
             f"{name}: source={getattr(source_config, name)!r}, "
             f"target={getattr(self.config.model, name)!r}"
@@ -721,21 +1489,33 @@ class Trainer:
         ]
         if mismatches:
             raise ValueError(
-                "production checkpoint architecture does not match dense KLENT: "
+                "production checkpoint architecture does not match KLENT: "
                 + "; ".join(mismatches)
             )
-        report = load_production_axis_weights(self.model, checkpoint)
+        if isinstance(self.model, KlentNet):
+            copied = load_production_graph_weights(self.model, checkpoint)
+            graft = "graph"
+        else:
+            report = load_production_axis_weights(self.model, checkpoint)
+            copied = report.copied
+            graft = (
+                "persistent_ray_axis"
+                if isinstance(self.model, PersistentRayKlentNet)
+                else "dense_axis"
+            )
         self.initial_checkpoint = {
             "path": str(path),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "train_steps": checkpoint.get("train_steps"),
-            "copied_tensors": len(report.copied),
+            "copied_tensors": len(copied),
+            "graft": graft,
         }
         logger.info(
-            "initialized dense KLENT from %s (%d tensors, train_steps=%s); "
+            "initialized %s KLENT from %s (%d tensors, train_steps=%s); "
             "optimizer starts fresh",
+            graft,
             path,
-            len(report.copied),
+            len(copied),
             checkpoint.get("train_steps", "?"),
         )
 
@@ -765,6 +1545,72 @@ class Trainer:
         temporary_path.replace(path)
         return path
 
+    def _best_so_far_state_path(self, opponent_name: str) -> Path:
+        safe_name = opponent_name.replace("/", "__")
+        return self.output_dir / "best_so_far" / f"{safe_name}.json"
+
+    def _write_best_so_far_state(
+        self,
+        opponent_name: str,
+        checkpoint: str | Path,
+        iteration: int | None,
+    ) -> dict[str, object]:
+        path = self._best_so_far_state_path(opponent_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = Path(checkpoint).expanduser().resolve()
+        state: dict[str, object] = {
+            "format": _BEST_SO_FAR_FORMAT,
+            "name": opponent_name,
+            "checkpoint": str(checkpoint_path),
+            "iteration": iteration,
+        }
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        temporary_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+        return state
+
+    def _load_best_so_far_state(
+        self,
+        opponent_name: str,
+        initial_checkpoint: str | Path,
+    ) -> dict[str, object]:
+        path = self._best_so_far_state_path(opponent_name)
+        if not path.exists():
+            checkpoint_path = Path(initial_checkpoint).expanduser().resolve()
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(
+                    f"best_so_far initial checkpoint not found: "
+                    f"{checkpoint_path}"
+                )
+            return self._write_best_so_far_state(
+                opponent_name,
+                checkpoint_path,
+                _checkpoint_iteration_from_path(checkpoint_path),
+            )
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("format") != _BEST_SO_FAR_FORMAT:
+            raise ValueError(f"invalid best_so_far state: {path}")
+        if raw.get("name") != opponent_name:
+            raise ValueError(
+                f"best_so_far state name mismatch in {path}: "
+                f"{raw.get('name')!r}"
+            )
+        checkpoint = raw.get("checkpoint")
+        if not isinstance(checkpoint, str) or not Path(checkpoint).is_file():
+            raise FileNotFoundError(
+                f"best_so_far checkpoint not found: {checkpoint!r}"
+            )
+        iteration = raw.get("iteration")
+        if iteration is not None and not isinstance(iteration, int):
+            raise ValueError(
+                f"invalid best_so_far iteration in {path}: {iteration!r}"
+            )
+        return raw
+
     def run(self, iterations: int | None = None) -> None:
         stop_at = (
             self.config.run.iterations
@@ -776,6 +1622,29 @@ class Trainer:
         try:
             while self.iteration < stop_at:
                 self.run_iteration()
+                if (
+                    self.display is not None
+                    and self.iteration < stop_at
+                ):
+                    def release_for_pause() -> None:
+                        _release_cuda_cache(
+                            self.device,
+                            phase="pause",
+                        )
+                        logger.info(
+                            "training paused after committed iteration %d",
+                            self.iteration,
+                        )
+
+                    paused = self.display.wait_if_paused(
+                        self.iteration,
+                        on_pause=release_for_pause,
+                    )
+                    if paused:
+                        logger.info(
+                            "training resumed at iteration %d",
+                            self.iteration,
+                        )
         finally:
             self.close()
         final_path = self.save_checkpoint(final=True)
@@ -842,12 +1711,44 @@ class Trainer:
             phase="collection",
         )
         samples = flatten_trajectories(trajectories)
+        diagnostic_samples = _policy_diagnostic_slice(
+            samples,
+            self.config.training.policy_diagnostic_samples,
+        )
+        policy_diagnostic_seconds = 0.0
+        policy_target_kl_collection = _stored_policy_target_kl(
+            diagnostic_samples
+        )
+        policy_target_kl_before = None
+        policy_target_top1_before = None
+        if diagnostic_samples:
+            diagnostic_started = time.monotonic()
+            (
+                policy_target_kl_before,
+                policy_target_top1_before,
+            ) = _measure_policy_target_diagnostics(
+                self.model,
+                diagnostic_samples,
+                model_config=self.config.model,
+                device=self.device,
+                precision=self.config.run.precision,
+                batch_size=self.config.training.batch_size,
+                edge_budget=self.config.training.edge_budget,
+            )
+            policy_diagnostic_seconds += time.monotonic() - diagnostic_started
         if self.display is not None:
             self.display.set_phase(
                 "FIT",
                 next_iteration,
                 f"one epoch across {len(samples):,} fresh examples",
             )
+        if self.config.training.learning_rate_warmup_iterations > 0:
+            scheduled_learning_rate = _learning_rate_for_iteration(
+                self.config.training,
+                next_iteration,
+            )
+            for group in self.optimizer.param_groups:
+                group["lr"] = scheduled_learning_rate
         training = train_epoch(
             self.model,
             self.optimizer,
@@ -863,6 +1764,86 @@ class Trainer:
             seed=seed,
             prefetch_batches=self.config.training.prefetch_batches,
         )
+        learning_rates = {
+            float(group["lr"]) for group in self.optimizer.param_groups
+        }
+        if len(learning_rates) != 1:
+            raise RuntimeError(
+                "KLENT metrics require one shared optimizer learning rate"
+            )
+        training["learning_rate"] = learning_rates.pop()
+        if diagnostic_samples:
+            training.update(
+                _measure_policy_q_trunk_gradients(
+                    self.model,
+                    diagnostic_samples,
+                    model_config=self.config.model,
+                    device=self.device,
+                    precision=self.config.run.precision,
+                    batch_size=self.config.training.batch_size,
+                    edge_budget=self.config.training.edge_budget,
+                    q_loss_weight=self.config.training.q_loss_weight,
+                )
+            )
+            diagnostic_started = time.monotonic()
+            (
+                policy_target_kl_after,
+                policy_target_top1_after,
+            ) = _measure_policy_target_diagnostics(
+                self.model,
+                diagnostic_samples,
+                model_config=self.config.model,
+                device=self.device,
+                precision=self.config.run.precision,
+                batch_size=self.config.training.batch_size,
+                edge_budget=self.config.training.edge_budget,
+            )
+            policy_diagnostic_seconds += time.monotonic() - diagnostic_started
+            if policy_target_kl_before is None:
+                raise RuntimeError("policy target KL before fit was not measured")
+            if policy_target_top1_before is None:
+                raise RuntimeError(
+                    "policy target top-1 agreement before fit was not measured"
+                )
+            policy_target_progress = (
+                0.0
+                if policy_target_kl_before <= 1e-12
+                else 1.0
+                - policy_target_kl_after / policy_target_kl_before
+            )
+            training.update(
+                {
+                    "policy_diagnostic_examples": float(
+                        len(diagnostic_samples)
+                    ),
+                    "policy_diagnostic_seconds": policy_diagnostic_seconds,
+                    "policy_target_kl_before": policy_target_kl_before,
+                    "policy_target_kl_after": policy_target_kl_after,
+                    "policy_target_progress": policy_target_progress,
+                    "policy_target_top1_agreement_before": (
+                        policy_target_top1_before
+                    ),
+                    "policy_target_top1_agreement_after": (
+                        policy_target_top1_after
+                    ),
+                    "policy_target_top1_agreement_delta": (
+                        policy_target_top1_after
+                        - policy_target_top1_before
+                    ),
+                }
+            )
+            if policy_target_kl_collection is not None:
+                training.update(
+                    {
+                        "policy_target_kl_collection": (
+                            policy_target_kl_collection
+                        ),
+                        "policy_target_kl_sync_gap": (
+                            policy_target_kl_before
+                            - policy_target_kl_collection
+                        ),
+                    }
+                )
         memory_metrics.update(
             _release_cuda_cache(
                 self.device,
@@ -891,6 +1872,7 @@ class Trainer:
         )
 
         evaluation = self.config.evaluation
+        pending_best_promotions: list[str] = []
         if (
             evaluation.interval > 0
             and evaluation.opponents
@@ -900,6 +1882,16 @@ class Trainer:
                 evaluation.opponents
             ):
                 opponent_name = opponent.name or opponent.kind
+                evaluation_kind = opponent.kind
+                evaluation_checkpoint = opponent.checkpoint
+                best_state: dict[str, object] | None = None
+                if opponent.kind == "best_so_far":
+                    best_state = self._load_best_so_far_state(
+                        opponent_name,
+                        opponent.checkpoint,
+                    )
+                    evaluation_kind = "checkpoint"
+                    evaluation_checkpoint = str(best_state["checkpoint"])
                 if self.display is not None:
                     self.display.set_phase(
                         "EVAL",
@@ -917,7 +1909,7 @@ class Trainer:
                 )
                 try:
                     result = evaluate_opponent(
-                        opponent.kind,
+                        evaluation_kind,
                         self.model,
                         model_config=self.config.model,
                         game_config=opponent_game_config,
@@ -928,7 +1920,7 @@ class Trainer:
                         mcts_actions=opponent.mcts_actions,
                         device=self.device,
                         precision=self.config.run.precision,
-                        checkpoint=opponent.checkpoint,
+                        checkpoint=evaluation_checkpoint,
                         checkpoint_cache=self._checkpoint_opponents,
                         opponent_mcts_simulations=(
                             opponent.opponent_mcts_simulations
@@ -939,6 +1931,9 @@ class Trainer:
                             self._checkpoint_history_dirs
                         ),
                         lag_iterations=opponent.lag_iterations,
+                        opening_plies=evaluation.opening_plies,
+                        opening_temperature=evaluation.opening_temperature,
+                        opening_generator=evaluation.opening_generator,
                         seed=(
                             None
                             if seed is None
@@ -972,7 +1967,17 @@ class Trainer:
                 metrics[f"{prefix}/mcts_actions"] = float(
                     opponent.mcts_actions
                 )
-                if opponent.kind in {"checkpoint", "lagged"}:
+                if opponent.kind in {
+                    "checkpoint",
+                    "lagged",
+                    "best_so_far",
+                }:
+                    metrics[f"{prefix}/opening_plies"] = float(
+                        evaluation.opening_plies
+                    )
+                    metrics[f"{prefix}/opening_temperature"] = float(
+                        evaluation.opening_temperature
+                    )
                     metrics[f"{prefix}/opponent_mcts_simulations"] = float(
                         (
                             opponent.mcts_simulations
@@ -994,6 +1999,32 @@ class Trainer:
                     metrics[f"{prefix}/opponent_iteration"] = float(
                         next_iteration - opponent.lag_iterations
                     )
+                if opponent.kind == "best_so_far":
+                    assert best_state is not None
+                    best_iteration = best_state.get("iteration")
+                    if isinstance(best_iteration, int):
+                        metrics[f"{prefix}/opponent_iteration"] = float(
+                            best_iteration
+                        )
+                    threshold = opponent.best_promotion_win_rate
+                    promoted = (
+                        result.wins + result.losses > 0
+                        and result.win_rate_decided >= threshold
+                    )
+                    metrics[f"{prefix}/promotion_win_rate"] = float(
+                        threshold
+                    )
+                    metrics[f"{prefix}/promoted"] = float(promoted)
+                    if promoted:
+                        pending_best_promotions.append(opponent_name)
+                        logger.info(
+                            "best_so_far=%s promotion pending: iteration=%d "
+                            "win_rate_decided=%.3f threshold=%.3f",
+                            opponent_name,
+                            next_iteration,
+                            result.win_rate_decided,
+                            threshold,
+                        )
                 logger.info(
                     "evaluation=%s games=%d wins=%d losses=%d "
                     "truncations=%d win_rate_decided=%.3f",
@@ -1028,18 +2059,34 @@ class Trainer:
             self.writer.flush()
 
         interval = self.config.run.checkpoint_interval
-        if interval > 0 and self.iteration % interval == 0:
-            self.save_checkpoint()
+        checkpoint_due = interval > 0 and self.iteration % interval == 0
+        committed_checkpoint: Path | None = None
+        if checkpoint_due or pending_best_promotions:
+            committed_checkpoint = self.save_checkpoint()
+        if pending_best_promotions:
+            assert committed_checkpoint is not None
+            for opponent_name in pending_best_promotions:
+                self._write_best_so_far_state(
+                    opponent_name,
+                    committed_checkpoint,
+                    self.iteration,
+                )
+                logger.info(
+                    "best_so_far=%s promoted checkpoint=%s",
+                    opponent_name,
+                    committed_checkpoint,
+                )
         if self.display is not None:
             self.display.update_metrics(metrics)
         logger.info(
-            "iteration=%d games=%d positions=%d "
+            "iteration=%d games=%d positions=%d discarded_positions=%d "
             "truncations=%d(horizon=%d spatial=%d chunk=%d) workers=%d "
             "policy=%.4f excess_kl=%.4f q=%.4f reverse_kl=%.4f "
             "collect=%.1fs fit=%.1fs total=%.1fs",
             self.iteration,
             collection.games,
             collection.positions,
+            collection.discarded_positions,
             collection.truncations,
             collection.horizon_truncations,
             collection.spatial_truncations,

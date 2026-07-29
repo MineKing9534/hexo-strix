@@ -15,7 +15,7 @@ from hexo_a0.graph import (
 from hexo_a0.head_to_head import load_checkpoint
 from hexo_klent.config import AlgorithmConfig, KlentModelConfig
 from hexo_klent.mcts_adapter import KlentMCTSAdapter
-from hexo_klent.model import KlentNet, make_klent_net
+from hexo_klent.model import BatchOutput, KlentNet, improved_policy, make_klent_net
 
 
 def tiny_model_config() -> ModelConfig:
@@ -58,7 +58,7 @@ def tiny_dense_model_config() -> KlentModelConfig:
     )
 
 
-def test_adapter_derives_value_from_improved_policy_q_expectation():
+def test_adapter_derives_value_from_learned_policy_q_expectation():
     config = tiny_model_config()
     network = KlentNet(config)
     q_output = network.q_head.mlp[-2]
@@ -75,16 +75,45 @@ def test_adapter_derives_value_from_improved_policy_q_expectation():
     torch.testing.assert_close(values, torch.full((2,), 0.25))
 
 
-@pytest.mark.parametrize("architecture", ["graph", "dense_axis"])
+def test_adapter_does_not_reimprove_policy_for_test_time_value():
+    adapter = KlentMCTSAdapter(KlentNet(tiny_model_config()), AlgorithmConfig())
+    output = BatchOutput(
+        policy_logits=torch.tensor([2.0, -1.0]),
+        q_values=torch.tensor([-0.5, 0.75]),
+        legal_counts=torch.tensor([2]),
+    )
+
+    [value] = adapter._state_values(output)
+    learned_policy = torch.softmax(output.policy_logits, dim=0)
+    expected = torch.dot(learned_policy, output.q_values)
+    reimproved = improved_policy(
+        output.policy_logits,
+        output.q_values,
+        alpha=adapter.algorithm.alpha,
+        beta=adapter.algorithm.beta,
+    )
+
+    torch.testing.assert_close(value, expected)
+    assert not torch.isclose(value, torch.dot(reimproved, output.q_values))
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["graph", "dense_axis", "persistent_ray_axis"],
+)
 def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(
     tmp_path,
     architecture,
 ):
     config = (
         tiny_dense_model_config()
-        if architecture == "dense_axis"
+        if architecture in {"dense_axis", "persistent_ray_axis"}
         else tiny_model_config()
     )
+    if architecture == "persistent_ray_axis":
+        config.architecture = architecture
+        config.ray_channels = 4
+        config.ray_update_hidden = 8
     algorithm = AlgorithmConfig()
     network = make_klent_net(config)
     checkpoint_path = tmp_path / f"klent-{architecture}.pt"

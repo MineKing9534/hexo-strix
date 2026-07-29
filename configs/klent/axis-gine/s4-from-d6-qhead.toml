@@ -1,0 +1,142 @@
+# Axis-GINE KLENT S4 initialized from the production Gumbel-MCTS network.
+#
+# The graph representation, relational layers, JK-cat policy head, and Q head
+# are shape-identical. Production-only value/auxiliary heads are ignored and
+# KLENT starts at iteration 0 with a fresh optimizer:
+#
+#   uv run hexo-klent train \
+#     --config configs/klent/axis-gine/s4-from-d6-qhead.toml \
+#     --init-from runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt \
+#     --tui
+#
+# Continue this output later with the ordinary `--resume latest`; --init-from
+# is used only for the first launch.
+
+[model]
+architecture = "graph"
+
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 8
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.03
+beta = 0.10
+tau = 8.0
+
+[collection]
+positions_per_iteration = 131_072
+parallel_games = 512
+inference_batch_size = 256
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 2_048
+edge_budget = 250_000
+policy_diagnostic_samples = 2_048
+grad_accumulation = true
+prefetch_batches = true
+# Compile-time-only tuning from one representative fragment avoids the
+# compiler-worker/RAM growth caused by runtime tuning across ragged shapes.
+fit_max_autotune = true
+fit_compile_seed_nodes = 16_384
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 10
+
+[[evaluation.opponents]]
+name = "lag_25"
+kind = "lagged"
+lag_iterations = 25
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_100"
+kind = "lagged"
+lag_iterations = 100
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "source_d6_qhead_215547"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "strix_jkcat_rel2_full"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00237000.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "persistent_ray_peak_60"
+kind = "checkpoint"
+checkpoint = "runs/klent/persistent-ray/s4-graft/checkpoints/checkpoint_000060.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot_r8_d2"
+kind = "sealbot"
+games = 16
+depth = 2
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+iterations = 1_000
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/axis-gine/s4-from-d6-qhead"
+checkpoint_interval = 5
+seed = 0

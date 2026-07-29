@@ -58,8 +58,8 @@ inference_batch_size = 64
 # Dense budgets count padded raster cells rather than graph edges.
 inference_edge_budget = 1_000_000
 # Radius is local to existing stones, so a wandering game can create an
-# enormous mostly-empty bounding box. End such lanes as value-bootstrapped
-# truncations before their stored positions exceed the safe fit footprint.
+# enormous mostly-empty bounding box. Discard such games before their stored
+# positions exceed the safe fit footprint; only terminal games enter FIT.
 dense_position_cell_limit = 200_000
 workers = 4
 batch_timeout_ms = 2.0

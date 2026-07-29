@@ -15,7 +15,6 @@ from hexo_klent.config import AlgorithmConfig, KlentModelConfig
 from hexo_klent.model import (
     BatchOutput,
     KlentNet,
-    improved_policy,
     make_klent_net,
 )
 
@@ -23,14 +22,16 @@ from hexo_klent.model import (
 class KlentMCTSAdapter(nn.Module):
     """Present KLENT as the policy-plus-state-value model MCTS expects.
 
-    KLENT does not train a separate scalar value head. Its state value is the
-    same improved-policy expectation used to bootstrap TD(lambda) during
-    self-play:
+    KLENT does not train a separate scalar value head. For test-time MCTS,
+    Appendix M of the paper reconstructs its state value from the learned
+    policy and action-value estimates:
 
-        V(s) = sum_a pi_KLENT(a | s) Q(s, a)
+        V(s) = sum_a pi_theta(a | s) Q_theta(s, a)
 
-    Policy logits remain the learned policy head's raw logits. The existing
-    Rust Gumbel MCTS can therefore consume this wrapper without modification.
+    This intentionally differs from self-play's TD(lambda) bootstrap, which
+    follows Algorithm 1 and weights Q with the freshly improved policy pi'.
+    Policy logits remain the learned policy head's raw logits, so the existing
+    Rust Gumbel MCTS can consume this wrapper without modification.
     """
 
     def __init__(
@@ -52,12 +53,7 @@ class KlentMCTSAdapter(nn.Module):
         ):
             logits_f = logits.float()
             q_f = q_values.float()
-            policy = improved_policy(
-                logits_f,
-                q_f,
-                alpha=self.algorithm.alpha,
-                beta=self.algorithm.beta,
-            )
+            policy = torch.softmax(logits_f, dim=0)
             values.append(torch.dot(policy, q_f))
         return torch.stack(values)
 

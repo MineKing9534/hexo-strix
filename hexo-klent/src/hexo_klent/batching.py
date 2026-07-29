@@ -119,7 +119,22 @@ def _native_axis_batch(
 ):
     """Convert one collated legacy axis slice to the native model schema."""
 
-    common = dict(legal_mask=legal_mask, batch=batch_index)
+    # Resolve dynamic legal-node indices while the tensors are still on CPU.
+    # Calling ``nonzero`` after the batch reaches ROCm synchronizes the device
+    # so PyTorch can discover the data-dependent output size.  Legal ordering
+    # is already fixed by the Rust graph builder, so these indices and counts
+    # are durable batch metadata rather than model work.
+    legal_idx = legal_mask.nonzero(as_tuple=False).squeeze(1)
+    legal_counts = torch.bincount(
+        batch_index.index_select(0, legal_idx),
+        minlength=num_graphs,
+    )
+    common = dict(
+        legal_mask=legal_mask,
+        legal_idx=legal_idx,
+        legal_counts=legal_counts,
+        batch=batch_index,
+    )
     if getattr(model_config, "axis_relational", False):
         columns = legacy_lean_columns(model_config)
         lean_x = x if columns is None else x[:, columns]

@@ -38,6 +38,7 @@ class TrajectoryStep:
     action_index: int
     player: str
     state_value: float
+    target_prior_kl: float | None = None
     reward: float = 0.0
     return_target: float | None = None
 
@@ -50,12 +51,22 @@ class Trajectory:
     spatial_truncated: bool = False
     chunk_truncated: bool = False
     bootstrap_value: float | None = None
+    entropy_sum: float = 0.0
+    normalized_entropy_sum: float = 0.0
+    target_top1_probability_sum: float = 0.0
+    prior_normalized_entropy_sum: float = 0.0
+    prior_top1_probability_sum: float = 0.0
+    legal_actions_sum: float = 0.0
+    reverse_kl_sum: float = 0.0
+    abs_q_sum: float = 0.0
+    q_span_sum: float = 0.0
 
 
 @dataclass(frozen=True)
 class CollectionStats:
     games: int
     positions: int
+    discarded_positions: int
     p1_wins: int
     p2_wins: int
     truncations: int
@@ -67,6 +78,8 @@ class CollectionStats:
     mean_entropy: float
     mean_normalized_entropy: float
     mean_target_top1_probability: float
+    mean_prior_normalized_entropy: float
+    mean_prior_top1_probability: float
     mean_legal_actions: float
     mean_reverse_kl: float
     mean_abs_q: float
@@ -78,6 +91,14 @@ class CollectionStats:
 
 
 InferenceFn = Callable[[list[object]], tuple[list[Tensor], list[Tensor]]]
+CompletedTrajectoryFn = Callable[[list[Trajectory]], None]
+
+
+# A worker may collect tens of thousands of ragged S4 positions.  Sending the
+# whole shard only at the end retains one full copy in the worker while
+# multiprocessing serializes another and the learner restores a third.  Keep
+# that transport window bounded independently of the configured generation.
+_WORKER_RESULT_CHUNK_POSITIONS = 2_048
 
 
 def _autocast(device: torch.device, precision: str):
@@ -132,13 +153,25 @@ def _collect_with_inference(
     dense_position_cell_limit: int,
     seed: int | None,
     worker_processes: int,
+    completed_callback: CompletedTrajectoryFn | None = None,
+    completed_chunk_positions: int = 0,
 ) -> tuple[list[Trajectory], CollectionStats]:
-    """Collect a fixed number of transitions from a frozen policy/Q network."""
+    """Collect complete games from a frozen policy/Q network.
+
+    ``positions`` is the replacement-game budget, not a hard trajectory cut.
+    Once it is reached, every live lane drains to a genuine terminal result.
+    Games stopped by a safety horizon or dense spatial bound are excluded from
+    the returned training trajectories in their entirety.
+    """
 
     if positions <= 0 or parallel_games <= 0:
         raise ValueError("positions and parallel_games must be positive")
     if parallel_games > positions:
         raise ValueError("parallel_games cannot exceed positions")
+    if completed_callback is not None and completed_chunk_positions <= 0:
+        raise ValueError(
+            "completed_chunk_positions must be positive with a callback"
+        )
 
     import hexo_rs
 
@@ -155,16 +188,104 @@ def _collect_with_inference(
         for _ in range(parallel_games)
     ]
     completed: list[Trajectory] = []
-    pending_bootstraps: list[tuple[object, Trajectory]] = []
+    completed_positions = 0
+    accepted_position_count = 0
+    discarded_position_count = 0
+
+    game_count = 0
+    game_length_sum = 0
+    p1_wins = 0
+    p2_wins = 0
+    truncations = 0
+    horizon_truncations = 0
+    spatial_truncations = 0
+    chunk_truncations = 0
+    abs_bootstrap_sum = 0.0
+    bootstrap_count = 0
+    abs_return_sum = 0.0
+    return_count = 0
 
     entropy_sum = 0.0
     normalized_entropy_sum = 0.0
     target_top1_probability_sum = 0.0
+    prior_normalized_entropy_sum = 0.0
+    prior_top1_probability_sum = 0.0
     legal_actions_sum = 0.0
     reverse_kl_sum = 0.0
     abs_q_sum = 0.0
     q_span_sum = 0.0
-    position_count = 0
+
+    def finish_trajectory(
+        trajectory: Trajectory, *, include_in_training: bool
+    ) -> None:
+        nonlocal completed, completed_positions
+        nonlocal accepted_position_count, discarded_position_count
+        nonlocal game_count, game_length_sum, p1_wins, p2_wins
+        nonlocal truncations, horizon_truncations
+        nonlocal spatial_truncations, chunk_truncations
+        nonlocal abs_bootstrap_sum, bootstrap_count
+        nonlocal abs_return_sum, return_count
+        nonlocal entropy_sum, normalized_entropy_sum
+        nonlocal target_top1_probability_sum
+        nonlocal prior_normalized_entropy_sum
+        nonlocal prior_top1_probability_sum, legal_actions_sum
+        nonlocal reverse_kl_sum, abs_q_sum, q_span_sum
+
+        length = len(trajectory.steps)
+        game_count += 1
+        game_length_sum += length
+        p1_wins += int(trajectory.winner == "P1")
+        p2_wins += int(trajectory.winner == "P2")
+        truncations += int(trajectory.truncated)
+        spatial_truncations += int(trajectory.spatial_truncated)
+        chunk_truncations += int(trajectory.chunk_truncated)
+        horizon_truncations += int(
+            trajectory.truncated
+            and not trajectory.spatial_truncated
+            and not trajectory.chunk_truncated
+        )
+        if trajectory.bootstrap_value is not None:
+            abs_bootstrap_sum += abs(float(trajectory.bootstrap_value))
+            bootstrap_count += 1
+        if not include_in_training:
+            discarded_position_count += length
+            return
+
+        if trajectory.winner not in {"P1", "P2"} or trajectory.truncated:
+            raise RuntimeError(
+                "only genuinely terminal HeXO games may enter KLENT FIT"
+            )
+        accepted_position_count += length
+        entropy_sum += trajectory.entropy_sum
+        normalized_entropy_sum += trajectory.normalized_entropy_sum
+        target_top1_probability_sum += (
+            trajectory.target_top1_probability_sum
+        )
+        prior_normalized_entropy_sum += (
+            trajectory.prior_normalized_entropy_sum
+        )
+        prior_top1_probability_sum += trajectory.prior_top1_probability_sum
+        legal_actions_sum += trajectory.legal_actions_sum
+        reverse_kl_sum += trajectory.reverse_kl_sum
+        abs_q_sum += trajectory.abs_q_sum
+        q_span_sum += trajectory.q_span_sum
+        for step in trajectory.steps:
+            if step.return_target is not None:
+                abs_return_sum += abs(float(step.return_target))
+                return_count += 1
+
+        completed.append(trajectory)
+        completed_positions += length
+        if (
+            completed_callback is not None
+            and completed_positions >= completed_chunk_positions
+        ):
+            chunk = completed
+            completed = []
+            completed_positions = 0
+            completed_callback(chunk)
+
+    generated_position_count = 0
     max_dense_position_cells = 0
     if dense_position_cell_limit > 0:
         initial_height, initial_width = raster_shape(active[0][0])
@@ -176,12 +297,13 @@ def _collect_with_inference(
             )
 
     with torch.no_grad():
-        while position_count < positions:
-            remaining = positions - position_count
-            step_count = min(len(active), remaining)
+        while generated_position_count < positions or active:
+            collecting = generated_position_count < positions
+            remaining = positions - generated_position_count
+            step_count = min(len(active), remaining) if collecting else len(active)
             stepping = active[:step_count]
-            # Lanes beyond the final partial batch remain at their current
-            # successor state and are bootstrapped below.
+            # Lanes beyond the final partial budget batch remain live. The
+            # next loop drains every one to a terminal result.
             next_active = active[step_count:]
             states = [game for game, _trajectory in stepping]
             logit_chunks, q_chunks = infer(states)
@@ -217,6 +339,23 @@ def _collect_with_inference(
                         policy_cpu, 1, generator=generator
                     ).item()
                 )
+                log_prior = prior.clamp_min(1e-12).log()
+                prior_diagnostics = torch.stack(
+                    (
+                        (
+                            policy
+                            * (
+                                policy.clamp_min(1e-12).log()
+                                - log_prior
+                            )
+                        ).sum(),
+                        -(prior * log_prior).sum(),
+                        prior.max(),
+                    )
+                ).cpu().tolist()
+                target_prior_kl = max(0.0, float(prior_diagnostics[0]))
+                prior_entropy = float(prior_diagnostics[1])
+                prior_top1_probability = float(prior_diagnostics[2])
 
                 player = game.current_player()
                 if player not in {"P1", "P2"}:
@@ -228,6 +367,7 @@ def _collect_with_inference(
                         action_index=action_index,
                         player=player,
                         state_value=float(torch.dot(policy, q_f).item()),
+                        target_prior_kl=target_prior_kl,
                     )
                 )
 
@@ -238,36 +378,37 @@ def _collect_with_inference(
                     ).sum().item()
                 )
                 legal_action_count = len(legal_coords)
-                entropy_sum += entropy
-                normalized_entropy_sum += (
+                trajectory.entropy_sum += entropy
+                trajectory.normalized_entropy_sum += (
                     entropy / math.log(legal_action_count)
                     if legal_action_count > 1
                     else 0.0
                 )
-                target_top1_probability_sum += float(
+                trajectory.target_top1_probability_sum += float(
                     policy_cpu.max().item()
                 )
-                legal_actions_sum += legal_action_count
-                reverse_kl_sum += max(
-                    0.0,
-                    float(
-                        (
-                            policy
-                            * (
-                                policy.clamp_min(1e-12).log()
-                                - prior.clamp_min(1e-12).log()
-                            )
-                        )
-                        .sum()
-                        .item()
-                    ),
+                trajectory.prior_normalized_entropy_sum += (
+                    min(
+                        1.0,
+                        max(
+                            0.0,
+                            prior_entropy / math.log(legal_action_count),
+                        ),
+                    )
+                    if legal_action_count > 1
+                    else 0.0
                 )
+                trajectory.prior_top1_probability_sum += (
+                    prior_top1_probability
+                )
+                trajectory.legal_actions_sum += legal_action_count
+                trajectory.reverse_kl_sum += target_prior_kl
                 mean_abs_q, q_span = torch.stack(
                     (q_f.abs().mean(), q_f.max() - q_f.min())
                 ).cpu().tolist()
-                abs_q_sum += float(mean_abs_q)
-                q_span_sum += float(q_span)
-                position_count += 1
+                trajectory.abs_q_sum += float(mean_abs_q)
+                trajectory.q_span_sum += float(q_span)
+                generated_position_count += 1
 
                 q, r = legal_coords[action_index]
                 game.apply_move(q, r)
@@ -285,22 +426,26 @@ def _collect_with_inference(
                         # double-threat shape by the actor.
                         trajectory.steps[-1].reward = -1.0
                     _attach_returns(trajectory, algorithm.trace_decay)
-                    completed.append(trajectory)
+                    finish_trajectory(
+                        trajectory, include_in_training=True
+                    )
                 elif game.move_count() >= game_config.rollout_horizon:
                     trajectory.truncated = True
-                    pending_bootstraps.append((game, trajectory))
+                    finish_trajectory(
+                        trajectory, include_in_training=False
+                    )
                 elif dense_position_cell_limit > 0:
                     height, width = raster_shape(game)
                     successor_cells = height * width
                     if successor_cells > dense_position_cell_limit:
                         # Dense execution scales with the padded bounding box,
-                        # not the number of live nodes. This is a standard
-                        # value-bootstrap boundary, never a synthetic draw:
-                        # the just-recorded state remains exact and the
-                        # over-spread successor is used only for bootstrapping.
+                        # not the number of live nodes. The entire capped game
+                        # is excluded: FIT only sees terminal outcome targets.
                         trajectory.truncated = True
                         trajectory.spatial_truncated = True
-                        pending_bootstraps.append((game, trajectory))
+                        finish_trajectory(
+                            trajectory, include_in_training=False
+                        )
                     else:
                         max_dense_position_cells = max(
                             max_dense_position_cells,
@@ -312,8 +457,8 @@ def _collect_with_inference(
 
             active = next_active
 
-            if position_count < positions:
-                remaining = positions - position_count
+            if generated_position_count < positions:
+                remaining = positions - generated_position_count
                 new_lanes = min(
                     parallel_games - len(active),
                     max(0, remaining - len(active)),
@@ -323,70 +468,17 @@ def _collect_with_inference(
                     for _ in range(new_lanes)
                 )
 
-        # The collection budget is a standard TD(lambda) truncation boundary:
-        # close every still-live lane against the same frozen network rather
-        # than discarding its positions or pretending HeXO drew.
-        for game, trajectory in active:
-            if not trajectory.steps:
-                raise RuntimeError("collection ended with an empty live lane")
-            trajectory.truncated = True
-            trajectory.chunk_truncated = True
-            pending_bootstraps.append((game, trajectory))
+    if completed_callback is not None and completed:
+        chunk = completed
+        completed = []
+        completed_positions = 0
+        completed_callback(chunk)
 
-        for start in range(0, len(pending_bootstraps), parallel_games):
-            chunk = pending_bootstraps[start : start + parallel_games]
-            states = [game for game, _trajectory in chunk]
-            logit_chunks, q_chunks = infer(states)
-            for (game, trajectory), logits, q_values in zip(
-                chunk, logit_chunks, q_chunks, strict=True
-            ):
-                bootstrap_player = game.current_player()
-                if bootstrap_player not in {"P1", "P2"}:
-                    raise RuntimeError(
-                        "truncated successor must remain non-terminal"
-                    )
-                policy = improved_policy(
-                    logits.float(),
-                    q_values.float(),
-                    alpha=algorithm.alpha,
-                    beta=algorithm.beta,
-                )
-                bootstrap_value = float(
-                    torch.dot(policy, q_values.float()).item()
-                )
-                trajectory.bootstrap_value = bootstrap_value
-                _attach_returns(
-                    trajectory,
-                    algorithm.trace_decay,
-                    bootstrap_player=bootstrap_player,
-                    bootstrap_value=bootstrap_value,
-                )
-                completed.append(trajectory)
-
-    lengths = [len(item.steps) for item in completed]
-    p1_wins = sum(item.winner == "P1" for item in completed)
-    p2_wins = sum(item.winner == "P2" for item in completed)
-    truncations = sum(item.truncated for item in completed)
-    spatial_truncations = sum(item.spatial_truncated for item in completed)
-    chunk_truncations = sum(item.chunk_truncated for item in completed)
-    horizon_truncations = (
-        truncations - spatial_truncations - chunk_truncations
-    )
-    bootstrap_values = [
-        abs(float(trajectory.bootstrap_value))
-        for trajectory in completed
-        if trajectory.bootstrap_value is not None
-    ]
-    return_targets = [
-        float(step.return_target)
-        for trajectory in completed
-        for step in trajectory.steps
-        if step.return_target is not None
-    ]
-    denominator = max(position_count, 1)
+    denominator = max(accepted_position_count, 1)
     stats = CollectionStats(
-        games=len(completed),
-        positions=position_count,
+        games=game_count,
+        positions=accepted_position_count,
+        discarded_positions=discarded_position_count,
         p1_wins=p1_wins,
         p2_wins=p2_wins,
         truncations=truncations,
@@ -394,22 +486,27 @@ def _collect_with_inference(
         spatial_truncations=spatial_truncations,
         chunk_truncations=chunk_truncations,
         max_dense_position_cells=max_dense_position_cells,
-        mean_game_length=sum(lengths) / max(len(lengths), 1),
+        mean_game_length=game_length_sum / max(game_count, 1),
         mean_entropy=entropy_sum / denominator,
         mean_normalized_entropy=normalized_entropy_sum / denominator,
         mean_target_top1_probability=(
             target_top1_probability_sum / denominator
+        ),
+        mean_prior_normalized_entropy=(
+            prior_normalized_entropy_sum / denominator
+        ),
+        mean_prior_top1_probability=(
+            prior_top1_probability_sum / denominator
         ),
         mean_legal_actions=legal_actions_sum / denominator,
         mean_reverse_kl=max(0.0, reverse_kl_sum / denominator),
         mean_abs_q=abs_q_sum / denominator,
         mean_q_span=q_span_sum / denominator,
         mean_abs_return=(
-            sum(abs(target) for target in return_targets)
-            / max(len(return_targets), 1)
+            abs_return_sum / max(return_count, 1)
         ),
         mean_abs_bootstrap_value=(
-            sum(bootstrap_values) / max(len(bootstrap_values), 1)
+            abs_bootstrap_sum / max(bootstrap_count, 1)
         ),
         worker_processes=worker_processes,
         elapsed_seconds=time.monotonic() - started_at,
@@ -515,6 +612,18 @@ class _WorkerDone:
     stats: CollectionStats
 
 
+@dataclass
+class _WorkerTrajectoryChunk:
+    worker_id: int
+    chunk_id: int
+    trajectories: list[Trajectory]
+
+
+@dataclass(frozen=True)
+class _WorkerTrajectoryAck:
+    chunk_id: int
+
+
 @dataclass(frozen=True)
 class _WorkerFailure:
     worker_id: int
@@ -536,6 +645,7 @@ def _actor_worker_main(
     request_queue,
     response_queue,
     stop_event,
+    result_chunk_positions: int = _WORKER_RESULT_CHUNK_POSITIONS,
 ) -> None:
     """Own Rust games on CPU and request all neural evaluations from parent."""
 
@@ -588,6 +698,46 @@ def _actor_worker_main(
             )
 
         try:
+            result_chunk_id = 0
+
+            def emit_trajectories(
+                trajectories: list[Trajectory],
+            ) -> None:
+                nonlocal result_chunk_id
+                # Never send thousands of Torch storages through
+                # multiprocessing: its reducer consumes one shared-memory file
+                # descriptor per tensor.  NumPy arrays travel in the ordinary
+                # pickle payload and are restored as zero-copy CPU tensors.
+                for trajectory in trajectories:
+                    for step in trajectory.steps:
+                        step.target_policy = step.target_policy.numpy()
+                chunk_id = result_chunk_id
+                result_chunk_id += 1
+                request_queue.put(
+                    _WorkerTrajectoryChunk(
+                        worker_id,
+                        chunk_id,
+                        trajectories,
+                    )
+                )
+                # One acknowledged chunk per actor bounds both retained game
+                # data and multiprocessing's serialization copies.  Inference
+                # and result messages share this response queue, but no neural
+                # request is outstanding while a completed chunk is emitted.
+                response = response_queue.get()
+                if isinstance(response, _StopWorker) or stop_event.is_set():
+                    raise _ActorShutdown
+                if not isinstance(response, _WorkerTrajectoryAck):
+                    raise RuntimeError(
+                        "unexpected trajectory acknowledgement "
+                        f"{type(response).__name__}"
+                    )
+                if response.chunk_id != chunk_id:
+                    raise RuntimeError(
+                        f"trajectory acknowledgement {response.chunk_id} "
+                        f"does not match chunk {chunk_id}"
+                    )
+
             trajectories, stats = _collect_with_inference(
                 infer,
                 game_config=task.game_config,
@@ -597,12 +747,13 @@ def _actor_worker_main(
                 dense_position_cell_limit=task.dense_position_cell_limit,
                 seed=task.seed,
                 worker_processes=1,
+                completed_callback=emit_trajectories,
+                completed_chunk_positions=result_chunk_positions,
             )
-            # Never send thousands of Torch storages through multiprocessing:
-            # its reducer consumes one shared-memory file descriptor per tensor.
-            for trajectory in trajectories:
-                for step in trajectory.steps:
-                    step.target_policy = step.target_policy.numpy()
+            if trajectories:
+                raise RuntimeError(
+                    "streaming actor retained completed trajectories"
+                )
             request_queue.put(_WorkerDone(worker_id, trajectories, stats))
         except _ActorShutdown:
             return
@@ -613,11 +764,18 @@ def _actor_worker_main(
             return
 
 
-def _restore_worker_tensors(done: _WorkerDone) -> _WorkerDone:
-    for trajectory in done.trajectories:
+def _restore_trajectory_tensors(
+    trajectories: list[Trajectory],
+) -> list[Trajectory]:
+    for trajectory in trajectories:
         for step in trajectory.steps:
             if not isinstance(step.target_policy, Tensor):
                 step.target_policy = torch.from_numpy(step.target_policy)
+    return trajectories
+
+
+def _restore_worker_tensors(done: _WorkerDone) -> _WorkerDone:
+    _restore_trajectory_tensors(done.trajectories)
     return done
 
 
@@ -626,12 +784,25 @@ def _merge_worker_results(
     *,
     workers: int,
     elapsed_seconds: float,
+    streamed_trajectories: list[list[Trajectory]] | None = None,
 ) -> tuple[list[Trajectory], CollectionStats]:
-    trajectories = [
-        trajectory
-        for result in results
-        for trajectory in result.trajectories
-    ]
+    if streamed_trajectories is None:
+        trajectories = [
+            trajectory
+            for result in results
+            for trajectory in result.trajectories
+        ]
+    else:
+        trajectories = [
+            trajectory
+            for worker_trajectories in streamed_trajectories
+            for trajectory in worker_trajectories
+        ]
+        trajectories.extend(
+            trajectory
+            for result in results
+            for trajectory in result.trajectories
+        )
     stats = [result.stats for result in results]
     games = sum(item.games for item in stats)
     positions = sum(item.positions for item in stats)
@@ -646,6 +817,9 @@ def _merge_worker_results(
     return trajectories, CollectionStats(
         games=games,
         positions=positions,
+        discarded_positions=sum(
+            item.discarded_positions for item in stats
+        ),
         p1_wins=sum(item.p1_wins for item in stats),
         p2_wins=sum(item.p2_wins for item in stats),
         truncations=truncations,
@@ -664,6 +838,12 @@ def _merge_worker_results(
         mean_normalized_entropy=position_mean("mean_normalized_entropy"),
         mean_target_top1_probability=position_mean(
             "mean_target_top1_probability"
+        ),
+        mean_prior_normalized_entropy=position_mean(
+            "mean_prior_normalized_entropy"
+        ),
+        mean_prior_top1_probability=position_mean(
+            "mean_prior_top1_probability"
         ),
         mean_legal_actions=position_mean("mean_legal_actions"),
         mean_reverse_kl=position_mean("mean_reverse_kl"),
@@ -685,9 +865,16 @@ def _merge_worker_results(
 class SharedInferenceActors:
     """Persistent CPU actors served by the learner's single frozen GPU model."""
 
-    def __init__(self, workers: int) -> None:
+    def __init__(
+        self,
+        workers: int,
+        *,
+        result_chunk_positions: int = _WORKER_RESULT_CHUNK_POSITIONS,
+    ) -> None:
         if workers <= 1:
             raise ValueError("shared actors require at least two workers")
+        if result_chunk_positions <= 0:
+            raise ValueError("result_chunk_positions must be positive")
         for name in (
             "OMP_NUM_THREADS",
             "MKL_NUM_THREADS",
@@ -697,6 +884,7 @@ class SharedInferenceActors:
             os.environ.setdefault(name, "1")
 
         self.workers = workers
+        self.result_chunk_positions = result_chunk_positions
         self._ctx = mp.get_context("spawn")
         self._request_queue = self._ctx.Queue()
         self._task_queues = [self._ctx.Queue(maxsize=1) for _ in range(workers)]
@@ -713,6 +901,7 @@ class SharedInferenceActors:
                     self._request_queue,
                     self._response_queues[worker_id],
                     self._stop_event,
+                    self.result_chunk_positions,
                 ),
                 daemon=True,
             )
@@ -867,23 +1056,61 @@ class SharedInferenceActors:
         started_at = time.monotonic()
         pending: deque = deque()
         completed: dict[int, _WorkerDone] = {}
+        streamed_trajectories: list[list[Trajectory]] = [
+            [] for _ in range(active_workers)
+        ]
+        streamed_positions = [0 for _ in range(active_workers)]
+        next_result_chunk = [0 for _ in range(active_workers)]
         was_training = model.training
         model.eval()
         timeout_seconds = max(batch_timeout_ms, 0.0) / 1000.0
+
+        def handle_actor_control(message: object) -> bool:
+            if isinstance(message, _WorkerFailure):
+                raise RuntimeError(
+                    f"KLENT actor {message.worker_id} failed:\n"
+                    f"{message.detail}"
+                )
+            if isinstance(message, _WorkerTrajectoryChunk):
+                worker_id = message.worker_id
+                if not 0 <= worker_id < active_workers:
+                    raise RuntimeError(
+                        f"trajectory chunk has invalid worker {worker_id}"
+                    )
+                expected_chunk = next_result_chunk[worker_id]
+                if message.chunk_id != expected_chunk:
+                    raise RuntimeError(
+                        f"KLENT actor {worker_id} sent trajectory chunk "
+                        f"{message.chunk_id}, expected {expected_chunk}"
+                    )
+                restored = _restore_trajectory_tensors(
+                    message.trajectories
+                )
+                streamed_trajectories[worker_id].extend(restored)
+                streamed_positions[worker_id] += sum(
+                    len(trajectory.steps) for trajectory in restored
+                )
+                next_result_chunk[worker_id] += 1
+                self._response_queues[worker_id].put(
+                    _WorkerTrajectoryAck(message.chunk_id)
+                )
+                return True
+            if isinstance(message, _WorkerDone):
+                if message.worker_id in completed:
+                    raise RuntimeError(
+                        f"KLENT actor {message.worker_id} completed twice"
+                    )
+                completed[message.worker_id] = _restore_worker_tensors(
+                    message
+                )
+                return True
+            return False
 
         try:
             with torch.no_grad():
                 while len(completed) < active_workers:
                     message = self._next_message(pending)
-                    if isinstance(message, _WorkerFailure):
-                        raise RuntimeError(
-                            f"KLENT actor {message.worker_id} failed:\n"
-                            f"{message.detail}"
-                        )
-                    if isinstance(message, _WorkerDone):
-                        completed[message.worker_id] = _restore_worker_tensors(
-                            message
-                        )
+                    if handle_actor_control(message):
                         continue
                     if not isinstance(message, _EvalRequest):
                         raise RuntimeError(
@@ -903,15 +1130,7 @@ class SharedInferenceActors:
                             )
                         except queue.Empty:
                             break
-                        if isinstance(candidate, _WorkerFailure):
-                            raise RuntimeError(
-                                f"KLENT actor {candidate.worker_id} failed:\n"
-                                f"{candidate.detail}"
-                            )
-                        if isinstance(candidate, _WorkerDone):
-                            completed[candidate.worker_id] = (
-                                _restore_worker_tensors(candidate)
-                            )
+                        if handle_actor_control(candidate):
                             continue
                         if not isinstance(candidate, _EvalRequest):
                             raise RuntimeError(
@@ -939,10 +1158,24 @@ class SharedInferenceActors:
             model.train(was_training)
 
         results = [completed[index] for index in range(active_workers)]
+        for worker_id, result in enumerate(results):
+            actual_positions = (
+                streamed_positions[worker_id]
+                + sum(
+                    len(trajectory.steps)
+                    for trajectory in result.trajectories
+                )
+            )
+            if actual_positions != result.stats.positions:
+                raise RuntimeError(
+                    f"KLENT actor {worker_id} returned {actual_positions} "
+                    f"streamed positions, expected {result.stats.positions}"
+                )
         return _merge_worker_results(
             results,
             workers=active_workers,
             elapsed_seconds=time.monotonic() - started_at,
+            streamed_trajectories=streamed_trajectories,
         )
 
     def close(self) -> None:

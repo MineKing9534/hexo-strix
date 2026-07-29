@@ -1,0 +1,176 @@
+# Persistent-ray KLENT S4 larger-corpus/larger-batch continuation from the
+# strongest confirmed checkpoint of the tau=16 run.
+#
+# This differs from s4-graft-lr5e4-from60.toml only in:
+#
+#   collection.positions_per_iteration = 131072  (2x)
+#   training.batch_size = 2048                   (4x)
+#   run.output_dir                               (independent branch)
+#
+# That yields 64 effective optimizer steps per iteration instead of 128 while
+# doubling the number of fresh positions represented by each policy snapshot.
+# All KLENT coefficients, optimizer state, LR, model, and evaluation opponents
+# remain matched to the tau=16 lower-LR control.
+#
+# Run 20 additional iterations for the first read:
+#
+#   uv run hexo-klent train \
+#     --config configs/klent/persistent-ray/s4-graft-pos131k-batch2k-lr5e4-from60.toml \
+#     --resume runs/klent/persistent-ray/s4-graft/checkpoints/checkpoint_000060.pt \
+#     --resume-configured-lr \
+#     --iterations 20
+#
+# --resume-configured-lr retains the checkpoint's AdamW moments and all other
+# optimizer state while replacing its stored 1e-3 LR with the 5e-4 value below.
+# Subsequent restarts of this branch use the ordinary:
+#
+#   --resume latest
+
+[model]
+architecture = "persistent_ray_axis"
+dense_ray_radius = 5
+
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+ray_channels = 12
+ray_update_hidden = 48
+ray_branch_scale = 1.0
+exact_graft_init = true
+ray_after_layers = [0, 1, 2, 3]
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 8
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.03
+beta = 0.10
+# HeXO has two atomic placements per ordinary turn. This makes the per-turn
+# trace decay exp(-2 / 16) = exp(-1 / 8), matching the paper's tau=8 cadence.
+tau = 16.0
+
+[collection]
+positions_per_iteration = 131072
+parallel_games = 64
+inference_batch_size = 64
+inference_edge_budget = 1_000_000
+dense_position_cell_limit = 200_000
+workers = 8
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 2048
+edge_budget = 200_000
+policy_diagnostic_samples = 2048
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 5e-4
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 10
+
+[[evaluation.opponents]]
+name = "random"
+kind = "random"
+games = 64
+
+[[evaluation.opponents]]
+name = "peak_60"
+kind = "checkpoint"
+checkpoint = "runs/klent/persistent-ray/s4-graft/checkpoints/checkpoint_000060.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "dense_s4_230"
+kind = "checkpoint"
+checkpoint = "runs/klent/dense-from-scratch/s4/checkpoints/checkpoint_000230.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_25"
+kind = "lagged"
+lag_iterations = 25
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_100"
+kind = "lagged"
+lag_iterations = 100
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot-d2_raw"
+kind = "sealbot"
+games = 16
+depth = 2
+placement_radius = 8
+mcts_simulations = 0
+mcts_actions = 16
+
+[[evaluation.opponents]]
+name = "sealbot-d2_mcts24/8"
+kind = "sealbot"
+games = 16
+depth = 2
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "strix_jkcat_rel2_champion"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00237000.pt"
+games = 16
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[run]
+iterations = 1_000
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/persistent-ray/s4-graft-pos131k-batch2k-lr5e4-from60"
+checkpoint_interval = 5
+seed = 0

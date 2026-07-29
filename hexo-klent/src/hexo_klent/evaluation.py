@@ -33,6 +33,8 @@ class EvaluationStats:
     win_rate_decided: float
     mean_game_length: float
     mean_opponent_depth: float
+    opening_pairs: int = 0
+    frac_unique_opening: float = 0.0
 
 
 class CheckpointOpponentCache:
@@ -141,6 +143,79 @@ def _compatible_outputs(
     )
 
 
+def _sample_paired_checkpoint_openings(
+    *,
+    candidate: torch.nn.Module,
+    candidate_config,
+    opponent: torch.nn.Module,
+    opponent_config,
+    rust_game_config,
+    games: int,
+    opening_plies: int,
+    opening_temperature: float,
+    opening_generator: str,
+    device: torch.device,
+    seed: int | None,
+) -> list[list[tuple[int, int]]]:
+    """Sample one replayable opening for each swapped-side game pair.
+
+    This deliberately reuses ``hexo_a0.evaluate.sample_opening``, the opening
+    path used by standalone head-to-head/SPRT.  Sampling mutates torch's global
+    RNG, so preserve the trainer's CPU and accelerator RNG states around the
+    whole operation.
+    """
+
+    if opening_plies <= 0:
+        return []
+    if games % 2 != 0:
+        raise ValueError(
+            "paired-opening checkpoint evaluation requires an even number "
+            "of games"
+        )
+    if opening_generator not in {"alternate", "a", "b", "champion"}:
+        raise ValueError(f"unknown opening generator: {opening_generator}")
+
+    from hexo_a0.evaluate import sample_opening
+
+    accelerator_devices: list[int] = []
+    if device.type == "cuda":
+        accelerator_devices.append(
+            device.index
+            if device.index is not None
+            else torch.cuda.current_device()
+        )
+
+    base_seed = 0 if seed is None else seed
+    openings: list[list[tuple[int, int]]] = []
+    with torch.random.fork_rng(devices=accelerator_devices):
+        for pair_index in range(games // 2):
+            if opening_generator == "a":
+                generator = candidate
+                generator_config = candidate_config
+            elif opening_generator in {"b", "champion"}:
+                generator = opponent
+                generator_config = opponent_config
+            elif pair_index % 2 == 0:
+                # Match head-to-head's alternate protocol: B, A, B, A, ...
+                generator = opponent
+                generator_config = opponent_config
+            else:
+                generator = candidate
+                generator_config = candidate_config
+            openings.append(
+                sample_opening(
+                    generator,
+                    rust_game_config,
+                    device,
+                    opening_plies,
+                    opening_temperature,
+                    seed=base_seed + pair_index,
+                    model_config=generator_config,
+                )
+            )
+    return openings
+
+
 def resolve_lagged_checkpoint(
     *,
     iteration: int,
@@ -182,6 +257,7 @@ def _mcts_move_selector(
     device: torch.device,
     precision: str,
     seed: int | None,
+    disable_gumbel_noise: bool = False,
 ) -> Callable[[object], tuple[int, int]] | None:
     if simulations < 0:
         raise ValueError("MCTS simulations cannot be negative")
@@ -203,6 +279,7 @@ def _mcts_move_selector(
         device=device,
         precision=precision,
         seed=seed,
+        disable_gumbel_noise=disable_gumbel_noise,
     )
 
 
@@ -215,6 +292,7 @@ def _compatible_mcts_move_selector(
     device: torch.device,
     precision: str,
     seed: int | None,
+    disable_gumbel_noise: bool = False,
 ) -> Callable[[object], tuple[int, int]] | None:
     """Build MCTS selection for an A0 model or a KLENT MCTS adapter."""
 
@@ -268,6 +346,7 @@ def _compatible_mcts_move_selector(
         m_actions=actions,
         c_visit=50,
         c_scale=1.0,
+        disable_gumbel_noise=disable_gumbel_noise,
     )
     search_index = 0
 
@@ -442,11 +521,17 @@ def evaluate_vs_checkpoint(
     iteration: int = 0,
     checkpoint_dirs: tuple[str | Path, ...] = (),
     lag_iterations: int = 0,
+    opening_plies: int = 0,
+    opening_temperature: float = 0.5,
+    opening_generator: str = "alternate",
 ) -> EvaluationStats:
     """Play against one fixed KLENT or HeXO-A0/Strix checkpoint.
 
     The two sides have independent MCTS budgets. Zero simulations selects that
-    side's greedy raw policy.
+    side's greedy raw policy. With ``opening_plies > 0``, one raw-policy
+    opening is sampled per two-game pair and replayed with model sides swapped;
+    in-tree Gumbel noise is then disabled on both sides, matching standalone
+    head-to-head.
     """
 
     if games <= 0:
@@ -455,6 +540,19 @@ def evaluate_vs_checkpoint(
         raise ValueError("checkpoint evaluation does not use a search depth")
     if not checkpoint:
         raise ValueError("checkpoint evaluation requires a checkpoint path")
+    if opening_plies < 0:
+        raise ValueError("opening_plies cannot be negative")
+    if opening_temperature <= 0:
+        raise ValueError("opening_temperature must be positive")
+    if opening_plies > 0 and games % 2 != 0:
+        raise ValueError(
+            "paired-opening checkpoint evaluation requires an even number "
+            "of games"
+        )
+    if opening_plies >= game_config.rollout_horizon:
+        raise ValueError(
+            "opening_plies must be below the evaluation rollout horizon"
+        )
     del iteration, checkpoint_dirs, lag_iterations
 
     import hexo_rs
@@ -479,13 +577,40 @@ def evaluate_vs_checkpoint(
         device=device,
         precision=precision,
         seed=seed,
+        disable_gumbel_noise=opening_plies > 0,
     )
     cache = checkpoint_cache or CheckpointOpponentCache()
+    paired_openings: list[list[tuple[int, int]]] = []
 
     try:
         with cache.activate(checkpoint, device) as loaded:
             opponent = loaded.model
             opponent_config = loaded.model_config
+            if opening_plies > 0:
+                from hexo_klent.mcts_adapter import KlentMCTSAdapter
+
+                candidate = KlentMCTSAdapter(
+                    model,
+                    algorithm or AlgorithmConfig(),
+                ).to(device).eval()
+                paired_openings = _sample_paired_checkpoint_openings(
+                    candidate=candidate,
+                    candidate_config=model_config,
+                    opponent=opponent,
+                    opponent_config=opponent_config,
+                    rust_game_config=rust_config,
+                    games=games,
+                    opening_plies=opening_plies,
+                    opening_temperature=opening_temperature,
+                    opening_generator=opening_generator,
+                    device=device,
+                    seed=seed,
+                )
+                for pair_index, opening in enumerate(paired_openings):
+                    for game_index in (2 * pair_index, 2 * pair_index + 1):
+                        game = records[game_index]["game"]
+                        for q, r in opening:
+                            game.apply_move(q, r)
             choose_opponent_mcts = _compatible_mcts_move_selector(
                 opponent,
                 model_config=opponent_config,
@@ -498,6 +623,7 @@ def evaluate_vs_checkpoint(
                     if seed is None
                     else seed + 500_000_003
                 ),
+                disable_gumbel_noise=opening_plies > 0,
             )
             with torch.inference_mode():
                 while active:
@@ -582,6 +708,12 @@ def evaluate_vs_checkpoint(
         else:
             losses += 1
     decided = wins + losses
+    unique_opening_fraction = (
+        len({tuple(opening) for opening in paired_openings})
+        / len(paired_openings)
+        if paired_openings
+        else 0.0
+    )
     return EvaluationStats(
         games=games,
         wins=wins,
@@ -591,6 +723,8 @@ def evaluate_vs_checkpoint(
         win_rate_decided=wins / decided if decided else 0.0,
         mean_game_length=sum(lengths) / games,
         mean_opponent_depth=0.0,
+        opening_pairs=len(paired_openings),
+        frac_unique_opening=unique_opening_fraction,
     )
 
 
@@ -614,6 +748,9 @@ def evaluate_vs_lagged(
     checkpoint_cache: CheckpointOpponentCache | None = None,
     opponent_mcts_simulations: int = 0,
     opponent_mcts_actions: int = 16,
+    opening_plies: int = 0,
+    opening_temperature: float = 0.5,
+    opening_generator: str = "alternate",
 ) -> EvaluationStats:
     """Evaluate against the exact checkpoint a configured generation lag ago."""
 
@@ -639,6 +776,9 @@ def evaluate_vs_lagged(
         checkpoint_cache=checkpoint_cache,
         opponent_mcts_simulations=mcts_simulations,
         opponent_mcts_actions=mcts_actions,
+        opening_plies=opening_plies,
+        opening_temperature=opening_temperature,
+        opening_generator=opening_generator,
     )
 
 
@@ -863,6 +1003,9 @@ def evaluate_opponent(
     iteration: int = 0,
     checkpoint_dirs: tuple[str | Path, ...] = (),
     lag_iterations: int = 0,
+    opening_plies: int = 0,
+    opening_temperature: float = 0.5,
+    opening_generator: str = "alternate",
 ) -> EvaluationStats:
     """Dispatch one configured opponent through the evaluator registry."""
 
@@ -870,8 +1013,7 @@ def evaluate_opponent(
         evaluator = OPPONENT_EVALUATORS[kind]
     except KeyError as error:
         raise ValueError(f"unknown evaluation opponent kind: {kind}") from error
-    return evaluator(
-        model,
+    kwargs = dict(
         model_config=model_config,
         game_config=game_config,
         games=games,
@@ -890,3 +1032,10 @@ def evaluate_opponent(
         checkpoint_dirs=checkpoint_dirs,
         lag_iterations=lag_iterations,
     )
+    if kind in {"checkpoint", "lagged"}:
+        kwargs.update(
+            opening_plies=opening_plies,
+            opening_temperature=opening_temperature,
+            opening_generator=opening_generator,
+        )
+    return evaluator(model, **kwargs)

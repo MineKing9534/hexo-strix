@@ -44,6 +44,8 @@ def test_decode_hxr1():
     assert batch.legal_offsets.tolist() == [0, 2]
     assert batch.legal_flat_indices.tolist() == [1, 4]
     assert batch.active_flat_indices.tolist() == [0, 1, 4]
+    assert batch.active_flat_lookup.tolist() == [0, 1, -1, -1, 2, -1]
+    assert batch.active_flat_lookup.dtype == torch.int32
     assert batch.origins.tolist() == [[-2, 7]]
     mask = batch.ray_mask
     assert bool(mask[0, 0, 0, 0, 0])
@@ -73,3 +75,4 @@ def test_raster_batch_slice_rebases_offsets_and_flat_indices():
     assert second.legal_offsets.tolist() == [0, 2]
     assert second.legal_flat_indices.tolist() == [1, 4]
     assert second.active_flat_indices.tolist() == [0, 1, 4]
+    assert second.active_flat_lookup.tolist() == [0, 1, -1, -1, 2, -1]

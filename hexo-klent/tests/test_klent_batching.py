@@ -4,6 +4,7 @@ from torch_geometric.data import Batch
 
 import hexo_rs
 from hexo_a0.graph import graph_batch_fn_from_model_config
+from hexo_axis_models.ops import RAY_DIRS
 from hexo_klent.batching import (
     _packed_ranges,
     order_states_for_batching,
@@ -71,6 +72,17 @@ def test_prepared_axis_batches_match_native_lean_graphs_and_outputs():
         )
         assert torch.equal(native.legal_mask, actual_batch.legal_mask)
         assert torch.equal(native.batch, actual_batch.batch)
+        expected_legal_idx = actual_batch.legal_mask.nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        assert torch.equal(actual_batch.legal_idx, expected_legal_idx)
+        assert torch.equal(
+            actual_batch.legal_counts,
+            torch.bincount(
+                actual_batch.batch.index_select(0, expected_legal_idx),
+                minlength=actual_batch.num_graphs,
+            ),
+        )
         with torch.inference_mode():
             expected = model.forward_batch(native)
             actual = model.forward_batch(actual_batch)
@@ -147,6 +159,55 @@ def test_dense_cell_budget_splits_equal_shape_positions():
         (state_slice.start, state_slice.stop)
         for _batch, state_slice in prepared
     ] == [(0, 1), (1, 2), (2, 3)]
+
+
+def test_packed_rays_only_reference_active_sources_and_destinations():
+    config = _tiny_dense_config()
+    game = hexo_rs.GameState(
+        hexo_rs.GameConfig(6, 8, 2**32 - 1)
+    )
+    states = [game.clone()]
+    for _ in range(12):
+        q, r = max(
+            game.legal_moves(),
+            key=lambda coord: abs(coord[0]) + abs(coord[1]),
+        )
+        game.apply_move(q, r)
+        if game.is_terminal():
+            break
+        states.append(game.clone())
+
+    prepared = prepare_graph_batches(
+        states,
+        model_config=config,
+        edge_budget=0,
+    )
+    for batch, _state_slice in prepared:
+        height, width = batch.planes.shape[-2:]
+        cells = height * width
+        for (
+            batch_index,
+            ray,
+            distance_index,
+            row,
+            column,
+        ) in batch.ray_mask.nonzero(as_tuple=False).tolist():
+            destination = (
+                batch_index * cells + row * width + column
+            )
+            assert int(batch.active_flat_lookup[destination]) >= 0
+            dq, dr = RAY_DIRS[ray]
+            distance = distance_index + 1
+            source_row = row + dr * distance
+            source_column = column + dq * distance
+            assert 0 <= source_row < height
+            assert 0 <= source_column < width
+            source = (
+                batch_index * cells
+                + source_row * width
+                + source_column
+            )
+            assert int(batch.active_flat_lookup[source]) >= 0
 
 
 def test_dense_cell_budget_rejects_one_oversized_position():

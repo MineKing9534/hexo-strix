@@ -122,6 +122,7 @@ class AxisRelationalConv(nn.Module):
         *,
         prebucketed: bool = False,
         has_global_edges: bool = False,
+        separate_global_star: bool = False,
     ) -> Tensor:
         """Compute updated node embeddings with one fixed-shape edge scatter.
 
@@ -143,11 +144,26 @@ class AxisRelationalConv(nn.Module):
                                multi-layer representation do that work once.
             has_global_edges:  Whether the prebucketed tensors contain global
                                edges. Ignored unless ``prebucketed=True``.
+            separate_global_star: Keep Rust's alternating dummy-to-real and
+                               real-to-dummy star edges out of the general
+                               relation scatter. Evaluate them as a broadcast
+                               to real nodes plus a reduction into dummy nodes.
 
         Returns:
             Node embeddings of shape ``(N, out_dim)``.
         """
-        if not prebucketed:
+        if separate_global_star and prebucketed:
+            raise ValueError(
+                "separate_global_star requires separate axis/global edges"
+            )
+
+        if separate_global_star:
+            has_global_edges = (
+                self.use_global
+                and global_edge_index is not None
+                and global_edge_index.numel() > 0
+            )
+        elif not prebucketed:
             has_global_edges = (
                 self.use_global
                 and global_edge_index is not None
@@ -166,7 +182,11 @@ class AxisRelationalConv(nn.Module):
                 )
 
         num_nodes = x.shape[0]
-        num_buckets = self.num_axes + 1 if self.use_global else self.num_axes
+        num_buckets = (
+            self.num_axes
+            if separate_global_star
+            else self.num_axes + 1 if self.use_global else self.num_axes
+        )
         src, dst = edge_index[0], edge_index[1]
 
         # Project the small distance table once, then gather its rows per edge.
@@ -175,7 +195,11 @@ class AxisRelationalConv(nn.Module):
         dist_table = self.axis_conv.lin(self.dist_embed.weight)
         axis_proj = dist_table.index_select(0, (edge_dist.long() - 1))
 
-        if self.use_global and has_global_edges:
+        if (
+            self.use_global
+            and has_global_edges
+            and not separate_global_star
+        ):
             # The global relation uses one learned edge vector. Project it once
             # and select it for the global bucket without splitting the edge
             # tensors by a data-dependent boolean mask.
@@ -202,23 +226,78 @@ class AxisRelationalConv(nn.Module):
         )
         buckets = buckets.view(num_nodes, num_buckets, self.in_dim)
 
-        # Apply the tied axis MLP to the stacked relation buckets in one call,
-        # then take the same symmetric sum as the old three-GINE loop.
+        # Apply the tied axis MLP to the stacked relation buckets in one call.
+        # The second affine projection is linear, so move the symmetric axis
+        # sum in front of it:
+        #
+        #   sum_k (W h_k + b) = W sum_k(h_k) + num_axes * b
+        #
+        # This preserves the learned parameters and state-dict layout while
+        # reducing that projection from num_axes * num_nodes rows to num_nodes.
         axis_inputs = (
             (1.0 + self.axis_conv.eps) * x.unsqueeze(1)
             + buckets[:, : self.num_axes, :]
         )
-        axis_outputs = self.axis_conv.nn(
-            axis_inputs.reshape(num_nodes * self.num_axes, self.in_dim)
+        axis_first = self.axis_conv.nn[0]
+        axis_second = self.axis_conv.nn[2]
+        if not isinstance(axis_first, nn.Linear) or not isinstance(
+            axis_second, nn.Linear
+        ):
+            raise TypeError("unexpected axis MLP layout")
+        axis_hidden = F.relu(
+            axis_first(
+                axis_inputs.reshape(
+                    num_nodes * self.num_axes, self.in_dim
+                )
+            )
         )
-        agg = axis_outputs.view(
-            num_nodes, self.num_axes, self.out_dim
+        axis_hidden_sum = axis_hidden.view(
+            num_nodes, self.num_axes, axis_second.in_features
         ).sum(dim=1)
+        axis_bias = (
+            None
+            if axis_second.bias is None
+            else axis_second.bias * self.num_axes
+        )
+        agg = F.linear(axis_hidden_sum, axis_second.weight, axis_bias)
 
         # Preserve the old empty-global behavior exactly: skipping this branch
         # leaves global parameters with grad=None, so AdamW cannot decay them on
         # batches where the relation is absent.
-        if self.use_global and has_global_edges:
+        if (
+            self.use_global
+            and has_global_edges
+            and separate_global_star
+        ):
+            if global_edge_index is None:
+                raise RuntimeError("missing separate global edge index")
+
+            # The Rust builder emits pairs in this exact order for every real
+            # node: dummy -> real, real -> dummy. Real destinations are unique,
+            # so only the compact real-to-dummy half needs a reduction.
+            dummy_sources = global_edge_index[0, 0::2]
+            real_destinations = global_edge_index[1, 0::2]
+            real_sources = global_edge_index[0, 1::2]
+            dummy_destinations = global_edge_index[1, 1::2]
+            global_edge = self.global_conv.lin(self.global_edge_embed)
+            global_bucket = x.new_zeros(x.shape)
+            global_bucket.index_copy_(
+                0,
+                real_destinations,
+                F.relu(
+                    x.index_select(0, dummy_sources) + global_edge
+                ),
+            )
+            global_bucket.index_add_(
+                0,
+                dummy_destinations,
+                F.relu(x.index_select(0, real_sources) + global_edge),
+            )
+            global_inputs = (
+                (1.0 + self.global_conv.eps) * x + global_bucket
+            )
+            agg = agg + self.global_conv.nn(global_inputs)
+        elif self.use_global and has_global_edges:
             global_inputs = (
                 (1.0 + self.global_conv.eps) * x
                 + buckets.select(1, self.num_axes)

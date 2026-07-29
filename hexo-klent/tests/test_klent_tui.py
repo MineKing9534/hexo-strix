@@ -1,6 +1,7 @@
 import io
 import json
 import math
+import threading
 from pathlib import Path
 
 import pytest
@@ -33,12 +34,15 @@ def _metrics(
         "collection/games": 4.0,
         "collection/p1_wins": 1.0,
         "collection/p2_wins": 2.0,
+        "collection/discarded_positions": 0.0,
         "collection/horizon_truncations": 0.0,
-        "collection/chunk_truncations": 1.0,
+        "collection/chunk_truncations": 0.0,
         "collection/mean_game_length": 4.0,
         "collection/mean_entropy": 2.4,
         "collection/mean_normalized_entropy": 0.68,
         "collection/mean_target_top1_probability": 0.32,
+        "collection/mean_prior_normalized_entropy": 0.74,
+        "collection/mean_prior_top1_probability": 0.26,
         "collection/mean_legal_actions": 36.0,
         "collection/mean_reverse_kl": 0.08,
         "collection/mean_abs_q": mean_abs_q,
@@ -53,8 +57,21 @@ def _metrics(
         "training/mean_microbatches_per_step": 1.5,
         "training/policy_loss": 2.41,
         "training/policy_excess_kl": 0.01,
+        "training/policy_diagnostic_examples": 16.0,
+        "training/policy_diagnostic_seconds": 0.1,
+        "training/policy_target_kl_before": 0.08,
+        "training/policy_target_kl_after": 0.02,
+        "training/policy_target_progress": 0.75,
+        "training/policy_target_top1_agreement_before": 0.72,
+        "training/policy_target_top1_agreement_after": 0.81,
+        "training/policy_target_top1_agreement_delta": 0.09,
         "training/q_loss": 0.18,
         "training/total_loss": 2.59,
+        "training/trunk_gradient_diagnostic_examples": 4.0,
+        "training/trunk_gradient_diagnostic_seconds": 0.05,
+        "training/policy_trunk_grad_norm": 0.7,
+        "training/q_trunk_grad_norm": 1.4,
+        "training/policy_q_trunk_grad_cosine": -0.2,
         "training/mean_grad_norm": grad,
         "training/grad_norm_p50": grad_p50,
         "training/grad_norm_p95": grad_p95,
@@ -63,6 +80,10 @@ def _metrics(
         "training/clipped_optimizer_steps": 8.0 * clip_fraction,
         "training/clip_fraction": clip_fraction,
         "training/mean_clip_scale": clip_scale,
+        "training/mean_parameter_update_norm": 0.0042,
+        "training/parameter_update_norm_p95": 0.0061,
+        "training/mean_update_to_weight_ratio": 0.000021,
+        "training/update_to_weight_ratio_p95": 0.000030,
         "training/played_action_target_top1": 0.42,
         "training/elapsed_seconds": 3.0,
         "training/examples_per_second": 5.33,
@@ -219,6 +240,67 @@ def test_completed_dashboard_does_not_wait_without_interactive_input(tmp_path):
     assert input_stream.tell() == 0
 
 
+def test_pause_key_arms_boundary_wait_and_resumes_with_frozen_clock(
+    tmp_path,
+    monkeypatch,
+):
+    dashboard = _dashboard(tmp_path)
+    clock = [100.0]
+    monkeypatch.setattr(
+        "hexo_klent.tui.time.monotonic",
+        lambda: clock[0],
+    )
+    dashboard._started_at = 90.0
+    dashboard.begin_run(2, 5)
+
+    dashboard._handle_key("p")
+
+    assert dashboard.pause_requested is True
+    assert "CANCEL PAUSE" in dashboard._footer().renderable.plain
+
+    entered = threading.Event()
+    finished = threading.Event()
+
+    def wait_at_boundary():
+        dashboard.wait_if_paused(3, on_pause=entered.set)
+        finished.set()
+
+    thread = threading.Thread(target=wait_at_boundary)
+    thread.start()
+    assert entered.wait(timeout=1.0)
+    assert dashboard._state == "PAUSED"
+    assert dashboard._phase == "PAUSED"
+    assert "RESUME" in dashboard._footer().renderable.plain
+
+    clock[0] = 110.0
+    assert dashboard._elapsed_seconds() == pytest.approx(10.0)
+    frozen_color = dashboard._pulse_color()
+    clock[0] = 120.0
+    assert dashboard._elapsed_seconds() == pytest.approx(10.0)
+    assert dashboard._pulse_color() == frozen_color
+
+    dashboard._handle_key("P")
+    thread.join(timeout=1.0)
+
+    assert finished.is_set()
+    assert dashboard._state == "RUN"
+    assert dashboard.pause_requested is False
+    assert dashboard._phase == "COLLECT"
+    assert dashboard._elapsed_seconds() == pytest.approx(10.0)
+    assert "PAUSE @ GEN END" in dashboard._footer().renderable.plain
+
+
+def test_pause_key_can_cancel_an_armed_boundary_pause(tmp_path):
+    dashboard = _dashboard(tmp_path)
+    dashboard.begin_run(1, 3)
+
+    assert dashboard.toggle_pause() is True
+    assert dashboard.toggle_pause() is False
+
+    assert dashboard.pause_requested is False
+    assert dashboard.wait_if_paused(2) is False
+
+
 def test_health_is_factual_and_surfaces_watch_states(tmp_path):
     dashboard = _dashboard(tmp_path)
 
@@ -263,6 +345,16 @@ def test_health_is_factual_and_surfaces_watch_states(tmp_path):
     health, _style, signals = dashboard._health()
     assert health == "WATCH"
     assert ("GPU CACHE", "0.1G/94G PEAK") in [
+        (name, value) for name, value, _signal_style in signals
+    ]
+
+    policy_regression = _metrics(iteration=6.0)
+    policy_regression["training/policy_target_kl_after"] = 0.10
+    policy_regression["training/policy_target_progress"] = -0.25
+    dashboard.update_metrics(policy_regression)
+    health, _style, signals = dashboard._health()
+    assert health == "NOMINAL"
+    assert ("FROZEN TARGET", "FARTHER -25.0%") in [
         (name, value) for name, value, _signal_style in signals
     ]
 
@@ -437,11 +529,17 @@ def test_dashboard_renders_cockpit_and_loads_metric_history(tmp_path):
     assert "SELF-PLAY FABRIC" in output
     assert "POLICY / Q DYNAMICS" in output
     assert "TEMPORAL TRACE" in output
-    assert "ENTROPY H / Hₙ" in output
-    assert "TOP-1 MASS" in output
+    assert "TARGET / PRIOR Hₙ" in output
+    assert "T / P TOP-1" in output
     assert "LEGAL MOVES" in output
     assert "Q SPAN" in output
     assert "EXCESS KL" in output
+    assert "FROZEN KL B / A" in output
+    assert "TARGET RETENTION" in output
+    assert "ARGMAX MATCH B / A" in output
+    assert "MATCH DELTA" in output
+    assert "P / Q TRUNK L2" in output
+    assert "TRUNK COS" in output
     assert "OPPONENT ARRAY" in output
     assert "random" in output
     assert "sealbot_mcts24/8" in output
@@ -462,6 +560,7 @@ def test_dashboard_renders_cockpit_and_loads_metric_history(tmp_path):
     assert "LIVE TELEMETRY" in compact_output
     assert "TEMPORAL TRACE" in compact_output
     assert "EXCESS KL" in compact_output
-    assert "TOP-1 MASS" in compact_output
+    assert "TARGET RETENTION" in compact_output
+    assert "T / P TOP-1" in compact_output
     assert "Q SPAN" in compact_output
     assert "SAFE HALT" in compact_output

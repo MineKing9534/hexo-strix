@@ -33,7 +33,7 @@ def tiny_model_config() -> ModelConfig:
     )
 
 
-def test_collect_games_produces_exact_position_budget_with_fresh_targets():
+def test_collect_games_drains_to_terminal_games_with_fresh_targets():
     model_config = tiny_model_config()
     model = KlentNet(model_config)
 
@@ -53,7 +53,9 @@ def test_collect_games_produces_exact_position_budget_with_fresh_targets():
     samples = flatten_trajectories(trajectories)
 
     assert stats.games == len(trajectories)
-    assert stats.positions == len(samples) == 12
+    assert stats.positions == len(samples)
+    assert stats.positions >= 12
+    assert stats.discarded_positions == 0
     assert stats.p1_wins + stats.p2_wins + stats.truncations == stats.games
     assert all(sample.return_target is not None for sample in samples)
     assert all(
@@ -89,6 +91,8 @@ def test_collect_games_produces_exact_position_budget_with_fresh_targets():
         sum(float(sample.target_policy.max()) for sample in samples)
         / len(samples)
     )
+    assert 0.0 <= stats.mean_prior_normalized_entropy <= 1.0
+    assert 0.0 < stats.mean_prior_top1_probability <= 1.0
     assert stats.mean_legal_actions == pytest.approx(
         sum(sample.target_policy.numel() for sample in samples)
         / len(samples)
@@ -135,7 +139,7 @@ def test_collection_model_forward_runs_in_inference_mode():
     )
 
 
-def test_rollout_horizon_bootstraps_instead_of_creating_a_draw():
+def test_rollout_horizon_discards_the_entire_nonterminal_game():
     model_config = tiny_model_config()
     model = KlentNet(model_config)
     with torch.no_grad():
@@ -159,15 +163,13 @@ def test_rollout_horizon_bootstraps_instead_of_creating_a_draw():
     assert stats.horizon_truncations == 2
     assert stats.chunk_truncations == 0
     assert stats.p1_wins == stats.p2_wins == 0
-    assert stats.mean_abs_bootstrap_value == pytest.approx(0.25)
-    assert all(trajectory.truncated for trajectory in trajectories)
-    assert all(
-        trajectory.steps[-1].return_target == pytest.approx(-0.25)
-        for trajectory in trajectories
-    )
+    assert stats.positions == 0
+    assert stats.discarded_positions == 4
+    assert stats.mean_abs_bootstrap_value == 0.0
+    assert trajectories == []
 
 
-def test_position_boundary_bootstraps_live_games():
+def test_position_budget_drains_live_games_to_terminal_results():
     model_config = tiny_model_config()
     model = KlentNet(model_config)
     with torch.no_grad():
@@ -177,7 +179,7 @@ def test_position_boundary_bootstraps_live_games():
         model,
         model_config=model_config,
         game_config=GameConfig(
-            win_length=6, placement_radius=1, rollout_horizon=10
+            win_length=2, placement_radius=1, rollout_horizon=10
         ),
         algorithm=AlgorithmConfig(),
         positions=3,
@@ -187,21 +189,23 @@ def test_position_boundary_bootstraps_live_games():
         seed=19,
     )
 
-    assert stats.positions == 3
+    assert stats.positions >= 3
+    assert stats.positions == sum(len(item.steps) for item in trajectories)
+    assert stats.discarded_positions == 0
     assert stats.games == 2
-    assert stats.truncations == 2
+    assert stats.truncations == 0
     assert stats.horizon_truncations == 0
-    assert stats.chunk_truncations == 2
-    assert stats.mean_abs_bootstrap_value == pytest.approx(0.25)
-    assert sorted(len(trajectory.steps) for trajectory in trajectories) == [1, 2]
-    assert all(trajectory.chunk_truncated for trajectory in trajectories)
+    assert stats.chunk_truncations == 0
+    assert stats.mean_abs_bootstrap_value == 0.0
+    assert all(trajectory.winner in {"P1", "P2"} for trajectory in trajectories)
+    assert all(not trajectory.truncated for trajectory in trajectories)
     assert all(
-        abs(trajectory.steps[-1].return_target) == pytest.approx(0.25)
+        abs(trajectory.steps[-1].return_target) == pytest.approx(1.0)
         for trajectory in trajectories
     )
 
 
-def test_dense_spatial_boundary_bootstraps_wandering_games():
+def test_dense_spatial_boundary_discards_wandering_games():
     def frontier_inference(states):
         logits = []
         q_values = []
@@ -235,21 +239,85 @@ def test_dense_spatial_boundary_bootstraps_wandering_games():
         worker_processes=1,
     )
 
-    assert stats.positions == 2
+    assert stats.positions == 0
+    assert stats.discarded_positions == 2
     assert stats.truncations == 2
     assert stats.horizon_truncations == 0
     assert stats.spatial_truncations == 2
     assert stats.chunk_truncations == 0
     assert stats.max_dense_position_cells == 17 * 17
-    assert all(trajectory.spatial_truncated for trajectory in trajectories)
-    assert all(
-        trajectory.bootstrap_value == pytest.approx(0.25)
-        for trajectory in trajectories
+    assert trajectories == []
+    assert stats.mean_abs_bootstrap_value == 0.0
+
+
+def test_completed_trajectory_streaming_preserves_collection_semantics():
+    def zero_inference(states):
+        return (
+            [torch.zeros(state.legal_move_count()) for state in states],
+            [torch.zeros(state.legal_move_count()) for state in states],
+        )
+
+    arguments = dict(
+        game_config=GameConfig(
+            win_length=2,
+            placement_radius=1,
+            rollout_horizon=10,
+        ),
+        algorithm=AlgorithmConfig(),
+        positions=20,
+        parallel_games=2,
+        dense_position_cell_limit=0,
+        seed=37,
+        worker_processes=1,
     )
-    assert all(
-        abs(trajectory.steps[-1].return_target) == pytest.approx(0.25)
-        for trajectory in trajectories
+    expected, expected_stats = _collect_with_inference(
+        zero_inference,
+        **arguments,
     )
+    chunks = []
+    retained, actual_stats = _collect_with_inference(
+        zero_inference,
+        completed_callback=chunks.append,
+        completed_chunk_positions=3,
+        **arguments,
+    )
+    actual = [
+        trajectory
+        for chunk in chunks
+        for trajectory in chunk
+    ]
+
+    assert retained == []
+    assert len(chunks) > 1
+    assert [len(item.steps) for item in actual] == [
+        len(item.steps) for item in expected
+    ]
+    assert actual_stats.positions == expected_stats.positions
+    assert actual_stats.games == expected_stats.games
+    assert actual_stats.p1_wins == expected_stats.p1_wins
+    assert actual_stats.p2_wins == expected_stats.p2_wins
+    assert actual_stats.truncations == expected_stats.truncations
+    assert actual_stats.mean_game_length == pytest.approx(
+        expected_stats.mean_game_length
+    )
+    assert actual_stats.mean_abs_return == pytest.approx(
+        expected_stats.mean_abs_return
+    )
+    for expected_step, actual_step in zip(
+        flatten_trajectories(expected),
+        flatten_trajectories(actual),
+        strict=True,
+    ):
+        assert actual_step.state.placed_stones() == (
+            expected_step.state.placed_stones()
+        )
+        assert actual_step.return_target == pytest.approx(
+            expected_step.return_target
+        )
+        torch.testing.assert_close(
+            actual_step.target_policy,
+            expected_step.target_policy,
+        )
 
 
 def test_parallel_collection_uses_spawn_workers_and_merges_shards():
@@ -257,14 +325,15 @@ def test_parallel_collection_uses_spawn_workers_and_merges_shards():
     model = KlentNet(model_config)
     with torch.no_grad():
         model.q_head.mlp[-2].bias.fill_(math.atanh(0.25))
-    actors = SharedInferenceActors(2)
+    # Force several acknowledged result chunks per actor in this small test.
+    actors = SharedInferenceActors(2, result_chunk_positions=1)
     try:
         for seed in (23, 24):
             trajectories, stats = collect_games_parallel(
                 model,
                 model_config=model_config,
                 game_config=GameConfig(
-                    win_length=6, placement_radius=1, rollout_horizon=2
+                    win_length=2, placement_radius=1, rollout_horizon=10
                 ),
                 algorithm=AlgorithmConfig(),
                 positions=8,
@@ -278,13 +347,21 @@ def test_parallel_collection_uses_spawn_workers_and_merges_shards():
                 actors=actors,
             )
 
-            assert len(trajectories) == 4
-            assert stats.games == 4
-            assert stats.positions == 8
-            assert stats.truncations == 4
-            assert stats.horizon_truncations == 4
+            assert len(trajectories) == stats.games
+            assert stats.positions >= 8
+            assert stats.positions == sum(
+                len(trajectory.steps) for trajectory in trajectories
+            )
+            assert stats.discarded_positions == 0
+            assert stats.truncations == 0
+            assert stats.horizon_truncations == 0
             assert stats.chunk_truncations == 0
-            assert stats.mean_abs_bootstrap_value == pytest.approx(0.25)
+            assert stats.mean_abs_bootstrap_value == 0.0
+            assert all(
+                trajectory.winner in {"P1", "P2"}
+                and not trajectory.truncated
+                for trajectory in trajectories
+            )
             assert stats.worker_processes == 2
     finally:
         actors.close()

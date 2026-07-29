@@ -1,0 +1,37 @@
+Script started on 2026-08-06 18:08:11+01:00 [COMMAND=".venv/bin/hexo-a0 head-to-head --checkpoint-a runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000020.pt --checkpoint-b runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt --win-length 6 --radius 8 --max-moves 1000 --mcts-sims 64 --mcts-m-actions 16 --device cuda --sprt-s0 0.50 --sprt-s1 0.55 --sprt-alpha 0.05 --sprt-beta 0.05 --window-size 0 --max-games 1000 --seed 20260871 --state-file artifacts/klent-head-to-head/gpu-forcing-off-fresh-noclip20-vs10-20260806.json --opening-plies 8 --opening-generator alternate --opening-temperature 0.5 --disable-forcing-solver" TERM="xterm-256color" TTY="/dev/pts/2" COLUMNS="80" LINES="24"]
+(null): No such file or directory
+2026-08-06 18:08:15 head_to_head INFO ==============================================================================
+2026-08-06 18:08:15 head_to_head INFO Head-to-head match: A vs B
+2026-08-06 18:08:15 head_to_head INFO   A: runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000020.pt
+2026-08-06 18:08:15 head_to_head INFO      train_steps=20  graph=axis conv=gine layers=4 hidden=128 heads=8 jk=True
+2026-08-06 18:08:15 head_to_head INFO   B: runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt
+2026-08-06 18:08:15 head_to_head INFO      train_steps=10  graph=axis conv=gine layers=4 hidden=128 heads=8 jk=True
+2026-08-06 18:08:15 head_to_head INFO Game: win_length=6 radius=8 max_moves=1000
+2026-08-06 18:08:15 head_to_head INFO MCTS: sims=64 m_actions=16 device=cuda  capture_k A=0 B=0  vl A=0 B=0
+2026-08-06 18:08:15 head_to_head INFO Forcing: root A=off B=off depth=default root_budget=default leaf_budget A=0 B=0 leaf_width A=wide B=wide leaf_order A=legacy B=legacy leaf_windows A=legacy B=legacy
+2026-08-06 18:08:15 head_to_head INFO SPRT: s0=0.500 s1=0.550 alpha=0.050 beta=0.050  bounds [-2.944, 2.944]
+2026-08-06 18:08:15 head_to_head INFO Max games: 1000   pentanomial=True (pair_variance clamped to [0.05, 0.65])
+2026-08-06 18:08:15 head_to_head INFO State file: artifacts/klent-head-to-head/gpu-forcing-off-fresh-noclip20-vs10-20260806.json
+2026-08-06 18:08:15 head_to_head INFO ==============================================================================
+2026-08-06 18:08:22 head_to_head INFO game=1 side=P1 W  W-D-L=1-0-0  score=1.000  Elo(A-B)=+191 [-234, +2400]  LLR=0.000  continue
+2026-08-06 18:08:24 head_to_head INFO game=2 side=P2 L  W-D-L=1-0-1  score=0.500  Elo(A-B)=-0 [-393, +393]  LLR=-0.014  continue
+2026-08-06 18:08:28 head_to_head INFO game=3 side=P1 L  W-D-L=1-0-2  score=0.333  Elo(A-B)=-89 [-473, +233]  LLR=-0.014  continue
+2026-08-06 18:08:29 head_to_head INFO game=4 side=P2 L  W-D-L=1-0-3  score=0.250  Elo(A-B)=-147 [-528, +147]  LLR=-0.314  continue
+2026-08-06 18:08:33 head_to_head INFO game=5 side=P1 L  W-D-L=1-0-4  score=0.200  Elo(A-B)=-191 [-570, +88]  LLR=-0.440  continue
+2026-08-06 18:08:46 head_to_head INFO game=6 side=P2 L  W-D-L=1-0-5  score=0.167  Elo(A-B)=-226 [-604, +44]  LLR=-0.860  continue
+2026-08-06 18:08:48 head_to_head INFO game=7 side=P1 L  W-D-L=1-0-6  score=0.143  Elo(A-B)=-255 [-632, +9]  LLR=-0.968  continue
+2026-08-06 18:08:51 head_to_head INFO game=8 side=P2 L  W-D-L=1-0-7  score=0.125  Elo(A-B)=-280 [-656, -20]  LLR=-1.440  continue
+2026-08-06 18:09:04 head_to_head INFO game=9 side=P1 L  W-D-L=1-0-8  score=0.111  Elo(A-B)=-301 [-677, -45]  LLR=-1.707  continue
+2026-08-06 18:09:08 head_to_head INFO game=10 side=P2 L  W-D-L=1-0-9  score=0.100  Elo(A-B)=-321 [-696, -67]  LLR=-2.267  continue
+2026-08-06 18:09:30 head_to_head INFO game=11 side=P1 L  W-D-L=1-0-10  score=0.091  Elo(A-B)=-338 [-713, -87]  LLR=-2.656  continue
+2026-08-06 18:09:31 head_to_head INFO game=12 side=P2 L  W-D-L=1-0-11  score=0.083  Elo(A-B)=-354 [-729, -105]  LLR=-3.313  reject_h1
+2026-08-06 18:09:31 head_to_head INFO ==============================================================================
+2026-08-06 18:09:31 head_to_head INFO Final: B is at least as strong as A (reject H1 at LLR=-3.313)
+2026-08-06 18:09:31 head_to_head INFO Games=12  W-D-L=1-0-11  score=0.083  LLR=-3.313
+2026-08-06 18:09:31 head_to_head INFO Elo(A-B) = -354   (95% CI: [-729, -105]; Wilson on score [0.015, 0.354])
+2026-08-06 18:09:31 head_to_head INFO ==============================================================================
+2026-08-06 18:09:31 head_to_head INFO Games: mode=openings  frac_unique_game=1.000  mean_len=81.2 p10_len=36.0 min_len=32.0
+2026-08-06 18:09:31 head_to_head INFO Openings: plies=8 T=0.5 gen=alternate  frac_unique_opening=1.000  refuted=0.00 p2_dist=2.5 (A-gen 71.0 / B-gen 91.3)
+2026-08-06 18:09:31 head_to_head INFO ==============================================================================
+
+Script done on 2026-08-06 18:09:32+01:00 [COMMAND_EXIT_CODE="0"]

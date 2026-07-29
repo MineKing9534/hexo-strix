@@ -198,6 +198,13 @@ def main(argv=None):
                             help="SPRT type-II error rate (default 0.05)")
     h2h_parser.add_argument("--window-size", type=int, default=1000,
                             help="Sliding window of recent games for SPRT state (0 = unbounded)")
+    h2h_parser.add_argument(
+        "--pair-variance", type=float, default=0.5,
+        help=(
+            "Fixed pentanomial pair-score variance (default 0.5). "
+            "Standalone head-to-head does not adapt this online."
+        ),
+    )
     h2h_parser.add_argument("--max-games", type=int, default=1000,
                             help="Hard upper bound on games played (default 1000)")
     h2h_parser.add_argument("--seed", type=int, default=None,
@@ -793,6 +800,7 @@ def _run_head_to_head(args):
         sprt_alpha=args.sprt_alpha,
         sprt_beta=args.sprt_beta,
         window_size=window,
+        pair_variance=args.pair_variance,
         max_games=args.max_games,
         seed=args.seed,
         state_file=state_file,

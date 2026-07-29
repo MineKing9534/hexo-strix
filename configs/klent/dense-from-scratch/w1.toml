@@ -37,7 +37,7 @@ moves_scope = "node"
 [game]
 win_length = 4
 placement_radius = 2
-# HeXO has no draws. A still-live position at the horizon is bootstrapped.
+# HeXO has no draws. A game still live at the horizon is discarded from FIT.
 rollout_horizon = 30
 
 [algorithm]

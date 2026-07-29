@@ -8,7 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .fused_line import axis_line_gather
+from .fused_line import (
+    axis_line_gather,
+    axis_line_gather_compact,
+    directed_line_gather_compact,
+)
 from .ops import (
     AXIS_RAY_PAIRS,
     NUM_RAYS,
@@ -19,6 +23,7 @@ from .ops import (
     SpatialMLPHead,
     gather_dense_actions,
     masked_mean,
+    pack_ray_mask,
     roll_source,
     unpack_ray_bits,
 )
@@ -152,14 +157,105 @@ class DenseAxisGineBlock(nn.Module):
                 persistent=False,
             )
 
+    def forward_compact(
+        self,
+        h_active: Tensor,
+        global_state: Tensor,
+        ray_bits: Tensor,
+        active_flat_indices: Tensor,
+        active_flat_lookup: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Update compact active cells without materializing a dense raster."""
+
+        if h_active.ndim != 2:
+            raise ValueError("h_active must be [active,channels]")
+        if ray_bits.ndim != 3:
+            raise ValueError("ray_bits must be packed [B,H,W] words")
+        residual_h = h_active
+        residual_g = global_state
+        gx = self.norm.forward_vector(global_state)
+        x_active = self.norm.forward_vector(h_active)
+        distance_table = self.axis_edge_proj(
+            self.distance_embedding.weight
+        )
+        batch, height, width = ray_bits.shape
+        cells = height * width
+        axis_inputs = axis_line_gather_compact(
+            x_active,
+            ray_bits,
+            distance_table,
+            self.axis_eps,
+            active_flat_indices,
+            active_flat_lookup,
+            height,
+            width,
+            self.radius,
+        )
+        axis_active = self.axis_mlp.forward_vector(
+            axis_inputs
+        ).sum(dim=1)
+        active_batch = torch.div(
+            active_flat_indices,
+            cells,
+            rounding_mode="floor",
+        )
+
+        # The dummy node has no axis edges, but GINE still applies its self
+        # term once per relation. All three outputs are identical because
+        # weights tie.
+        axis_global = 3.0 * self.axis_mlp.forward_vector(
+            (1.0 + self.axis_eps) * gx
+        )
+
+        global_edge = self.global_edge_proj(self.global_edge_embed)
+        global_to_real = F.relu(gx + global_edge)
+        global_real_active = self.global_mlp.forward_vector(
+            (1.0 + self.global_eps) * x_active
+            + global_to_real.index_select(0, active_batch)
+        )
+        real_to_global_active = F.relu(x_active + global_edge)
+        real_to_global = x_active.new_zeros((batch, self.channels))
+        real_to_global.index_add_(
+            0,
+            active_batch,
+            real_to_global_active,
+        )
+        global_input = (1.0 + self.global_eps) * gx + real_to_global
+        global_out = self.global_mlp.forward_vector(global_input)
+
+        conv_g = self.node_update.forward_vector(
+            torch.cat([gx, axis_global + global_out], dim=1)
+        )
+        conv_active = self.node_update.forward_vector(
+            torch.cat(
+                [x_active, axis_active + global_real_active],
+                dim=-1,
+            )
+        )
+        h_active = F.relu(
+            residual_h
+            + self.layer_scale.view(1, -1) * conv_active
+        )
+        global_state = F.relu(
+            residual_g + self.layer_scale.view(1, -1) * conv_g
+        )
+        return h_active, global_state
+
     def forward(
         self,
         h: Tensor,
         global_state: Tensor,
         active_mask: Tensor,
         ray_mask: Tensor,
-        active_flat_indices: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
+        residual_h = h
+        residual_g = global_state
+        gx = self.norm.forward_vector(global_state)
+        distance_table = self.axis_edge_proj(
+            self.distance_embedding.weight
+        )
+        b, c, height, width = h.shape
+
         if ray_mask.ndim != 5 or ray_mask.shape[1] != NUM_RAYS:
             raise ValueError("ray_mask must be [B,6,R,H,W]")
         if ray_mask.shape[2] < self.radius:
@@ -167,17 +263,8 @@ class DenseAxisGineBlock(nn.Module):
                 f"ray_mask radius {ray_mask.shape[2]} "
                 f"< model radius {self.radius}"
             )
-
-        residual_h = h
-        residual_g = global_state
         active = active_mask.to(dtype=h.dtype)
         x = self.norm(h) * active
-        gx = self.norm.forward_vector(global_state)
-
-        distance_table = self.axis_edge_proj(
-            self.distance_embedding.weight
-        )
-        b, c, height, width = x.shape
         stacked = axis_line_gather(
             x,
             ray_mask,
@@ -185,32 +272,9 @@ class DenseAxisGineBlock(nn.Module):
             self.axis_eps,
             self.radius,
         )
-        if active_flat_indices is None:
-            axis_real = self.axis_mlp(stacked).reshape(
-                b, 3, c, height, width
-            ).sum(dim=1)
-        else:
-            # Inactive cells are discarded by this block. Apply the expensive
-            # three-axis MLP only to live nodes, then scatter its relation sum
-            # back into the dense trunk. All parameters and active outputs are
-            # identical to the padded 1x1-convolution formulation.
-            cells = height * width
-            axis_points = (
-                stacked.reshape(b, 3, c, cells)
-                .permute(1, 0, 3, 2)
-                .reshape(3, b * cells, c)
-            )
-            active_points = axis_points.index_select(
-                1, active_flat_indices
-            )
-            axis_active = self.axis_mlp.forward_vector(
-                active_points
-            ).sum(dim=0)
-            active_batch = torch.div(
-                active_flat_indices, cells, rounding_mode="floor"
-            )
-            x_points = x.permute(0, 2, 3, 1).reshape(b * cells, c)
-            x_active = x_points.index_select(0, active_flat_indices)
+        axis_real = self.axis_mlp(stacked).reshape(
+            b, 3, c, height, width
+        ).sum(dim=1)
 
         # The dummy node has no axis edges, but GINE still applies its self term
         # once per relation. All three outputs are identical because weights tie.
@@ -220,56 +284,27 @@ class DenseAxisGineBlock(nn.Module):
 
         global_edge = self.global_edge_proj(self.global_edge_embed)
         global_to_real = F.relu(gx + global_edge)
-        if active_flat_indices is None:
-            global_real_input = (
-                (1.0 + self.global_eps) * x
-                + global_to_real.unsqueeze(-1).unsqueeze(-1)
-            )
-            global_real = self.global_mlp(global_real_input)
-        else:
-            global_real_active = self.global_mlp.forward_vector(
-                (1.0 + self.global_eps) * x_active
-                + global_to_real.index_select(0, active_batch)
-            )
+        global_real_input = (
+            (1.0 + self.global_eps) * x
+            + global_to_real.unsqueeze(-1).unsqueeze(-1)
+        )
+        global_real = self.global_mlp(global_real_input)
 
-        real_to_global = F.relu(x + global_edge.view(1, -1, 1, 1)) * active
-        real_to_global = real_to_global.sum(dim=(-2, -1))
+        real_to_global = (
+            F.relu(x + global_edge.view(1, -1, 1, 1))
+            * active
+        ).sum(dim=(-2, -1))
         global_input = (1.0 + self.global_eps) * gx + real_to_global
         global_out = self.global_mlp.forward_vector(global_input)
 
         conv_g = self.node_update.forward_vector(
             torch.cat([gx, axis_global + global_out], dim=1)
         )
-        if active_flat_indices is None:
-            conv_h = self.node_update(
-                torch.cat([x, axis_real + global_real], dim=1)
-            )
-            scale = self.layer_scale.view(1, -1, 1, 1)
-            h = F.relu(residual_h + scale * conv_h) * active
-        else:
-            conv_active = self.node_update.forward_vector(
-                torch.cat(
-                    [x_active, axis_active + global_real_active],
-                    dim=-1,
-                )
-            )
-            residual_points = residual_h.permute(
-                0, 2, 3, 1
-            ).reshape(b * cells, c)
-            residual_active = residual_points.index_select(
-                0, active_flat_indices
-            )
-            h_active = F.relu(
-                residual_active
-                + self.layer_scale.view(1, -1) * conv_active
-            )
-            h_points = h_active.new_zeros((b * cells, c))
-            h_points.index_copy_(
-                0, active_flat_indices, h_active
-            )
-            h = h_points.reshape(
-                b, height, width, c
-            ).permute(0, 3, 1, 2)
+        conv_h = self.node_update(
+            torch.cat([x, axis_real + global_real], dim=1)
+        )
+        scale = self.layer_scale.view(1, -1, 1, 1)
+        h = F.relu(residual_h + scale * conv_h) * active
         global_state = F.relu(
             residual_g + self.layer_scale.view(1, -1) * conv_g
         )
@@ -399,6 +434,108 @@ class AxisGineCompatNet(nn.Module):
             global_state = global_state + condition
         return h, global_state, active, legal, stones
 
+    def _initial_active_state(
+        self,
+        planes: Tensor,
+        scalars: Tensor,
+        active_flat_indices: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Project only active cells into the checkpoint-compatible trunk."""
+
+        if planes.ndim != 4:
+            raise ValueError(
+                f"planes must be [B,P,H,W], got {tuple(planes.shape)}"
+            )
+        if scalars.ndim != 2:
+            raise ValueError(
+                f"scalars must be [B,S], got {tuple(scalars.shape)}"
+            )
+        if planes.shape[1] < 8:
+            raise ValueError(
+                "planes must contain at least the eight standard channels"
+            )
+        if scalars.shape[1] < 1:
+            raise ValueError("scalars must contain moves_remaining")
+
+        batch, plane_count, height, width = planes.shape
+        cells = height * width
+        active_batch = torch.div(
+            active_flat_indices,
+            cells,
+            rounding_mode="floor",
+        )
+        plane_points = planes.permute(0, 2, 3, 1).reshape(
+            batch * cells,
+            plane_count,
+        )
+        active_planes = plane_points.index_select(
+            0,
+            active_flat_indices,
+        )
+        moves = scalars[:, 0].index_select(0, active_batch).unsqueeze(1)
+        features = torch.cat(
+            [
+                active_planes[:, 0:2],
+                moves,
+                active_planes[:, 3:8],
+            ],
+            dim=1,
+        )
+        h_active = F.linear(
+            features,
+            self.input_proj.weight,
+            self.input_proj.bias,
+        )
+
+        global_features = planes.new_zeros(
+            (batch, self.config.input_dim)
+        )
+        global_features[:, 2] = scalars[:, 0]
+        global_state = self.input_proj(global_features)
+        if self.conditioner is not None:
+            condition = self.conditioner(
+                scalars[:, 1 : self.config.scalar_count]
+            )
+            h_active = h_active + condition.index_select(
+                0,
+                active_batch,
+            )
+            global_state = global_state + condition
+        return h_active, global_state
+
+    @staticmethod
+    def _prepare_compact_rays(
+        ray_mask: Tensor,
+        active_flat_indices: Tensor,
+        active_flat_lookup: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        if ray_mask.ndim == 5:
+            ray_bits = pack_ray_mask(ray_mask)
+        elif ray_mask.ndim == 3:
+            ray_bits = ray_mask
+        else:
+            raise ValueError(
+                "compact ray data must be packed [B,H,W] words "
+                "or an unpacked [B,6,R,H,W] mask"
+            )
+        if active_flat_lookup is None:
+            active_flat_lookup = torch.full(
+                (ray_bits.numel(),),
+                -1,
+                dtype=torch.int32,
+                device=active_flat_indices.device,
+            )
+            active_flat_lookup.index_copy_(
+                0,
+                active_flat_indices,
+                torch.arange(
+                    active_flat_indices.numel(),
+                    dtype=torch.int32,
+                    device=active_flat_indices.device,
+                ),
+            )
+        return ray_bits, active_flat_lookup
+
     def _combine_jk(self, states: list[Tensor]) -> Tensor:
         if self.config.jk_mode == "cat":
             return torch.cat([self.final_norm(h) for h in states], dim=1)
@@ -408,13 +545,59 @@ class AxisGineCompatNet(nn.Module):
             return self.final_norm(mixed)
         return self.final_norm(states[-1])
 
+    def _combine_jk_active(self, states: list[Tensor]) -> Tensor:
+        if self.config.jk_mode == "cat":
+            return torch.cat(
+                [self.final_norm.forward_vector(h) for h in states],
+                dim=1,
+            )
+        if self.config.jk_mode == "sum":
+            weights = torch.softmax(
+                self.jk_weights,
+                dim=0,
+            ).view(-1, 1, 1)
+            mixed = (weights * torch.stack(states, dim=0)).sum(dim=0)
+            return self.final_norm.forward_vector(mixed)
+        return self.final_norm.forward_vector(states[-1])
+
+    def forward_active_features(
+        self,
+        planes: Tensor,
+        scalars: Tensor,
+        ray_mask: Tensor,
+        active_flat_indices: Tensor,
+        active_flat_lookup: Tensor | None = None,
+    ) -> Tensor:
+        """Return JK features while keeping the complete trunk compact."""
+
+        ray_bits, active_flat_lookup = self._prepare_compact_rays(
+            ray_mask,
+            active_flat_indices,
+            active_flat_lookup,
+        )
+        h_active, global_state = self._initial_active_state(
+            planes,
+            scalars,
+            active_flat_indices,
+        )
+        states: list[Tensor] = []
+        for block in self.blocks:
+            h_active, global_state = block.forward_compact(
+                h_active,
+                global_state,
+                ray_bits,
+                active_flat_indices,
+                active_flat_lookup,
+            )
+            states.append(h_active)
+        return self._combine_jk_active(states)
+
     def forward_features(
         self,
         planes: Tensor,
         scalars: Tensor,
         active_mask: Tensor | None,
         ray_mask: Tensor,
-        active_flat_indices: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         h, global_state, active, legal, stones = self._initial_state(planes, scalars, active_mask)
         states: list[Tensor] = []
@@ -424,7 +607,6 @@ class AxisGineCompatNet(nn.Module):
                 global_state,
                 active,
                 ray_mask,
-                active_flat_indices,
             )
             states.append(h)
         representation = self._combine_jk(states)
@@ -516,6 +698,28 @@ class RayRingMixer(nn.Module):
         opposite = self._apply_conv(self.opposite, torch.roll(rays, 3, dims=1))
         return same + adjacent + next_nearest + opposite + self.bias.view(1, 1, -1, 1, 1)
 
+    @staticmethod
+    def _apply_linear(module: nn.Conv2d, rays: Tensor) -> Tensor:
+        return F.linear(rays, module.weight[:, :, 0, 0])
+
+    def forward_vector(self, rays: Tensor) -> Tensor:
+        """Mix compact ``[active, direction, channel]`` ray states."""
+
+        same = self._apply_linear(self.same, rays)
+        adjacent = self._apply_linear(
+            self.adjacent,
+            torch.roll(rays, 1, dims=1) + torch.roll(rays, -1, dims=1),
+        )
+        next_nearest = self._apply_linear(
+            self.next_nearest,
+            torch.roll(rays, 2, dims=1) + torch.roll(rays, -2, dims=1),
+        )
+        opposite = self._apply_linear(
+            self.opposite,
+            torch.roll(rays, 3, dims=1),
+        )
+        return same + adjacent + next_nearest + opposite + self.bias
+
 
 class PersistentRayMixer(nn.Module):
     """Narrow persistent directed-ray stream with invariant fork folding."""
@@ -591,6 +795,86 @@ class PersistentRayMixer(nn.Module):
         axis_max = axis.max(dim=1).values
         return self.fold(torch.cat([axis_sum, pair_product, axis_max], dim=1))
 
+    def _fold_invariant_vector(self, rays: Tensor) -> Tensor:
+        axes: list[Tensor] = []
+        for a, b in AXIS_RAY_PAIRS:
+            ra, rb = rays[:, a], rays[:, b]
+            axes.append(
+                torch.cat([ra + rb, ra * rb, (ra - rb).abs()], dim=-1)
+            )
+        axis = torch.stack(axes, dim=1)
+        axis_sum = axis.sum(dim=1)
+        axis_sq_sum = (axis * axis).sum(dim=1)
+        pair_product = 0.5 * (axis_sum * axis_sum - axis_sq_sum)
+        axis_max = axis.max(dim=1).values
+        return self.fold.forward_vector(
+            torch.cat([axis_sum, pair_product, axis_max], dim=-1)
+        )
+
+    def forward_compact(
+        self,
+        h_active: Tensor,
+        ray_state: Tensor | None,
+        ray_mask: Tensor,
+        active_flat_indices: Tensor,
+        active_flat_lookup: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Update a compact trunk and persistent ray state in place."""
+
+        if h_active.ndim != 2:
+            raise ValueError("h_active must be [active,channels]")
+        if ray_mask.ndim != 3:
+            raise ValueError("ray_mask must be packed [B,H,W] words")
+        _batch, height, width = ray_mask.shape
+        normalized = self.trunk_norm.forward_vector(h_active)
+        source_active = F.linear(
+            normalized,
+            self.source_proj.weight[:, :, 0, 0],
+            self.source_proj.bias,
+        )
+        distance_table = self.edge_proj(self.distance_embedding.weight)
+        directional = directed_line_gather_compact(
+            source_active,
+            ray_mask,
+            distance_table,
+            active_flat_indices,
+            active_flat_lookup,
+            height,
+            width,
+            self.radius,
+        )
+
+        active_count = active_flat_indices.numel()
+        if ray_state is None:
+            ray_state = h_active.new_zeros(
+                (active_count, NUM_RAYS, self.ray_channels)
+            )
+        ring = self.ring_mixer.forward_vector(ray_state)
+        trunk = F.linear(
+            h_active,
+            self.trunk_proj.weight[:, :, 0, 0],
+            self.trunk_proj.bias,
+        ).unsqueeze(1).expand(-1, NUM_RAYS, -1)
+        update_input = torch.cat(
+            [ray_state, directional, trunk, ring],
+            dim=-1,
+        )
+        delta = torch.tanh(self.update_mlp.forward_vector(update_input))
+        gate = torch.sigmoid(
+            F.linear(
+                update_input,
+                self.gate.weight[:, :, 0, 0],
+                self.gate.bias,
+            )
+        )
+        ray_state = ray_state + gate * delta
+
+        folded = self._fold_invariant_vector(ray_state)
+        h_active = F.relu(
+            h_active + self.branch_scale * folded
+        )
+        return h_active, ray_state
+
     def forward(
         self,
         h: Tensor,
@@ -645,6 +929,47 @@ class PersistentRayAxisNet(AxisGineCompatNet):
             ]
         )
 
+    def forward_active_features(
+        self,
+        planes: Tensor,
+        scalars: Tensor,
+        ray_mask: Tensor,
+        active_flat_indices: Tensor,
+        active_flat_lookup: Tensor | None = None,
+    ) -> Tensor:
+        """Run the compatibility trunk and all ray mixers compactly."""
+
+        ray_bits, active_flat_lookup = self._prepare_compact_rays(
+            ray_mask,
+            active_flat_indices,
+            active_flat_lookup,
+        )
+        h_active, global_state = self._initial_active_state(
+            planes,
+            scalars,
+            active_flat_indices,
+        )
+        states: list[Tensor] = []
+        ray_state: Tensor | None = None
+        for block, mixer in zip(self.blocks, self.ray_mixers):
+            h_active, global_state = block.forward_compact(
+                h_active,
+                global_state,
+                ray_bits,
+                active_flat_indices,
+                active_flat_lookup,
+            )
+            if isinstance(mixer, PersistentRayMixer):
+                h_active, ray_state = mixer.forward_compact(
+                    h_active,
+                    ray_state,
+                    ray_bits,
+                    active_flat_indices,
+                    active_flat_lookup,
+                )
+            states.append(h_active)
+        return self._combine_jk_active(states)
+
     def forward_features(
         self,
         planes: Tensor,
@@ -656,9 +981,19 @@ class PersistentRayAxisNet(AxisGineCompatNet):
         states: list[Tensor] = []
         ray_state: Tensor | None = None
         for block, mixer in zip(self.blocks, self.ray_mixers):
-            h, global_state = block(h, global_state, active, ray_mask)
+            h, global_state = block(
+                h,
+                global_state,
+                active,
+                ray_mask,
+            )
             if isinstance(mixer, PersistentRayMixer):
-                h, ray_state = mixer(h, ray_state, active, ray_mask)
+                h, ray_state = mixer(
+                    h,
+                    ray_state,
+                    active,
+                    ray_mask,
+                )
             states.append(h)
         representation = self._combine_jk(states)
         return representation, active, legal, stones

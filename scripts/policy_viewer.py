@@ -50,7 +50,7 @@ def _load_model(ckpt_path: str):
         # policy/value heads. Reuse the evaluation adapter so the viewer sees
         # the same derived state value as self-play and MCTS:
         # V(s) = E_{pi_improved}[Q(s, a)]. This also reconstructs the dense
-        # raster backend when model.architecture == "dense_axis".
+        # raster backend for dense_axis and persistent_ray_axis.
         from hexo_klent.mcts_adapter import adapt_checkpoint
 
         loaded = adapt_checkpoint(ckpt, torch.device("cpu"))

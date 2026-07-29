@@ -17,6 +17,13 @@ from hexo_a0.graph import axis_states_to_batch, game_to_graph, game_to_axis_grap
 logger = logging.getLogger(__name__)
 
 
+def _uses_dense_raster(model_config) -> bool:
+    return getattr(model_config, "architecture", "graph") in {
+        "dense_axis",
+        "persistent_ray_axis",
+    }
+
+
 def _graph_fn_for(model_config):
     """Build the ``game -> PyG Data`` builder for a model's config (hex or axis)."""
     graph_type = model_config.graph_type if model_config else "hex"
@@ -48,7 +55,7 @@ def sample_opening(model, game_config, device, k, temperature, seed,
 
     graph_fn = _graph_fn_for(model_config)
     dense_eval_fn = None
-    if getattr(model_config, "architecture", "graph") == "dense_axis":
+    if _uses_dense_raster(model_config):
         dense_eval_fn = make_eval_fn(
             model,
             device,
@@ -374,7 +381,7 @@ def make_eval_fn(
     Rust-precomputed index tensors). Hex models keep the per-graph
     ``graph_fn`` + PyG-collation path.
     """
-    if getattr(model_config, "architecture", "graph") == "dense_axis":
+    if _uses_dense_raster(model_config):
         # Keep hexo-a0 independent of KLENT during ordinary production use.
         # The lazy import is reached only for a dense KLENT checkpoint.
         from hexo_klent.batching import (

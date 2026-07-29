@@ -1,0 +1,122 @@
+Script started on 2026-08-06 16:32:04+01:00 [COMMAND=".venv/bin/hexo-a0 head-to-head --checkpoint-a runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip-from10/checkpoints/checkpoint_000020.pt --checkpoint-b runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt --win-length 6 --radius 8 --max-moves 1000 --mcts-sims 64 --mcts-m-actions 16 --device cpu --sprt-s0 0.50 --sprt-s1 0.55 --sprt-alpha 0.05 --sprt-beta 0.05 --window-size 0 --max-games 1000 --seed 20260861 --state-file artifacts/klent-head-to-head/cpu-unclipped20-vs-strix-d6-qhead-215547-20260806.json --opening-plies 8 --opening-generator alternate --opening-temperature 0.5" TERM="tmux-256color" TTY="/dev/pts/14" COLUMNS="80" LINES="24"]
+(null): No such file or directory
+2026-08-06 16:32:06 head_to_head INFO ==============================================================================
+2026-08-06 16:32:06 head_to_head INFO Head-to-head match: A vs B
+2026-08-06 16:32:06 head_to_head INFO   A: runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip-from10/checkpoints/checkpoint_000020.pt
+2026-08-06 16:32:06 head_to_head INFO      train_steps=20  graph=axis conv=gine layers=4 hidden=128 heads=8 jk=True
+2026-08-06 16:32:06 head_to_head INFO   B: runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt
+2026-08-06 16:32:06 head_to_head INFO      train_steps=215547  graph=axis conv=gine layers=4 hidden=128 heads=8 jk=True
+2026-08-06 16:32:06 head_to_head INFO Game: win_length=6 radius=8 max_moves=1000
+2026-08-06 16:32:06 head_to_head INFO MCTS: sims=64 m_actions=16 device=cpu  capture_k A=0 B=0  vl A=0 B=0
+2026-08-06 16:32:06 head_to_head INFO Forcing: root A=on B=on depth=default root_budget=default leaf_budget A=0 B=0 leaf_width A=wide B=wide leaf_order A=legacy B=legacy leaf_windows A=legacy B=legacy
+2026-08-06 16:32:06 head_to_head INFO SPRT: s0=0.500 s1=0.550 alpha=0.050 beta=0.050  bounds [-2.944, 2.944]
+2026-08-06 16:32:06 head_to_head INFO Max games: 1000   pentanomial=True (pair_variance clamped to [0.05, 0.65])
+2026-08-06 16:32:06 head_to_head INFO State file: artifacts/klent-head-to-head/cpu-unclipped20-vs-strix-d6-qhead-215547-20260806.json
+2026-08-06 16:32:06 head_to_head INFO ==============================================================================
+2026-08-06 16:32:16 head_to_head INFO game=1 side=P1 W  W-D-L=1-0-0  score=1.000  Elo(A-B)=+191 [-234, +2400]  LLR=0.000  continue
+2026-08-06 16:32:32 head_to_head INFO game=2 side=P2 W  W-D-L=2-0-0  score=1.000  Elo(A-B)=+280 [-113, +2400]  LLR=0.271  continue
+2026-08-06 16:33:07 head_to_head INFO game=3 side=P1 W  W-D-L=3-0-0  score=1.000  Elo(A-B)=+338 [-43, +2400]  LLR=0.271  continue
+2026-08-06 16:33:23 head_to_head INFO game=4 side=P2 L  W-D-L=3-0-1  score=0.750  Elo(A-B)=+147 [-147, +528]  LLR=0.257  continue
+2026-08-06 16:33:39 head_to_head INFO game=5 side=P1 L  W-D-L=3-0-2  score=0.600  Elo(A-B)=+58 [-209, +350]  LLR=0.360  continue
+2026-08-06 16:33:48 head_to_head INFO game=6 side=P2 L  W-D-L=3-0-3  score=0.500  Elo(A-B)=-0 [-255, +255]  LLR=-0.060  continue
+2026-08-06 16:33:54 head_to_head INFO game=7 side=P1 L  W-D-L=3-0-4  score=0.429  Elo(A-B)=-44 [-290, +190]  LLR=-0.023  continue
+2026-08-06 16:34:07 head_to_head INFO game=8 side=P2 L  W-D-L=3-0-5  score=0.375  Elo(A-B)=-79 [-320, +142]  LLR=-0.185  continue
+2026-08-06 16:34:31 head_to_head INFO game=9 side=P1 W  W-D-L=4-0-5  score=0.444  Elo(A-B)=-35 [-253, +176]  LLR=-0.185  continue
+2026-08-06 16:35:01 head_to_head INFO game=10 side=P2 W  W-D-L=5-0-5  score=0.500  Elo(A-B)=-0 [-204, +204]  LLR=-0.038  continue
+2026-08-06 16:35:05 head_to_head INFO game=11 side=P1 W  W-D-L=6-0-5  score=0.545  Elo(A-B)=+29 [-164, +227]  LLR=-0.038  continue
+2026-08-06 16:35:07 head_to_head INFO game=12 side=P2 W  W-D-L=7-0-5  score=0.583  Elo(A-B)=+54 [-131, +248]  LLR=0.108  continue
+2026-08-06 16:35:28 head_to_head INFO game=13 side=P1 W  W-D-L=8-0-5  score=0.615  Elo(A-B)=+76 [-104, +267]  LLR=0.108  continue
+2026-08-06 16:35:32 head_to_head INFO game=14 side=P2 W  W-D-L=9-0-5  score=0.643  Elo(A-B)=+95 [-79, +284]  LLR=0.254  continue
+2026-08-06 16:35:50 head_to_head INFO game=15 side=P1 L  W-D-L=9-0-6  score=0.600  Elo(A-B)=+66 [-102, +243]  LLR=0.254  continue
+2026-08-06 16:36:20 head_to_head INFO game=16 side=P2 W  W-D-L=10-0-6  score=0.625  Elo(A-B)=+83 [-80, +258]  LLR=0.246  continue
+2026-08-06 16:36:24 head_to_head INFO game=17 side=P1 L  W-D-L=10-0-7  score=0.588  Elo(A-B)=+58 [-100, +224]  LLR=0.246  continue
+2026-08-06 16:36:37 head_to_head INFO game=18 side=P2 L  W-D-L=10-0-8  score=0.556  Elo(A-B)=+37 [-117, +195]  LLR=0.085  continue
+2026-08-06 16:36:51 head_to_head INFO game=19 side=P1 L  W-D-L=10-0-9  score=0.526  Elo(A-B)=+17 [-133, +170]  LLR=0.085  continue
+2026-08-06 16:36:58 head_to_head INFO game=20 side=P2 W  W-D-L=11-0-9  score=0.550  Elo(A-B)=+33 [-114, +183]  LLR=0.077  continue
+2026-08-06 16:37:16 head_to_head INFO game=21 side=P1 W  W-D-L=12-0-9  score=0.571  Elo(A-B)=+48 [-96, +196]  LLR=0.077  continue
+2026-08-06 16:37:26 head_to_head INFO game=22 side=P2 L  W-D-L=12-0-10  score=0.545  Elo(A-B)=+30 [-110, +173]  LLR=0.069  continue
+2026-08-06 16:37:29 head_to_head INFO game=23 side=P1 L  W-D-L=12-0-11  score=0.522  Elo(A-B)=+14 [-123, +154]  LLR=0.072  continue
+2026-08-06 16:37:43 head_to_head INFO game=24 side=P2 L  W-D-L=12-0-12  score=0.500  Elo(A-B)=-0 [-136, +136]  LLR=-0.096  continue
+2026-08-06 16:38:10 head_to_head INFO game=25 side=P1 W  W-D-L=13-0-12  score=0.520  Elo(A-B)=+13 [-119, +147]  LLR=-0.092  continue
+2026-08-06 16:39:17 head_to_head INFO game=26 side=P2 W  W-D-L=14-0-12  score=0.538  Elo(A-B)=+26 [-104, +158]  LLR=0.054  continue
+2026-08-06 16:39:39 head_to_head INFO game=27 side=P1 L  W-D-L=14-0-13  score=0.519  Elo(A-B)=+12 [-115, +141]  LLR=0.054  continue
+2026-08-06 16:40:18 head_to_head INFO game=28 side=P2 W  W-D-L=15-0-13  score=0.536  Elo(A-B)=+24 [-101, +151]  LLR=0.046  continue
+2026-08-06 16:40:29 head_to_head INFO game=29 side=P1 L  W-D-L=15-0-14  score=0.517  Elo(A-B)=+12 [-112, +136]  LLR=0.047  continue
+2026-08-06 16:40:38 head_to_head INFO game=30 side=P2 L  W-D-L=15-0-15  score=0.500  Elo(A-B)=-0 [-122, +122]  LLR=-0.118  continue
+2026-08-06 16:40:59 head_to_head INFO game=31 side=P1 L  W-D-L=15-0-16  score=0.484  Elo(A-B)=-11 [-131, +109]  LLR=-0.115  continue
+2026-08-06 16:41:06 head_to_head INFO game=32 side=P2 W  W-D-L=16-0-16  score=0.500  Elo(A-B)=-0 [-118, +118]  LLR=-0.123  continue
+^CTraceback (most recent call last):
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/.venv/bin/hexo-a0"[0m, line [35m10[0m, in [35m<module>[0m
+    sys.exit([31mmain[0m[1;31m()[0m)
+             [31m~~~~[0m[1;31m^^[0m
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/cli.py"[0m, line [35m365[0m, in [35mmain[0m
+    return _run_head_to_head(args)
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/cli.py"[0m, line [35m782[0m, in [35m_run_head_to_head[0m
+    summary = run_head_to_head(
+        checkpoint_a=ckpt_a,
+    ...<33 lines>...
+        leaf_forcing_capture_limit=args.leaf_forcing_capture_limit,
+    )
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/head_to_head.py"[0m, line [35m397[0m, in [35mrun_head_to_head[0m
+    result = play_eval_game(
+        ckpt_a.model, game_config, device,
+    ...<24 lines>...
+        opponent_mcts_leaf_forcing_incremental_windows=mcts_b_leaf_forcing_incremental_windows,
+    )
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/evaluate.py"[0m, line [35m306[0m, in [35mplay_eval_game[0m
+    action = _choose_move(
+        opponent, game, device, opp_graph_fn, temperature, opp_mcts_config,
+        pending_forced=pending_forced[current_player], eval_fn=opp_eval_fn,
+    )
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/evaluate.py"[0m, line [35m466[0m, in [35m_choose_move[0m
+    return _mcts_argmax_move(
+        model, game, device, graph_fn, mcts_config,
+        pending_forced=pending_forced, eval_fn=eval_fn,
+    )
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/evaluate.py"[0m, line [35m520[0m, in [35m_mcts_argmax_move[0m
+    ) = [31mhexo_rs.gumbel_mcts_with_diagnostics[0m[1;31m([0m
+        [31m~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~[0m[1;31m^[0m
+        [1;31mgame, eval_fn, mcts_config, forced_candidates=forced,[0m
+        [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1;31m)[0m
+    [1;31m^[0m
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/evaluate.py"[0m, line [35m427[0m, in [35meval_fn[0m
+    logits, counts, values = [31mmodel._forward_batch_core[0m[1;31m([0m
+                             [31m~~~~~~~~~~~~~~~~~~~~~~~~~[0m[1;31m^[0m
+        [1;31mbatch, legal_idx=aux.legal_idx,[0m
+        [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+        [1;31mstone_idx=aux.stone_idx, stone_batch=aux.stone_batch,[0m
+        [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1;31m)[0m
+    [1;31m^[0m
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/model.py"[0m, line [35m721[0m, in [35m_forward_batch_core[0m
+    embeddings = self.representation(
+        batch.x,
+    ...<4 lines>...
+        global_edge_index=getattr(batch, "global_edge_index", None),
+    )
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py"[0m, line [35m1779[0m, in [35m_wrapped_call_impl[0m
+    return [31mself._call_impl[0m[1;31m(*args, **kwargs)[0m
+           [31m~~~~~~~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^[0m
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py"[0m, line [35m1790[0m, in [35m_call_impl[0m
+    return forward_call(*args, **kwargs)
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/model.py"[0m, line [35m382[0m, in [35mforward[0m
+    x = conv(
+        x,
+    ...<5 lines>...
+        separate_global_star=True,
+    )
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py"[0m, line [35m1779[0m, in [35m_wrapped_call_impl[0m
+    return [31mself._call_impl[0m[1;31m(*args, **kwargs)[0m
+           [31m~~~~~~~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^[0m
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py"[0m, line [35m1790[0m, in [35m_call_impl[0m
+    return forward_call(*args, **kwargs)
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/hexo-a0/src/hexo_a0/axis_conv.py"[0m, line [35m241[0m, in [35mforward[0m
+    axis_first = [1;31mself.axis_conv[0m.nn[0]
+                 [1;31m^^^^^^^^^^^^^^[0m
+  File [35m"/var/home/tyto/Development/personal/hexo-strix/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py"[0m, line [35m1955[0m, in [35m__getattr__[0m
+    def __getattr__(self, name: str) -> Union[Tensor, "Module"]:
+    
+[1;35mKeyboardInterrupt[0m
+
+Script done on 2026-08-06 16:41:18+01:00 [COMMAND_EXIT_CODE="130"]

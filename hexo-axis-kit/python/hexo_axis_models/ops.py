@@ -43,6 +43,36 @@ def unpack_ray_bits(ray_bits: Tensor, radius: int = PACKED_RAY_RADIUS) -> Tensor
     return unpacked.squeeze(0) if squeeze else unpacked
 
 
+def pack_ray_mask(ray_mask: Tensor) -> Tensor:
+    """Pack ``[B,6,R,H,W]`` masks into Rust's five-bits-per-ray words."""
+
+    if ray_mask.ndim != 5 or ray_mask.shape[1] != NUM_RAYS:
+        raise ValueError("ray_mask must have shape [B,6,R,H,W]")
+    radius = ray_mask.shape[2]
+    if not 1 <= radius <= PACKED_RAY_RADIUS:
+        raise ValueError(
+            f"ray mask radius must be in 1..={PACKED_RAY_RADIUS}"
+        )
+    shifts = (
+        torch.arange(
+            NUM_RAYS,
+            dtype=torch.int64,
+            device=ray_mask.device,
+        ).view(1, NUM_RAYS, 1, 1, 1)
+        * PACKED_RAY_RADIUS
+        + torch.arange(
+            radius,
+            dtype=torch.int64,
+            device=ray_mask.device,
+        ).view(1, 1, radius, 1, 1)
+    )
+    return (
+        ray_mask.to(torch.int64)
+        .bitwise_left_shift(shifts)
+        .sum(dim=(1, 2))
+    )
+
+
 def roll_source(x: Tensor, dq: int, dr: int) -> Tensor:
     """Return source features at ``dest + (dq, dr)`` using axial raster axes.
 

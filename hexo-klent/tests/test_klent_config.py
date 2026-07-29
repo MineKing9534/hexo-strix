@@ -21,6 +21,13 @@ def test_config_fixture_loads_algorithm_collection_and_model():
     assert config.collection.workers == 2
     assert config.training.grad_accumulation is True
     assert config.training.prefetch_batches is False
+    assert config.training.policy_diagnostic_samples == 2048
+    assert config.training.fit_max_autotune is False
+    assert config.training.fit_compile_seed_nodes == 0
+    assert config.training.learning_rate_warmup_iterations == 0
+    assert config.training.learning_rate_warmup_start_factor == pytest.approx(
+        0.1
+    )
     assert config.run.compile is False
 
 
@@ -30,6 +37,9 @@ def test_config_fixture_loads_game_and_named_opponents():
     assert config.game.win_length == 6
     assert config.game.placement_radius == 2
     assert config.game.rollout_horizon == 12
+    assert config.evaluation.opening_plies == 8
+    assert config.evaluation.opening_temperature == pytest.approx(0.5)
+    assert config.evaluation.opening_generator == "alternate"
     assert [
         (
             opponent.name,
@@ -89,6 +99,51 @@ def test_parallel_games_cannot_exceed_position_budget(tmp_path):
         load_config(path)
 
 
+def test_policy_diagnostic_sample_count_cannot_be_negative(tmp_path):
+    path = tmp_path / "negative-policy-diagnostics.toml"
+    path.write_text(
+        "[training]\npolicy_diagnostic_samples = -1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="policy_diagnostic_samples cannot be negative",
+    ):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("setting", "value", "message"),
+    [
+        (
+            "learning_rate_warmup_iterations",
+            "-1",
+            "learning_rate_warmup_iterations cannot be negative",
+        ),
+        (
+            "learning_rate_warmup_start_factor",
+            "1.1",
+            "learning_rate_warmup_start_factor must be in",
+        ),
+    ],
+)
+def test_learning_rate_warmup_settings_are_validated(
+    tmp_path,
+    setting,
+    value,
+    message,
+):
+    path = tmp_path / "bad-warmup.toml"
+    path.write_text(
+        f"[training]\n{setting} = {value}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_config(path)
+
+
 def test_dense_axis_backend_loads_strict_compatible_schema(tmp_path):
     path = tmp_path / "dense.toml"
     path.write_text(
@@ -130,6 +185,60 @@ def test_dense_axis_rejects_incomplete_ray_radius(tmp_path):
     )
 
     with pytest.raises(ValueError, match="dense_ray_radius to cover"):
+        load_config(path)
+
+
+def test_persistent_ray_backend_loads_branch_configuration(tmp_path):
+    path = tmp_path / "persistent-ray.toml"
+    path.write_text(
+        "[model]\n"
+        'architecture = "persistent_ray_axis"\n'
+        "dense_ray_radius = 5\n"
+        "ray_channels = 10\n"
+        "ray_update_hidden = 32\n"
+        "ray_branch_scale = 0.5\n"
+        "exact_graft_init = true\n"
+        "ray_after_layers = [0, 2]\n"
+        "num_layers = 3\n"
+        'graph_type = "axis"\n'
+        "axis_relational = true\n"
+        "threat_features = true\n"
+        "relative_stone_encoding = true\n"
+        "compact_stone_onehot = true\n"
+        "node_coords = false\n"
+        'moves_scope = "node"\n'
+        "pre_norm = true\n"
+        "dropout = 0.0\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.model.architecture == "persistent_ray_axis"
+    assert config.model.ray_channels == 10
+    assert config.model.ray_update_hidden == 32
+    assert config.model.ray_branch_scale == 0.5
+    assert config.model.ray_after_layers == [0, 2]
+
+
+def test_persistent_ray_rejects_invalid_branch_layer(tmp_path):
+    path = tmp_path / "persistent-ray-invalid-layer.toml"
+    path.write_text(
+        "[model]\n"
+        'architecture = "persistent_ray_axis"\n'
+        "num_layers = 2\n"
+        "ray_after_layers = [2]\n"
+        'graph_type = "axis"\n'
+        "axis_relational = true\n"
+        "threat_features = true\n"
+        "relative_stone_encoding = true\n"
+        "compact_stone_onehot = true\n"
+        "node_coords = false\n"
+        'moves_scope = "node"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="valid layer indices"):
         load_config(path)
 
 
@@ -247,3 +356,97 @@ def test_lagged_opponent_loads_shared_search_budget(tmp_path):
     assert opponent.lag_iterations == 250
     assert opponent.mcts_simulations == 24
     assert opponent.mcts_actions == 8
+
+
+def test_best_so_far_opponent_loads_initial_checkpoint_and_threshold(tmp_path):
+    path = tmp_path / "best.toml"
+    path.write_text(
+        "[[evaluation.opponents]]\n"
+        'name = "incumbent"\n'
+        'kind = "best_so_far"\n'
+        'checkpoint = "checkpoint_000010.pt"\n'
+        "best_promotion_win_rate = 0.60\n"
+        "games = 16\n",
+        encoding="utf-8",
+    )
+
+    [opponent] = load_config(path).evaluation.opponents
+
+    assert opponent.kind == "best_so_far"
+    assert opponent.checkpoint == "checkpoint_000010.pt"
+    assert opponent.best_promotion_win_rate == pytest.approx(0.60)
+
+
+def test_best_so_far_opponent_allows_a_distinct_incumbent_search_budget(
+    tmp_path,
+):
+    path = tmp_path / "best-budget.toml"
+    path.write_text(
+        "[[evaluation.opponents]]\n"
+        'name = "incumbent"\n'
+        'kind = "best_so_far"\n'
+        'checkpoint = "checkpoint_000010.pt"\n'
+        "games = 16\n"
+        "mcts_simulations = 24\n"
+        "mcts_actions = 8\n"
+        "opponent_mcts_simulations = 64\n"
+        "opponent_mcts_actions = 16\n",
+        encoding="utf-8",
+    )
+
+    [opponent] = load_config(path).evaluation.opponents
+
+    assert opponent.opponent_mcts_simulations == 64
+    assert opponent.opponent_mcts_actions == 16
+
+
+def test_best_so_far_opponent_rejects_invalid_promotion_threshold(tmp_path):
+    path = tmp_path / "best-invalid.toml"
+    path.write_text(
+        "[[evaluation.opponents]]\n"
+        'kind = "best_so_far"\n'
+        'checkpoint = "checkpoint_000010.pt"\n'
+        "best_promotion_win_rate = 0.49\n"
+        "games = 16\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="best_so_far promotion win rate must be in",
+    ):
+        load_config(path)
+
+
+def test_checkpoint_paired_openings_require_even_games(tmp_path):
+    path = tmp_path / "odd-checkpoint-games.toml"
+    path.write_text(
+        "[[evaluation.opponents]]\n"
+        'kind = "checkpoint"\n'
+        'checkpoint = "anchor.pt"\n'
+        "games = 3\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="paired-opening checkpoint evaluation requires an even",
+    ):
+        load_config(path)
+
+
+def test_checkpoint_paired_openings_can_be_disabled(tmp_path):
+    path = tmp_path / "legacy-checkpoint-games.toml"
+    path.write_text(
+        "[evaluation]\n"
+        "opening_plies = 0\n"
+        "[[evaluation.opponents]]\n"
+        'kind = "checkpoint"\n'
+        'checkpoint = "anchor.pt"\n'
+        "games = 3\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+    assert config.evaluation.opening_plies == 0
+    assert config.evaluation.opponents[0].games == 3

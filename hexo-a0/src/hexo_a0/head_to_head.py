@@ -234,8 +234,7 @@ def run_head_to_head(
     sprt_alpha: float = 0.01,
     sprt_beta: float = 0.05,
     window_size: int | None = 400,
-    pair_variance_floor: float = 0.05,
-    pair_variance_ceil: float = 0.65,
+    pair_variance: float = 0.5,
     max_games: int = 1000,
     seed: int | None = None,
     state_file: Path | None = None,
@@ -278,6 +277,9 @@ def run_head_to_head(
     """
     import hexo_rs  # lazy import — same pattern as evaluate.py / sprt_daemon
 
+    if pair_variance <= 0:
+        raise ValueError("pair_variance must be positive")
+
     leaf_requested = (
         mcts_a_leaf_forcing_node_budget > 0
         or mcts_b_leaf_forcing_node_budget > 0
@@ -306,13 +308,16 @@ def run_head_to_head(
     ckpt_a = load_checkpoint(checkpoint_a, device)
     ckpt_b = load_checkpoint(checkpoint_b, device)
 
-    # Pentanomial mode below assumes adaptive pair variance — initial value
-    # is the chess-engine convention; we clamp to [floor, ceil] like the daemon.
+    # Keep the statistical model fixed for this one-shot match.  The curriculum
+    # daemon can adapt pair variance *between* complete rounds using an EMA,
+    # but estimating it online from the first few pairs made standalone
+    # head-to-heads drastically over-confident (and could change the LLR on an
+    # otherwise ignored trailing game).  Empirical variance remains telemetry.
     sprt_cfg = SPRTConfig(
         s0=sprt_s0, s1=sprt_s1, alpha=sprt_alpha, beta=sprt_beta,
         window_size=window_size,
         pentanomial=True,
-        pair_variance=0.35,
+        pair_variance=pair_variance,
     )
     lower, upper = sprt_cfg.bounds()
 
@@ -354,8 +359,11 @@ def run_head_to_head(
         "SPRT: s0=%.3f s1=%.3f alpha=%.3f beta=%.3f  bounds [%.3f, %.3f]",
         sprt_s0, sprt_s1, sprt_alpha, sprt_beta, lower, upper,
     )
-    logger.info("Max games: %d   pentanomial=True (pair_variance clamped to [%.2f, %.2f])",
-                max_games, pair_variance_floor, pair_variance_ceil)
+    logger.info(
+        "Max games: %d   pentanomial=True (fixed pair_variance=%.3f)",
+        max_games,
+        pair_variance,
+    )
     if state_file is not None:
         logger.info("State file: %s", state_file)
     logger.info("=" * 78)
@@ -433,16 +441,6 @@ def run_head_to_head(
             outcome = "W"
         else:
             outcome = "L"
-
-        # Adapt pair_variance from empirical observations before recording the
-        # new outcome (clamped). The daemon does this between rounds via EMA;
-        # for a one-shot match we just track the running empirical sample, which
-        # is a reasonable single-round approximation.
-        emp_var = sample_pair_variance(state._outcomes)
-        if emp_var is not None:
-            sprt_cfg.pair_variance = max(
-                pair_variance_floor, min(pair_variance_ceil, emp_var),
-            )
 
         state.record(outcome, sprt_cfg)
         game_idx += 1
@@ -602,6 +600,8 @@ def run_head_to_head(
         "losses": state.losses,
         "score": state.score,
         "llr": state.llr,
+        "pair_variance": sprt_cfg.pair_variance,
+        "empirical_pair_variance": sample_pair_variance(state._outcomes),
         "decision": state.decision,
         "winner": winner_label,
         "elo_diff": final_elo,

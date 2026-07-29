@@ -1,0 +1,459 @@
+{
+  "config": "/var/home/tyto/Development/personal/hexo-strix/configs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip.toml",
+  "checkpoints": {
+    "gen10": {
+      "path": "/var/home/tyto/Development/personal/hexo/runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt",
+      "iteration": "10"
+    },
+    "gen50": {
+      "path": "/var/home/tyto/Development/personal/hexo/runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000050.pt",
+      "iteration": "50"
+    }
+  },
+  "settings": {
+    "positions_per_corpus": 32768,
+    "parallel_games": 128,
+    "workers": 4,
+    "rollout_horizon": 1000,
+    "seed": 0,
+    "device": "cuda",
+    "precision": "bf16",
+    "compile": true
+  },
+  "corpora": {
+    "gen10": {
+      "collection": {
+        "games": 463,
+        "positions": 32768,
+        "p1_wins": 152,
+        "p2_wins": 190,
+        "truncations": 121,
+        "horizon_truncations": 0,
+        "spatial_truncations": 0,
+        "chunk_truncations": 121,
+        "max_dense_position_cells": 0,
+        "mean_game_length": 70.7732181425486,
+        "mean_entropy": 1.2789540004944961,
+        "mean_normalized_entropy": 0.2081403787422345,
+        "mean_target_top1_probability": 0.6186398086108511,
+        "mean_prior_normalized_entropy": 0.21256035127643158,
+        "mean_prior_top1_probability": 0.6070051848695357,
+        "mean_legal_actions": 560.6906433105469,
+        "mean_reverse_kl": 0.01822343599170402,
+        "mean_abs_q": 0.4724441557117416,
+        "mean_q_span": 0.6378071543695114,
+        "mean_abs_return": 0.39947770145365974,
+        "mean_abs_bootstrap_value": 0.2802140104456555,
+        "worker_processes": 4,
+        "elapsed_seconds": 29.78245414900084
+      },
+      "completed_games": 342,
+      "completed_positions": 25362,
+      "excluded_truncated_positions": 7406,
+      "mean_completed_game_length": 74.15789473684211,
+      "critics": {
+        "gen10": {
+          "positions": 25362,
+          "mse": 0.7965069716539106,
+          "mae": 0.7953791303097304,
+          "bias_q_minus_outcome": -0.01654853663152348,
+          "mean_q": -0.002117498069895845,
+          "mean_abs_q": 0.3194126061212094,
+          "mean_outcome": 0.014431038561627632,
+          "sign_accuracy": 0.6756170649002444,
+          "pearson_r": 0.4512281396393096,
+          "calibration_intercept": 0.016537289649754785,
+          "calibration_slope": 0.9946885515842552,
+          "ece_10_fixed_bins": 0.05630373993785531,
+          "mean_q_on_winning_actions": 0.1996226100371548,
+          "mean_q_on_losing_actions": -0.20976550180562153,
+          "calibration_bins": [
+            {
+              "low": -1.0,
+              "high": -0.8,
+              "n": 1623,
+              "mean_q": -0.9445952711028959,
+              "mean_outcome": -0.9026494146642021
+            },
+            {
+              "low": -0.8,
+              "high": -0.6,
+              "n": 1004,
+              "mean_q": -0.6927563184760956,
+              "mean_outcome": -0.549800796812749
+            },
+            {
+              "low": -0.6,
+              "high": -0.3999999999999999,
+              "n": 1547,
+              "mean_q": -0.49575665602779573,
+              "mean_outcome": -0.48028442146089206
+            },
+            {
+              "low": -0.3999999999999999,
+              "high": -0.19999999999999996,
+              "n": 2118,
+              "mean_q": -0.29012574510151085,
+              "mean_outcome": -0.38243626062322944
+            },
+            {
+              "low": -0.19999999999999996,
+              "high": 0.0,
+              "n": 7163,
+              "mean_q": -0.06523745741971325,
+              "mean_outcome": -0.09786402345386011
+            },
+            {
+              "low": 0.0,
+              "high": 0.20000000000000018,
+              "n": 5744,
+              "mean_q": 0.06745373017691636,
+              "mean_outcome": 0.15076601671309192
+            },
+            {
+              "low": 0.20000000000000018,
+              "high": 0.40000000000000013,
+              "n": 2009,
+              "mean_q": 0.2910919417309607,
+              "mean_outcome": 0.3797909407665505
+            },
+            {
+              "low": 0.40000000000000013,
+              "high": 0.6000000000000001,
+              "n": 1467,
+              "mean_q": 0.491781431066803,
+              "mean_outcome": 0.5132924335378323
+            },
+            {
+              "low": 0.6000000000000001,
+              "high": 0.8,
+              "n": 929,
+              "mean_q": 0.689127253767492,
+              "mean_outcome": 0.61248654467169
+            },
+            {
+              "low": 0.8,
+              "high": 1.0,
+              "n": 1758,
+              "mean_q": 0.9611596985210467,
+              "mean_outcome": 0.9590443686006825
+            }
+          ]
+        },
+        "gen50": {
+          "positions": 25362,
+          "mse": 0.8090178474606147,
+          "mae": 0.7995842273171773,
+          "bias_q_minus_outcome": -0.056974920686623735,
+          "mean_q": -0.0425438821249961,
+          "mean_abs_q": 0.33194359703147064,
+          "mean_outcome": 0.014431038561627632,
+          "sign_accuracy": 0.6575191230975476,
+          "pearson_r": 0.4407909788536472,
+          "calibration_intercept": 0.0555414459112343,
+          "calibration_slope": 0.9663059715336316,
+          "ece_10_fixed_bins": 0.06091474700158313,
+          "mean_q_on_winning_actions": 0.15562604509979783,
+          "mean_q_on_losing_actions": -0.24651715335397267,
+          "calibration_bins": [
+            {
+              "low": -1.0,
+              "high": -0.8,
+              "n": 1484,
+              "mean_q": -0.9315695544137467,
+              "mean_outcome": -0.898921832884097
+            },
+            {
+              "low": -0.8,
+              "high": -0.6,
+              "n": 1509,
+              "mean_q": -0.6939586439695162,
+              "mean_outcome": -0.563949635520212
+            },
+            {
+              "low": -0.6,
+              "high": -0.3999999999999999,
+              "n": 1954,
+              "mean_q": -0.49750611725946775,
+              "mean_outcome": -0.44114636642784033
+            },
+            {
+              "low": -0.3999999999999999,
+              "high": -0.19999999999999996,
+              "n": 2648,
+              "mean_q": -0.2921470803436556,
+              "mean_outcome": -0.2688821752265861
+            },
+            {
+              "low": -0.19999999999999996,
+              "high": 0.0,
+              "n": 8233,
+              "mean_q": -0.06965996463113751,
+              "mean_outcome": -0.006437507591400462
+            },
+            {
+              "low": 0.0,
+              "high": 0.20000000000000018,
+              "n": 3964,
+              "mean_q": 0.07630930610910795,
+              "mean_outcome": 0.16649848637739656
+            },
+            {
+              "low": 0.20000000000000018,
+              "high": 0.40000000000000013,
+              "n": 1745,
+              "mean_q": 0.29264696006446994,
+              "mean_outcome": 0.39140401146131804
+            },
+            {
+              "low": 0.40000000000000013,
+              "high": 0.6000000000000001,
+              "n": 1280,
+              "mean_q": 0.491998291015625,
+              "mean_outcome": 0.5140625
+            },
+            {
+              "low": 0.6000000000000001,
+              "high": 0.8,
+              "n": 790,
+              "mean_q": 0.6906991693037975,
+              "mean_outcome": 0.6481012658227848
+            },
+            {
+              "low": 0.8,
+              "high": 1.0,
+              "n": 1755,
+              "mean_q": 0.9580105947293447,
+              "mean_outcome": 0.9487179487179487
+            }
+          ]
+        }
+      },
+      "paired_delta": {
+        "delta_mse_b_minus_a": 0.012510875806704062,
+        "delta_mae_b_minus_a": 0.004205097007446885,
+        "delta_mse_ci95_low": 0.004582604102700324,
+        "delta_mse_ci95_high": 0.020562558598501965,
+        "delta_mae_ci95_low": 4.8793757331773145e-05,
+        "delta_mae_ci95_high": 0.008441129690478309
+      }
+    },
+    "gen50": {
+      "collection": {
+        "games": 339,
+        "positions": 32768,
+        "p1_wins": 109,
+        "p2_wins": 102,
+        "truncations": 128,
+        "horizon_truncations": 0,
+        "spatial_truncations": 0,
+        "chunk_truncations": 128,
+        "max_dense_position_cells": 0,
+        "mean_game_length": 96.66076696165192,
+        "mean_entropy": 1.216902108343214,
+        "mean_normalized_entropy": 0.1897639767590401,
+        "mean_target_top1_probability": 0.6526043206682957,
+        "mean_prior_normalized_entropy": 0.19102518498630927,
+        "mean_prior_top1_probability": 0.6498810395630024,
+        "mean_legal_actions": 755.2522583007812,
+        "mean_reverse_kl": 0.005700522709458651,
+        "mean_abs_q": 0.6561981196298916,
+        "mean_q_span": 0.8583332767357206,
+        "mean_abs_return": 0.24656190922117185,
+        "mean_abs_bootstrap_value": 0.2405299002814445,
+        "worker_processes": 4,
+        "elapsed_seconds": 35.31385682700056
+      },
+      "completed_games": 211,
+      "completed_positions": 23764,
+      "excluded_truncated_positions": 9004,
+      "mean_completed_game_length": 112.62559241706161,
+      "critics": {
+        "gen10": {
+          "positions": 23764,
+          "mse": 0.8774291299196946,
+          "mae": 0.8715187416265677,
+          "bias_q_minus_outcome": -0.01912286911743535,
+          "mean_q": -0.011380064875725203,
+          "mean_abs_q": 0.23468104000846818,
+          "mean_outcome": 0.00774280424171015,
+          "sign_accuracy": 0.6056640296246423,
+          "pearson_r": 0.3508922346888014,
+          "calibration_intercept": 0.018640349786910513,
+          "calibration_slope": 0.9575995975599313,
+          "ece_10_fixed_bins": 0.028872260183943697,
+          "mean_q_on_winning_actions": 0.11620146827624481,
+          "mean_q_on_losing_actions": -0.14095269235339178,
+          "calibration_bins": [
+            {
+              "low": -1.0,
+              "high": -0.8,
+              "n": 1061,
+              "mean_q": -0.9618358270499529,
+              "mean_outcome": -0.9472196041470311
+            },
+            {
+              "low": -0.8,
+              "high": -0.6,
+              "n": 482,
+              "mean_q": -0.6937321706431535,
+              "mean_outcome": -0.5518672199170125
+            },
+            {
+              "low": -0.6,
+              "high": -0.3999999999999999,
+              "n": 825,
+              "mean_q": -0.4912097537878788,
+              "mean_outcome": -0.44242424242424244
+            },
+            {
+              "low": -0.3999999999999999,
+              "high": -0.19999999999999996,
+              "n": 1778,
+              "mean_q": -0.2846509420697413,
+              "mean_outcome": -0.1889763779527559
+            },
+            {
+              "low": -0.19999999999999996,
+              "high": 0.0,
+              "n": 8965,
+              "mean_q": -0.07333562828878816,
+              "mean_outcome": -0.049860568878973784
+            },
+            {
+              "low": 0.0,
+              "high": 0.20000000000000018,
+              "n": 6849,
+              "mean_q": 0.08232475757807742,
+              "mean_outcome": 0.07460943203387356
+            },
+            {
+              "low": 0.20000000000000018,
+              "high": 0.40000000000000013,
+              "n": 1739,
+              "mean_q": 0.2794709603220242,
+              "mean_outcome": 0.24324324324324326
+            },
+            {
+              "low": 0.40000000000000013,
+              "high": 0.6000000000000001,
+              "n": 614,
+              "mean_q": 0.4896331687703583,
+              "mean_outcome": 0.5342019543973942
+            },
+            {
+              "low": 0.6000000000000001,
+              "high": 0.8,
+              "n": 360,
+              "mean_q": 0.6946614583333334,
+              "mean_outcome": 0.7555555555555555
+            },
+            {
+              "low": 0.8,
+              "high": 1.0,
+              "n": 1091,
+              "mean_q": 0.964901036892759,
+              "mean_outcome": 0.9798350137488543
+            }
+          ]
+        },
+        "gen50": {
+          "positions": 23764,
+          "mse": 0.8756569607147656,
+          "mae": 0.8771419709322931,
+          "bias_q_minus_outcome": 0.003815757274687882,
+          "mean_q": 0.011558561516398032,
+          "mean_abs_q": 0.20460164901373903,
+          "mean_outcome": 0.00774280424171015,
+          "sign_accuracy": 0.6002777310217136,
+          "pearson_r": 0.3525966355317247,
+          "calibration_intercept": -0.003961537984092138,
+          "calibration_slope": 1.0126123574458152,
+          "ece_10_fixed_bins": 0.015075211966103973,
+          "mean_q_on_winning_actions": 0.13338382573244825,
+          "mean_q_on_losing_actions": -0.11216796212422837,
+          "calibration_bins": [
+            {
+              "low": -1.0,
+              "high": -0.8,
+              "n": 869,
+              "mean_q": -0.9704401611047181,
+              "mean_outcome": -0.9907940161104718
+            },
+            {
+              "low": -0.8,
+              "high": -0.6,
+              "n": 370,
+              "mean_q": -0.7005489864864864,
+              "mean_outcome": -0.7891891891891892
+            },
+            {
+              "low": -0.6,
+              "high": -0.3999999999999999,
+              "n": 645,
+              "mean_q": -0.48892926356589145,
+              "mean_outcome": -0.5131782945736434
+            },
+            {
+              "low": -0.3999999999999999,
+              "high": -0.19999999999999996,
+              "n": 1328,
+              "mean_q": -0.28220303087349397,
+              "mean_outcome": -0.2680722891566265
+            },
+            {
+              "low": -0.19999999999999996,
+              "high": 0.0,
+              "n": 8309,
+              "mean_q": -0.06030777959362209,
+              "mean_outcome": -0.05427849320014442
+            },
+            {
+              "low": 0.0,
+              "high": 0.20000000000000018,
+              "n": 8734,
+              "mean_q": 0.06042562610420068,
+              "mean_outcome": 0.05175177467368903
+            },
+            {
+              "low": 0.20000000000000018,
+              "high": 0.40000000000000013,
+              "n": 1438,
+              "mean_q": 0.2841307914638387,
+              "mean_outcome": 0.2267037552155772
+            },
+            {
+              "low": 0.40000000000000013,
+              "high": 0.6000000000000001,
+              "n": 569,
+              "mean_q": 0.4865443760984183,
+              "mean_outcome": 0.5325131810193322
+            },
+            {
+              "low": 0.6000000000000001,
+              "high": 0.8,
+              "n": 366,
+              "mean_q": 0.6931245730874317,
+              "mean_outcome": 0.7814207650273224
+            },
+            {
+              "low": 0.8,
+              "high": 1.0,
+              "n": 1136,
+              "mean_q": 0.9696749834947183,
+              "mean_outcome": 0.9753521126760564
+            }
+          ]
+        }
+      },
+      "paired_delta": {
+        "delta_mse_b_minus_a": -0.0017721692049290376,
+        "delta_mae_b_minus_a": 0.005623229305725309,
+        "delta_mse_ci95_low": -0.00895532892180473,
+        "delta_mse_ci95_high": 0.0052928900757070645,
+        "delta_mae_ci95_low": 0.0020855315690813375,
+        "delta_mae_ci95_high": 0.009218180394234386
+      }
+    }
+  }
+}

@@ -49,6 +49,17 @@ def tiny_config(**kwargs) -> AxisGineConfig:
     return AxisGineConfig(**base)
 
 
+def select_active_features(
+    features: torch.Tensor,
+    active_indices: torch.Tensor,
+) -> torch.Tensor:
+    points = features.permute(0, 2, 3, 1).reshape(
+        -1,
+        features.shape[1],
+    )
+    return points.index_select(0, active_indices)
+
+
 def test_unpack_ray_bits_layout():
     bits = torch.zeros(1, 2, 2, dtype=torch.int64)
     bits[0, 0, 0] = (1 << 0) | (1 << (3 * 5 + 1))
@@ -108,14 +119,16 @@ def test_active_compacted_axis_mlp_matches_padded_path():
         padded = model.forward_features(
             planes, scalars, active, ray_mask
         )[0]
-        compact = model.forward_features(
+        compact = model.forward_active_features(
             planes,
             scalars,
-            active,
             ray_mask,
             active_indices,
-        )[0]
-    torch.testing.assert_close(compact, padded)
+        )
+    torch.testing.assert_close(
+        compact,
+        select_active_features(padded, active_indices),
+    )
 
 
 def test_active_compacted_axis_mlp_matches_padded_gradients():
@@ -130,23 +143,23 @@ def test_active_compacted_axis_mlp_matches_padded_gradients():
         as_tuple=False
     ).squeeze(1)
     weights = torch.randn(
-        2,
+        active_indices.numel(),
         cfg.hidden_dim * cfg.num_layers,
-        9,
-        9,
     )
 
     padded = padded_model.forward_features(
         planes, scalars, active, ray_mask
     )[0]
-    compact = compact_model.forward_features(
+    compact = compact_model.forward_active_features(
         planes,
         scalars,
-        active,
         ray_mask,
         active_indices,
-    )[0]
-    (padded * weights).sum().backward()
+    )
+    padded_active = select_active_features(padded, active_indices)
+    torch.testing.assert_close(compact, padded_active)
+
+    (padded_active * weights).sum().backward()
     (compact * weights).sum().backward()
 
     for padded_parameter, compact_parameter in zip(
@@ -189,6 +202,77 @@ def test_persistent_ray_exact_graft_starts_as_base_function():
         b = ray(planes, scalars, active, ray_mask)
     for xa, xb in zip(a, b):
         torch.testing.assert_close(xa, xb, rtol=0.0, atol=0.0)
+
+
+def test_persistent_ray_active_compaction_matches_padded_gradients():
+    base_cfg = tiny_config()
+    ray_cfg = PersistentRayConfig(
+        hidden_dim=base_cfg.hidden_dim,
+        num_layers=base_cfg.num_layers,
+        line_radius=base_cfg.line_radius,
+        distance_bins=base_cfg.distance_bins,
+        policy_hidden=base_cfg.policy_hidden,
+        q_hidden=base_cfg.q_hidden,
+        value_hidden=base_cfg.value_hidden,
+        value_bins=base_cfg.value_bins,
+        value_horizons=base_cfg.value_horizons,
+        jk_mode=base_cfg.jk_mode,
+        ray_channels=6,
+        ray_update_hidden=12,
+        exact_graft_init=False,
+    )
+    torch.manual_seed(23)
+    padded_model = PersistentRayAxisNet(ray_cfg)
+    compact_model = PersistentRayAxisNet(ray_cfg)
+    compact_model.load_state_dict(padded_model.state_dict())
+    planes, scalars, active, ray_mask = synthetic_inputs(
+        radius=base_cfg.line_radius
+    )
+    active_indices = active.reshape(-1).nonzero(
+        as_tuple=False
+    ).squeeze(1)
+    weights = torch.randn(
+        active_indices.numel(),
+        base_cfg.hidden_dim * base_cfg.num_layers,
+    )
+
+    padded = padded_model.forward_features(
+        planes,
+        scalars,
+        active,
+        ray_mask,
+    )[0]
+    compact = compact_model.forward_active_features(
+        planes,
+        scalars,
+        ray_mask,
+        active_indices,
+    )
+    padded_active = select_active_features(padded, active_indices)
+    torch.testing.assert_close(
+        compact,
+        padded_active,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    (padded_active * weights).sum().backward()
+    (compact * weights).sum().backward()
+    for padded_parameter, compact_parameter in zip(
+        padded_model.parameters(),
+        compact_model.parameters(),
+        strict=True,
+    ):
+        if padded_parameter.grad is None:
+            assert compact_parameter.grad is None
+        else:
+            assert compact_parameter.grad is not None
+            torch.testing.assert_close(
+                compact_parameter.grad,
+                padded_parameter.grad,
+                rtol=1e-4,
+                atol=1e-5,
+            )
 
 
 def test_ring_mixer_commutes_with_rotation_and_reflection():

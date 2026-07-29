@@ -9,9 +9,12 @@ from hexo_klent.config import KlentModelConfig
 from hexo_klent.model import (
     DenseAxisKlentNet,
     KlentNet,
+    PersistentRayKlentNet,
     compile_klent_forward,
     improved_policy,
+    load_dense_klent_graft,
     load_production_axis_weights,
+    make_klent_net,
 )
 
 
@@ -63,6 +66,69 @@ def test_zero_initialized_heads_produce_uniform_policy_and_zero_q():
         )
 
 
+def test_joint_policy_q_projection_matches_separate_heads():
+    config = tiny_model_config()
+    torch.manual_seed(31)
+    model = KlentNet(config).eval()
+    with torch.no_grad():
+        for head in (model.policy_head, model.q_head):
+            for parameter in head.parameters():
+                parameter.normal_()
+
+    game_config = hexo_rs.GameConfig(2, 1, 4)
+    states = [hexo_rs.GameState(game_config) for _ in range(2)]
+    batch = Batch.from_data_list(
+        graph_batch_fn_from_model_config(config)(states)
+    )
+    legal_idx = batch.legal_mask.nonzero(as_tuple=False).squeeze(1)
+    with torch.no_grad():
+        embeddings = model.representation(
+            batch.x,
+            batch.edge_index,
+            getattr(batch, "edge_attr", None),
+            edge_type=batch.edge_type,
+            edge_dist=batch.edge_dist,
+            global_edge_index=batch.global_edge_index,
+        )
+        legal_embeddings = embeddings.index_select(0, legal_idx)
+        expected_policy = model.policy_head.mlp(
+            legal_embeddings
+        ).squeeze(-1)
+        expected_q = model.q_head.mlp(legal_embeddings).squeeze(-1)
+        actual = model._forward_batch_core(batch, legal_idx=legal_idx)
+
+    torch.testing.assert_close(actual.policy_logits, expected_policy)
+    torch.testing.assert_close(actual.q_values, expected_q)
+
+
+def test_fit_forward_only_evaluates_chosen_action_q():
+    config = tiny_model_config()
+    torch.manual_seed(37)
+    model = KlentNet(config).eval()
+    with torch.no_grad():
+        for head in (model.policy_head, model.q_head):
+            for parameter in head.parameters():
+                parameter.normal_()
+
+    game_config = hexo_rs.GameConfig(2, 1, 4)
+    states = [hexo_rs.GameState(game_config) for _ in range(2)]
+    batch = Batch.from_data_list(
+        graph_batch_fn_from_model_config(config)(states)
+    )
+    chosen = torch.tensor([1, 8])
+
+    with torch.no_grad():
+        full = model.forward_batch(batch)
+        fit = model.forward_fit(batch, chosen)
+
+    torch.testing.assert_close(fit.policy_logits, full.policy_logits)
+    torch.testing.assert_close(
+        fit.q_values,
+        full.q_values.index_select(0, chosen),
+    )
+    torch.testing.assert_close(fit.legal_counts, full.legal_counts)
+
+
 def test_axis_relational_core_compiles_as_one_full_graph():
     """The production KLENT fit core must no longer break per GNN layer."""
 
@@ -83,6 +149,15 @@ def test_axis_relational_core_compiles_as_one_full_graph():
     )
     assert explanation.graph_count == 1
     assert explanation.graph_break_count == 0
+
+    chosen = torch.tensor([1, 8])
+    fit_explanation = torch._dynamo.explain(model._forward_fit_core)(
+        batch,
+        chosen=chosen,
+        legal_idx=legal_idx,
+    )
+    assert fit_explanation.graph_count == 1
+    assert fit_explanation.graph_break_count == 0
 
     compiled_core = torch.compile(
         model._forward_batch_core,
@@ -187,6 +262,137 @@ def test_dense_conversion_matches_graph_policy_and_q_in_fp32():
     assert torch.equal(actual_counts, expected.legal_counts)
 
 
+def test_persistent_ray_graft_preserves_dense_klent_function():
+    graph_config = tiny_model_config()
+    graph_config.threat_features = True
+    graph_config.axis_window = 5
+    graph_config.use_jk = True
+    graph_config.jk_mode = "cat"
+    dense_config = KlentModelConfig(
+        **vars(graph_config),
+        architecture="dense_axis",
+        dense_ray_radius=5,
+    )
+    persistent_config = KlentModelConfig(
+        **vars(graph_config),
+        architecture="persistent_ray_axis",
+        dense_ray_radius=5,
+        ray_channels=6,
+        ray_update_hidden=12,
+        exact_graft_init=True,
+    )
+    torch.manual_seed(29)
+    dense_model = DenseAxisKlentNet(dense_config).eval()
+    with torch.no_grad():
+        dense_model.policy_head.fc2.weight.normal_()
+        dense_model.policy_head.fc2.bias.normal_()
+        dense_model.q_head.fc2.weight.normal_()
+        dense_model.q_head.fc2.bias.normal_()
+    persistent_model = make_klent_net(persistent_config).eval()
+    assert isinstance(persistent_model, PersistentRayKlentNet)
+    copied = load_dense_klent_graft(
+        persistent_model,
+        {"model_state_dict": dense_model.state_dict()},
+    )
+    assert set(copied) == set(dense_model.state_dict())
+
+    game = hexo_rs.GameState(
+        hexo_rs.GameConfig(6, 2, 2**32 - 1)
+    )
+    states = [game.clone()]
+    for _ in range(4):
+        q, r = game.legal_moves()[0]
+        game.apply_move(q, r)
+        if not game.is_terminal():
+            states.append(game.clone())
+    dense_batches = prepare_graph_batches(
+        states,
+        model_config=dense_config,
+        edge_budget=0,
+    )
+    persistent_batches = prepare_graph_batches(
+        states,
+        model_config=persistent_config,
+        edge_budget=0,
+    )
+    with torch.inference_mode():
+        dense_outputs = [
+            dense_model.forward_batch(batch)
+            for batch, _state_slice in dense_batches
+        ]
+        persistent_outputs = [
+            persistent_model.forward_batch(batch)
+            for batch, _state_slice in persistent_batches
+        ]
+    for dense_output, persistent_output in zip(
+        dense_outputs,
+        persistent_outputs,
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            persistent_output.policy_logits,
+            dense_output.policy_logits,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            persistent_output.q_values,
+            dense_output.q_values,
+            rtol=0.0,
+            atol=0.0,
+        )
+        assert torch.equal(
+            persistent_output.legal_counts,
+            dense_output.legal_counts,
+        )
+
+
+def test_persistent_klent_heads_never_materialize_dense_features(
+    monkeypatch,
+):
+    graph_config = tiny_model_config()
+    config = KlentModelConfig(
+        **vars(graph_config),
+        architecture="persistent_ray_axis",
+        dense_ray_radius=2,
+        ray_channels=4,
+        ray_update_hidden=8,
+    )
+    model = PersistentRayKlentNet(config).eval()
+    states = [
+        hexo_rs.GameState(hexo_rs.GameConfig(2, 1, 4))
+        for _ in range(4)
+    ]
+    [(batch, _state_slice)] = prepare_graph_batches(
+        states,
+        model_config=config,
+        edge_budget=0,
+    )
+    called = False
+    active_forward = model.forward_active_features
+
+    def tracked_active(*args, **kwargs):
+        nonlocal called
+        called = True
+        return active_forward(*args, **kwargs)
+
+    def forbidden_dense(*_args, **_kwargs):
+        raise AssertionError("KLENT must not scatter compact JK features")
+
+    monkeypatch.setattr(
+        model,
+        "forward_active_features",
+        tracked_active,
+    )
+    monkeypatch.setattr(model, "forward_features", forbidden_dense)
+    with torch.inference_mode():
+        output = model.forward_batch(batch)
+
+    assert called
+    assert torch.isfinite(output.policy_logits).all()
+    assert torch.isfinite(output.q_values).all()
+
+
 def test_dense_compile_allows_bucket_variants_without_fullgraph(monkeypatch):
     """Dense compilation must retain Dynamo's non-fatal eager fallback."""
 
@@ -224,5 +430,82 @@ def test_dense_compile_allows_bucket_variants_without_fullgraph(monkeypatch):
         dynamo_config.recompile_limit = old_limit
 
     assert compile_kwargs == [{}]
+    assert torch.isfinite(output.policy_logits).all()
+    assert torch.isfinite(output.q_values).all()
+
+
+def test_graph_compile_max_autotunes_only_fit_core(monkeypatch):
+    import torch._inductor.config as inductor_config
+
+    model = KlentNet(tiny_model_config())
+    compile_kwargs = []
+
+    def fake_compile(eager, **kwargs):
+        compile_kwargs.append(kwargs)
+        return eager
+
+    old_threads = inductor_config.compile_threads
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    try:
+        compile_klent_forward(
+            model,
+            fit_max_autotune=True,
+            fit_compile_seed_nodes=16_384,
+        )
+    finally:
+        inductor_config.compile_threads = old_threads
+
+    assert compile_kwargs == [
+        {"dynamic": True},
+        {
+            "dynamic": True,
+            "options": {
+                "max_autotune": True,
+                "triton.autotune_at_compile_time": True,
+            },
+        },
+    ]
+    assert model._fit_compile_seed_nodes == 16_384
+    assert model._fit_compile_seeded is False
+
+
+def test_persistent_compile_specializes_blocks_and_ray_mixers(monkeypatch):
+    import torch._dynamo.config as dynamo_config
+
+    graph_config = tiny_model_config()
+    persistent_config = KlentModelConfig(
+        **vars(graph_config),
+        architecture="persistent_ray_axis",
+        dense_ray_radius=2,
+        ray_channels=4,
+        ray_update_hidden=8,
+    )
+    model = PersistentRayKlentNet(persistent_config).eval()
+    states = [
+        hexo_rs.GameState(hexo_rs.GameConfig(2, 1, 4))
+        for _ in range(4)
+    ]
+    [(batch, _state_slice)] = prepare_graph_batches(
+        states,
+        model_config=persistent_config,
+        edge_budget=0,
+    )
+    compiled = []
+
+    def fake_compile(eager, **kwargs):
+        compiled.append((eager, kwargs))
+        return eager
+
+    old_limit = dynamo_config.recompile_limit
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    try:
+        compile_klent_forward(model)
+        with torch.inference_mode():
+            output = model.forward_batch(batch)
+    finally:
+        dynamo_config.recompile_limit = old_limit
+
+    assert len(compiled) == 2
+    assert all(kwargs == {} for _eager, kwargs in compiled)
     assert torch.isfinite(output.policy_logits).all()
     assert torch.isfinite(output.q_values).all()

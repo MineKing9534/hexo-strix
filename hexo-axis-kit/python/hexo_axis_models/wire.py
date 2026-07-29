@@ -25,6 +25,7 @@ class RasterTensorBatch:
     active_flat_indices: Tensor    # [A] int64, global over B*H*W
     origins: Tensor                # [B,2] int32
     ray_radius: int
+    active_flat_lookup: Tensor | None = None  # [B*H*W] int32, -1 if inactive
 
     def to(
         self,
@@ -48,6 +49,14 @@ class RasterTensorBatch:
             ),
             origins=self.origins.to(device, non_blocking=non_blocking),
             ray_radius=self.ray_radius,
+            active_flat_lookup=(
+                None
+                if self.active_flat_lookup is None
+                else self.active_flat_lookup.to(
+                    device,
+                    non_blocking=non_blocking,
+                )
+            ),
         )
 
     def slice(self, start: int, end: int) -> "RasterTensorBatch":
@@ -76,6 +85,21 @@ class RasterTensorBatch:
         active_flat_indices = (
             self.active_flat_indices[selected_active] - active_start
         )
+        active_flat_lookup = torch.full(
+            ((end - start) * cells,),
+            -1,
+            dtype=torch.int32,
+            device=active_flat_indices.device,
+        )
+        active_flat_lookup.index_copy_(
+            0,
+            active_flat_indices,
+            torch.arange(
+                active_flat_indices.numel(),
+                dtype=torch.int32,
+                device=active_flat_indices.device,
+            ),
+        )
         return RasterTensorBatch(
             planes=self.planes[start:end],
             scalars=self.scalars[start:end],
@@ -86,6 +110,7 @@ class RasterTensorBatch:
             active_flat_indices=active_flat_indices,
             origins=self.origins[start:end],
             ray_radius=self.ray_radius,
+            active_flat_lookup=active_flat_lookup,
         )
 
     @property
@@ -174,6 +199,16 @@ def decode_hxr1(data: bytes | bytearray | memoryview) -> RasterTensorBatch:
     active_flat = torch.from_numpy(
         np.flatnonzero(active_np).astype(np.int64)
     )
+    active_lookup_np = np.full(
+        int(batch_size) * cells,
+        -1,
+        dtype=np.int32,
+    )
+    active_lookup_np[active_flat.numpy()] = np.arange(
+        active_flat.numel(),
+        dtype=np.int32,
+    )
+    active_lookup = torch.from_numpy(active_lookup_np)
     origins = torch.from_numpy(origins_np.reshape(batch_size, 2))
     return RasterTensorBatch(
         planes=planes,
@@ -185,4 +220,5 @@ def decode_hxr1(data: bytes | bytearray | memoryview) -> RasterTensorBatch:
         active_flat_indices=active_flat,
         origins=origins,
         ray_radius=int(ray_radius),
+        active_flat_lookup=active_lookup,
     )

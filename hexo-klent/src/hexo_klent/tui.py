@@ -5,10 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import select
 import sys
+import termios
 import threading
 import time
+import tty
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -220,6 +225,18 @@ class TrainingDashboard:
         self._state = "BOOT"
         self._final_checkpoint: str | None = None
         self._live: Live | None = None
+        self._pause_condition = threading.Condition(self._lock)
+        self._pause_requested = False
+        self._pause_started_at: float | None = None
+        self._paused_seconds = 0.0
+        self._paused_iteration: int | None = None
+        self._phase_before_pause = self._phase
+        self._phase_detail_before_pause = self._phase_detail
+        self._input_stop = threading.Event()
+        self._exit_requested = threading.Event()
+        self._input_thread: threading.Thread | None = None
+        self._terminal_fd: int | None = None
+        self._terminal_attrs: list[Any] | None = None
 
     @property
     def logging_handler(self) -> DashboardLogHandler:
@@ -291,18 +308,102 @@ class TrainingDashboard:
                 vertical_overflow="crop",
             )
             self._live.start(refresh=True)
+        self._start_input_listener()
 
     def close(self) -> None:
+        self._stop_input_listener()
         with self._lock:
             live, self._live = self._live, None
         if live is not None:
             live.stop()
+
+    def _start_input_listener(self) -> None:
+        """Enter cbreak mode and consume single-key cockpit controls."""
+
+        if not self.console.is_terminal or not self.input_stream.isatty():
+            return
+        try:
+            terminal_fd = self.input_stream.fileno()
+            terminal_attrs = termios.tcgetattr(terminal_fd)
+            tty.setcbreak(terminal_fd)
+        except (AttributeError, OSError, termios.error):
+            return
+
+        with self._lock:
+            self._terminal_fd = terminal_fd
+            self._terminal_attrs = terminal_attrs
+            self._input_stop.clear()
+            self._exit_requested.clear()
+            thread = threading.Thread(
+                target=self._input_loop,
+                name="hexo-klent-tui-input",
+                daemon=True,
+            )
+            self._input_thread = thread
+        thread.start()
+
+    def _stop_input_listener(self) -> None:
+        self._input_stop.set()
+        with self._lock:
+            thread, self._input_thread = self._input_thread, None
+            terminal_fd, self._terminal_fd = self._terminal_fd, None
+            terminal_attrs, self._terminal_attrs = (
+                self._terminal_attrs,
+                None,
+            )
+            self._pause_condition.notify_all()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+        if terminal_fd is not None and terminal_attrs is not None:
+            try:
+                termios.tcsetattr(
+                    terminal_fd,
+                    termios.TCSANOW,
+                    terminal_attrs,
+                )
+            except (OSError, termios.error):
+                pass
+
+    def _input_loop(self) -> None:
+        terminal_fd = self._terminal_fd
+        if terminal_fd is None:
+            return
+        while not self._input_stop.is_set():
+            try:
+                readable, _writable, _exceptional = select.select(
+                    [terminal_fd],
+                    [],
+                    [],
+                    0.1,
+                )
+                if not readable:
+                    continue
+                payload = os.read(terminal_fd, 32)
+            except OSError:
+                return
+            if not payload:
+                return
+            for key in payload.decode(errors="ignore"):
+                self._handle_key(key)
+
+    def _handle_key(self, key: str) -> None:
+        if key in {"p", "P"}:
+            self.toggle_pause()
+        elif key in {"\r", "\n"}:
+            with self._pause_condition:
+                if self._state == "COMPLETE":
+                    self._exit_requested.set()
+                    self._pause_condition.notify_all()
 
     def begin_run(self, current_iteration: int, stop_at: int) -> None:
         self._load_history(current_iteration)
         now = time.monotonic()
         with self._lock:
             self._completed_at = None
+            self._pause_requested = False
+            self._pause_started_at = None
+            self._paused_seconds = 0.0
+            self._paused_iteration = None
             self._iteration_started_at = now
             self._phase_started_at = now
             self._run_start_iteration = current_iteration
@@ -368,20 +469,105 @@ class TrainingDashboard:
         self._refresh()
 
     def complete(self, checkpoint: str | Path) -> None:
-        with self._lock:
+        with self._pause_condition:
             self._completed_at = time.monotonic()
+            self._pause_requested = False
             self._state = "COMPLETE"
             self._phase = "COMPLETE"
             self._phase_detail = "run target reached"
             self._final_checkpoint = str(checkpoint)
+            self._pause_condition.notify_all()
         self._refresh()
+
+    @property
+    def pause_requested(self) -> bool:
+        with self._lock:
+            return self._pause_requested
+
+    def toggle_pause(self) -> bool:
+        """Arm a boundary pause, cancel it, or resume a paused run."""
+
+        now = time.monotonic()
+        with self._pause_condition:
+            if self._state in {"BOOT", "COMPLETE", "INTERRUPTED"}:
+                return False
+            if self._state == "PAUSED":
+                paused_at = self._pause_started_at or now
+                paused_for = max(0.0, now - paused_at)
+                self._paused_seconds += paused_for
+                self._iteration_started_at += paused_for
+                self._phase_started_at += paused_for
+                self._pause_started_at = None
+                self._pause_requested = False
+                self._paused_iteration = None
+                self._state = "RUN"
+                self._phase = self._phase_before_pause
+                self._phase_detail = self._phase_detail_before_pause
+                self._events.append(
+                    ("INFO", "training resumed", now)
+                )
+                self._pause_condition.notify_all()
+                active = False
+            else:
+                self._pause_requested = not self._pause_requested
+                active = self._pause_requested
+                message = (
+                    "pause armed for the next committed generation"
+                    if active
+                    else "boundary pause cancelled"
+                )
+                self._events.append(("INFO", message, now))
+        self._refresh()
+        return active
+
+    def wait_if_paused(
+        self,
+        iteration: int,
+        *,
+        on_pause: Callable[[], None] | None = None,
+    ) -> bool:
+        """Block at a committed generation boundary while pause is armed."""
+
+        now = time.monotonic()
+        with self._pause_condition:
+            if not self._pause_requested or self._state != "RUN":
+                return False
+            self._state = "PAUSED"
+            self._pause_started_at = now
+            self._paused_iteration = iteration
+            self._phase_before_pause = self._phase
+            self._phase_detail_before_pause = self._phase_detail
+            self._phase = "PAUSED"
+            self._phase_detail = (
+                f"generation {iteration} committed // press P to resume"
+            )
+            self._events.append(
+                ("INFO", f"paused after generation {iteration}", now)
+            )
+        self._refresh()
+
+        if on_pause is not None:
+            on_pause()
+
+        with self._pause_condition:
+            while self._state == "PAUSED" and not self._input_stop.is_set():
+                self._pause_condition.wait(timeout=0.25)
+        return True
 
     def _elapsed_seconds(self) -> float:
         with self._lock:
             stopped_at = self._completed_at
             started_at = self._started_at
-        now = time.monotonic() if stopped_at is None else stopped_at
-        return max(0.0, now - started_at)
+            paused_at = self._pause_started_at
+            paused_seconds = self._paused_seconds
+        now = (
+            stopped_at
+            if stopped_at is not None
+            else paused_at
+            if paused_at is not None
+            else time.monotonic()
+        )
+        return max(0.0, now - started_at - paused_seconds)
 
     def wait_for_exit(self) -> bool:
         """Keep a completed interactive cockpit visible until Enter."""
@@ -395,6 +581,11 @@ class TrainingDashboard:
         if not should_wait:
             return False
         self._refresh()
+        with self._lock:
+            listener_running = self._input_thread is not None
+        if listener_running:
+            self._exit_requested.wait()
+            return True
         try:
             self.input_stream.readline()
         except (KeyboardInterrupt, EOFError, OSError):
@@ -403,12 +594,14 @@ class TrainingDashboard:
         return True
 
     def interrupt(self, iteration: int) -> None:
-        with self._lock:
+        with self._pause_condition:
             self._completed_at = time.monotonic()
+            self._pause_requested = False
             self._state = "INTERRUPTED"
             self._phase = "HALT"
             self._phase_detail = f"last committed generation {iteration}"
             self._current_iteration = iteration
+            self._pause_condition.notify_all()
         self._refresh()
 
     def add_event(self, level: str, message: str) -> None:
@@ -435,9 +628,16 @@ class TrainingDashboard:
         ]
 
     def _animation_clock(self) -> float:
-        """Return an animation clock that freezes at terminal states."""
-        stopped_at = self._completed_at
-        return time.monotonic() if stopped_at is None else stopped_at
+        """Return an animation clock that freezes while paused or terminal."""
+
+        with self._lock:
+            stopped_at = self._completed_at
+            paused_at = self._pause_started_at
+        if stopped_at is not None:
+            return stopped_at
+        if paused_at is not None:
+            return paused_at
+        return time.monotonic()
 
     def _animation_step(self) -> int:
         """Return a slow scanner frame that freezes at terminal states."""
@@ -518,6 +718,7 @@ class TrainingDashboard:
             state = self._state
             iteration_started_at = self._iteration_started_at
             stopped_at = self._completed_at
+            paused_at = self._pause_started_at
 
         durations: list[tuple[float, bool]] = []
         for metrics in history:
@@ -600,6 +801,8 @@ class TrainingDashboard:
             now = (
                 stopped_at
                 if stopped_at is not None
+                else paused_at
+                if paused_at is not None
                 else time.monotonic()
             )
             active_elapsed = max(0.0, now - iteration_started_at)
@@ -658,6 +861,7 @@ class TrainingDashboard:
                 [
                     ("NUMERICS", "WAIT", _MUTED),
                     ("DATA PLANE", "WAIT", _MUTED),
+                    ("FROZEN TARGET", "WAIT", _MUTED),
                     ("GRADIENTS", "WAIT", _MUTED),
                     ("Q RANGE", "WAIT", _MUTED),
                     ("GPU CACHE", "WAIT", _MUTED),
@@ -681,6 +885,7 @@ class TrainingDashboard:
                 [
                     ("NUMERICS", "WAIT", _MUTED),
                     ("DATA PLANE", "WAIT", _MUTED),
+                    ("FROZEN TARGET", "WAIT", _MUTED),
                     ("GRAD CLIP", "WAIT", _MUTED),
                     ("Q RANGE", "WAIT", _MUTED),
                     ("GPU CACHE", "WAIT", _MUTED),
@@ -695,8 +900,62 @@ class TrainingDashboard:
         finite = bool(relevant) and all(math.isfinite(value) for value in relevant)
         positions = latest.get("collection/positions")
         examples = latest.get("training/examples")
-        target = float(self.config.collection.positions_per_iteration)
-        data_exact = positions == target and examples == positions
+        chunk_truncations = latest.get("collection/chunk_truncations", 0.0)
+        data_terminal = (
+            positions is not None
+            and positions > 0
+            and examples == positions
+            and chunk_truncations == 0.0
+        )
+        policy_kl_before = latest.get(
+            "training/policy_target_kl_before"
+        )
+        policy_kl_after = latest.get("training/policy_target_kl_after")
+        policy_progress = latest.get("training/policy_target_progress")
+        policy_fit_measured = (
+            policy_kl_before is not None
+            and policy_kl_after is not None
+            and policy_progress is not None
+            and all(
+                math.isfinite(value)
+                for value in (
+                    policy_kl_before,
+                    policy_kl_after,
+                    policy_progress,
+                )
+            )
+        )
+        if not policy_fit_measured:
+            policy_fit_status = "UNMEASURED"
+            policy_fit_style = _MUTED
+        elif policy_kl_before <= 1e-6 and policy_kl_after <= 1e-6:
+            policy_fit_status = "SETTLED"
+            policy_fit_style = _MINT
+        elif policy_kl_before <= 1e-6:
+            policy_fit_status = f"FARTHER {policy_kl_after:.4f}"
+            policy_fit_style = _VIOLET
+        else:
+            policy_fit_tolerance = max(1e-6, 0.01 * policy_kl_before)
+            policy_fit_farther = (
+                policy_kl_after > policy_kl_before + policy_fit_tolerance
+            )
+            if policy_fit_farther:
+                policy_fit_status = (
+                    f"FARTHER {100.0 * policy_progress:+.1f}%"
+                )
+                policy_fit_style = _VIOLET
+            elif abs(policy_kl_after - policy_kl_before) <= (
+                policy_fit_tolerance
+            ):
+                policy_fit_status = (
+                    f"FLAT {100.0 * policy_progress:+.1f}%"
+                )
+                policy_fit_style = _BLUE
+            else:
+                policy_fit_status = (
+                    f"CLOSER {100.0 * policy_progress:+.1f}%"
+                )
+                policy_fit_style = _MINT
         grad_limit = float(self.config.training.max_grad_norm)
         clip_fraction = latest.get("training/clip_fraction")
         clip_scale = latest.get("training/mean_clip_scale")
@@ -777,8 +1036,13 @@ class TrainingDashboard:
             ),
             (
                 "DATA PLANE",
-                "EXACT" if data_exact else "MISMATCH",
-                _MINT if data_exact else _RED,
+                "TERMINAL" if data_terminal else "MISMATCH",
+                _MINT if data_terminal else _RED,
+            ),
+            (
+                "FROZEN TARGET",
+                policy_fit_status,
+                policy_fit_style,
             ),
             (
                 "GRAD CLIP",
@@ -796,7 +1060,7 @@ class TrainingDashboard:
                 cache_style,
             ),
         ]
-        if not finite or not data_exact:
+        if not finite or not data_terminal:
             return "FAULT", _RED, signals
         if clip_watch or q_hot or cache_watch:
             return "WATCH", _AMBER, signals
@@ -808,6 +1072,10 @@ class TrainingDashboard:
             health, health_style = "COMPLETE", _MINT
         elif self._state == "INTERRUPTED":
             health, health_style = "HALTED", _AMBER
+        elif self._state == "PAUSED":
+            health, health_style = "PAUSED", _AMBER
+        elif self._pause_requested:
+            health, health_style = "PAUSE ARMED", _VIOLET
         elif self._state == "BOOT":
             health, health_style = "BOOT", _BLUE
         scanner = _SCANNER[self._animation_step() % len(_SCANNER)]
@@ -830,6 +1098,10 @@ class TrainingDashboard:
             chrono.append("  ETA ARRIVED", style=f"bold {_MINT}")
         elif self._state == "INTERRUPTED":
             chrono.append("  ETA HALTED", style=f"bold {_AMBER}")
+        elif self._state == "PAUSED":
+            chrono.append("  ETA SUSPENDED", style=f"bold {_AMBER}")
+        elif self._pause_requested:
+            chrono.append("  PAUSE @ GEN END", style=f"bold {_VIOLET}")
         else:
             chrono.append(
                 f"  ETA {_digital_duration(
@@ -852,6 +1124,16 @@ class TrainingDashboard:
         )
 
     def _pipeline(self) -> Text:
+        if self._state == "PAUSED":
+            line = Text()
+            line.append(" ⏸ PAUSED ", style=f"bold black on {_AMBER}")
+            line.append(
+                f" GENERATION {self._paused_iteration or self._current_iteration:06d} "
+                "SEALED ",
+                style=_MUTED,
+            )
+            return line
+
         active = self._phase
         if active.startswith("EVAL"):
             active = "EVAL"
@@ -925,8 +1207,8 @@ class TrainingDashboard:
             Text(
                 f"{self.config.run.device.upper()} / "
                 f"{self.config.run.precision.upper()}   "
-                f"{self.config.collection.workers} ACTORS × "
-                f"{self.config.collection.parallel_games} LANES",
+                f"{self.config.collection.workers} ACTORS / "
+                f"{self.config.collection.parallel_games} LANES TOTAL",
                 style=_BLUE,
             ),
         )
@@ -1019,23 +1301,21 @@ class TrainingDashboard:
                     f"{_integer(latest.get('collection/p1_wins'))} / "
                     f"{_integer(latest.get('collection/p2_wins'))}"
                 ),
-                "TRUNC H / S / C",
+                "DROPPED H / S",
                 (
                     f"{_integer(latest.get('collection/horizon_truncations'))}"
                     " / "
                     f"{_integer(latest.get('collection/spatial_truncations'))}"
-                    " / "
-                    f"{_integer(latest.get('collection/chunk_truncations'))}"
                 ),
             ),
             (
-                "DENSE CELL PEAK",
-                _integer(
-                    latest.get("collection/max_dense_position_cells")
-                ),
-                "DENSE CELL LIMIT",
-                _integer(
-                    self.config.collection.dense_position_cell_limit
+                "DISCARDED POS",
+                _integer(latest.get("collection/discarded_positions")),
+                "DENSE CELL PEAK / LIMIT",
+                (
+                    f"{_integer(latest.get('collection/max_dense_position_cells'))}"
+                    " / "
+                    f"{_integer(self.config.collection.dense_position_cell_limit)}"
                 ),
             ),
             (
@@ -1092,17 +1372,67 @@ class TrainingDashboard:
                 _number(latest.get("collection/mean_reverse_kl"), decimals=4),
             ),
             (
-                "ENTROPY H / Hₙ",
+                "FROZEN KL B / A",
                 (
-                    _number(latest.get("collection/mean_entropy"))
+                    _number(
+                        latest.get("training/policy_target_kl_before"),
+                        decimals=4,
+                    )
                     + " / "
                     + _number(
-                        latest.get("collection/mean_normalized_entropy")
+                        latest.get("training/policy_target_kl_after"),
+                        decimals=4,
                     )
                 ),
-                "TOP-1 MASS",
+                "TARGET RETENTION",
+                _percent(latest.get("training/policy_target_progress")),
+            ),
+            (
+                "ARGMAX MATCH B / A",
+                (
+                    _percent(
+                        latest.get(
+                            "training/policy_target_top1_agreement_before"
+                        )
+                    )
+                    + " / "
+                    + _percent(
+                        latest.get(
+                            "training/policy_target_top1_agreement_after"
+                        )
+                    )
+                ),
+                "MATCH DELTA",
                 _percent(
-                    latest.get("collection/mean_target_top1_probability")
+                    latest.get(
+                        "training/policy_target_top1_agreement_delta"
+                    )
+                ),
+            ),
+            (
+                "TARGET / PRIOR Hₙ",
+                (
+                    _number(
+                        latest.get("collection/mean_normalized_entropy")
+                    )
+                    + " / "
+                    + _number(
+                        latest.get("collection/mean_prior_normalized_entropy")
+                    )
+                ),
+                "T / P TOP-1",
+                (
+                    _percent(
+                        latest.get(
+                            "collection/mean_target_top1_probability"
+                        )
+                    )
+                    + " / "
+                    + _percent(
+                        latest.get(
+                            "collection/mean_prior_top1_probability"
+                        )
+                    )
                 ),
             ),
             (
@@ -1115,22 +1445,61 @@ class TrainingDashboard:
                 _number(latest.get("collection/mean_q_span")),
             ),
             (
-                "GRAD MEAN",
-                _number(latest.get("training/mean_grad_norm")),
-                "GRAD P50",
-                _number(latest.get("training/grad_norm_p50")),
+                "GRAD μ / P50",
+                (
+                    _number(latest.get("training/mean_grad_norm"))
+                    + " / "
+                    + _number(latest.get("training/grad_norm_p50"))
+                ),
+                "GRAD P95 / MAX",
+                (
+                    _number(latest.get("training/grad_norm_p95"))
+                    + " / "
+                    + _number(latest.get("training/grad_norm_max"))
+                ),
             ),
             (
-                "GRAD P95",
-                _number(latest.get("training/grad_norm_p95")),
-                "GRAD MAX",
-                _number(latest.get("training/grad_norm_max")),
+                "P / Q TRUNK L2",
+                (
+                    _number(
+                        latest.get("training/policy_trunk_grad_norm")
+                    )
+                    + " / "
+                    + _number(latest.get("training/q_trunk_grad_norm"))
+                ),
+                "TRUNK COS",
+                _number(
+                    latest.get("training/policy_q_trunk_grad_cosine")
+                ),
             ),
             (
                 "CLIP RATE",
                 _percent(latest.get("training/clip_fraction")),
                 "CLIP SCALE",
                 _number(latest.get("training/mean_clip_scale"), decimals=3),
+            ),
+            (
+                "UPDATE L2",
+                _number(
+                    latest.get("training/mean_parameter_update_norm"),
+                    decimals=5,
+                ),
+                "UPDATE / WEIGHT",
+                _number(
+                    (
+                        None
+                        if latest.get(
+                            "training/mean_update_to_weight_ratio"
+                        )
+                        is None
+                        else 1e6
+                        * latest[
+                            "training/mean_update_to_weight_ratio"
+                        ]
+                    ),
+                    decimals=1,
+                    suffix=" ppm",
+                ),
             ),
             (
                 "BATCH / MICRO",
@@ -1174,6 +1543,18 @@ class TrainingDashboard:
         table.add_column(justify="right", width=15)
         trace_width = max(8, min(34, width - 35))
         trends = (
+            (
+                "POST-FIT KL",
+                "training/policy_target_kl_after",
+                _MINT,
+                4,
+            ),
+            (
+                "TARGET RET",
+                "training/policy_target_progress",
+                _MINT,
+                3,
+            ),
             ("EXCESS KL", "training/policy_excess_kl", _VIOLET, 4),
             ("REVERSE KL", "collection/mean_reverse_kl", _CYAN, 4),
             (
@@ -1182,9 +1563,27 @@ class TrainingDashboard:
                 _BLUE,
                 3,
             ),
+            (
+                "PRIOR H N",
+                "collection/mean_prior_normalized_entropy",
+                _BLUE,
+                3,
+            ),
             ("LEGAL MOVES", "collection/mean_legal_actions", _BLUE, 1),
             ("Q SPAN", "collection/mean_q_span", _MAGENTA, 3),
+            (
+                "P/Q TRUNK COS",
+                "training/policy_q_trunk_grad_cosine",
+                _VIOLET,
+                3,
+            ),
             ("GRAD P95", "training/grad_norm_p95", _AMBER, 3),
+            (
+                "UPDATE L2",
+                "training/mean_parameter_update_norm",
+                _AMBER,
+                5,
+            ),
             ("CLIP RATE", "training/clip_fraction", _AMBER, 3),
             ("ITERATION", "iteration_seconds", _AMBER, 1),
         )
@@ -1201,7 +1600,11 @@ class TrainingDashboard:
                 Text(
                     (
                         _percent(latest)
-                        if key == "training/clip_fraction"
+                        if key
+                        in {
+                            "training/clip_fraction",
+                            "training/policy_target_progress",
+                        }
                         else _number(latest, decimals=decimals)
                     )
                     + delta,
@@ -1325,6 +1728,14 @@ class TrainingDashboard:
             line.append(" ENTER ", style=f"bold black on {_MINT}")
             line.append(" RELEASE TERMINAL", style=_MUTED)
         else:
+            line.append(" P ", style=f"bold black on {_VIOLET}")
+            if self._state == "PAUSED":
+                line.append(" RESUME", style=_MUTED)
+            elif self._pause_requested:
+                line.append(" CANCEL PAUSE", style=_MUTED)
+            else:
+                line.append(" PAUSE @ GEN END", style=_MUTED)
+            line.append("   ")
             line.append(" CTRL-C ", style=f"bold black on {_MAGENTA}")
             line.append(" SAFE SHUTDOWN", style=_MUTED)
         line.append("   ◆ NEURAL LINK ", style=_DIM)
@@ -1419,6 +1830,22 @@ class TrainingDashboard:
         table.add_column(justify="right", style=_WHITE)
         rows = (
             (
+                "FROZEN KL B / A",
+                (
+                    _number(
+                        latest.get("training/policy_target_kl_before"),
+                        decimals=4,
+                    )
+                    + " / "
+                    + _number(
+                        latest.get("training/policy_target_kl_after"),
+                        decimals=4,
+                    )
+                ),
+                "TARGET RETENTION",
+                _percent(latest.get("training/policy_target_progress")),
+            ),
+            (
                 "EXCESS KL",
                 _number(
                     latest.get("training/policy_excess_kl"),
@@ -1428,17 +1855,29 @@ class TrainingDashboard:
                 _number(latest.get("collection/mean_reverse_kl"), decimals=4),
             ),
             (
-                "ENTROPY H / Hₙ",
+                "TARGET / PRIOR Hₙ",
                 (
-                    _number(latest.get("collection/mean_entropy"))
-                    + " / "
-                    + _number(
+                    _number(
                         latest.get("collection/mean_normalized_entropy")
                     )
+                    + " / "
+                    + _number(
+                        latest.get("collection/mean_prior_normalized_entropy")
+                    )
                 ),
-                "TOP-1 MASS",
-                _percent(
-                    latest.get("collection/mean_target_top1_probability")
+                "T / P TOP-1",
+                (
+                    _percent(
+                        latest.get(
+                            "collection/mean_target_top1_probability"
+                        )
+                    )
+                    + " / "
+                    + _percent(
+                        latest.get(
+                            "collection/mean_prior_top1_probability"
+                        )
+                    )
                 ),
             ),
             (
@@ -1485,6 +1924,18 @@ class TrainingDashboard:
         table.add_column(justify="right", width=9)
         trace_width = max(8, width - 28)
         for label, key, style, decimals in (
+            (
+                "POST-FIT KL",
+                "training/policy_target_kl_after",
+                _MINT,
+                4,
+            ),
+            (
+                "TARGET RET",
+                "training/policy_target_progress",
+                _MINT,
+                3,
+            ),
             ("EXCESS KL", "training/policy_excess_kl", _VIOLET, 4),
             ("REVERSE KL", "collection/mean_reverse_kl", _CYAN, 4),
             (
@@ -1493,12 +1944,25 @@ class TrainingDashboard:
                 _BLUE,
                 3,
             ),
+            (
+                "PRIOR H N",
+                "collection/mean_prior_normalized_entropy",
+                _BLUE,
+                3,
+            ),
         ):
             values = self._series(key)
             table.add_row(
                 label,
                 Text(sparkline(values, trace_width), style=f"bold {style}"),
-                _number(values[-1] if values else None, decimals=decimals),
+                (
+                    _percent(values[-1] if values else None)
+                    if key == "training/policy_target_progress"
+                    else _number(
+                        values[-1] if values else None,
+                        decimals=decimals,
+                    )
+                ),
             )
 
         evaluation_parts = []
@@ -1533,6 +1997,14 @@ class TrainingDashboard:
             line.append(" ENTER ", style=f"bold black on {_MINT}")
             line.append(" RELEASE TERMINAL", style=_MUTED)
         else:
+            line.append(" P ", style=f"bold black on {_VIOLET}")
+            if self._state == "PAUSED":
+                line.append(" RESUME", style=_MUTED)
+            elif self._pause_requested:
+                line.append(" CANCEL", style=_MUTED)
+            else:
+                line.append(" PAUSE", style=_MUTED)
+            line.append("   ")
             line.append(" CTRL-C ", style=f"bold black on {_MAGENTA}")
             line.append(" SAFE HALT", style=_MUTED)
         line.append("   ◆ LINK ", style=_DIM)

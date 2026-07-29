@@ -1,0 +1,76 @@
+Script started on 2026-08-06 16:41:56+01:00 [COMMAND=".venv/bin/hexo-a0 head-to-head --checkpoint-a runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip-from10/checkpoints/checkpoint_000020.pt --checkpoint-b runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt --win-length 6 --radius 8 --max-moves 1000 --mcts-sims 64 --mcts-m-actions 16 --device cpu --sprt-s0 0.50 --sprt-s1 0.55 --sprt-alpha 0.05 --sprt-beta 0.05 --window-size 0 --max-games 1000 --seed 20260861 --state-file artifacts/klent-head-to-head/cpu-forcing-off-unclipped20-vs-strix-d6-qhead-215547-20260806.json --opening-plies 8 --opening-generator alternate --opening-temperature 0.5 --disable-forcing-solver" TERM="tmux-256color" TTY="/dev/pts/3" COLUMNS="80" LINES="24"]
+(null): No such file or directory
+2026-08-06 16:41:58 head_to_head INFO ==============================================================================
+2026-08-06 16:41:58 head_to_head INFO Head-to-head match: A vs B
+2026-08-06 16:41:58 head_to_head INFO   A: runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip-from10/checkpoints/checkpoint_000020.pt
+2026-08-06 16:41:58 head_to_head INFO      train_steps=20  graph=axis conv=gine layers=4 hidden=128 heads=8 jk=True
+2026-08-06 16:41:58 head_to_head INFO   B: runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt
+2026-08-06 16:41:58 head_to_head INFO      train_steps=215547  graph=axis conv=gine layers=4 hidden=128 heads=8 jk=True
+2026-08-06 16:41:58 head_to_head INFO Game: win_length=6 radius=8 max_moves=1000
+2026-08-06 16:41:58 head_to_head INFO MCTS: sims=64 m_actions=16 device=cpu  capture_k A=0 B=0  vl A=0 B=0
+2026-08-06 16:41:58 head_to_head INFO Forcing: root A=off B=off depth=default root_budget=default leaf_budget A=0 B=0 leaf_width A=wide B=wide leaf_order A=legacy B=legacy leaf_windows A=legacy B=legacy
+2026-08-06 16:41:58 head_to_head INFO SPRT: s0=0.500 s1=0.550 alpha=0.050 beta=0.050  bounds [-2.944, 2.944]
+2026-08-06 16:41:58 head_to_head INFO Max games: 1000   pentanomial=True (pair_variance clamped to [0.05, 0.65])
+2026-08-06 16:41:58 head_to_head INFO State file: artifacts/klent-head-to-head/cpu-forcing-off-unclipped20-vs-strix-d6-qhead-215547-20260806.json
+2026-08-06 16:41:58 head_to_head INFO ==============================================================================
+2026-08-06 16:42:54 head_to_head INFO game=1 side=P1 W  W-D-L=1-0-0  score=1.000  Elo(A-B)=+191 [-234, +2400]  LLR=0.000  continue
+2026-08-06 16:43:01 head_to_head INFO game=2 side=P2 L  W-D-L=1-0-1  score=0.500  Elo(A-B)=-0 [-393, +393]  LLR=-0.014  continue
+2026-08-06 16:44:01 head_to_head INFO game=3 side=P1 W  W-D-L=2-0-1  score=0.667  Elo(A-B)=+89 [-233, +473]  LLR=-0.014  continue
+2026-08-06 16:44:17 head_to_head INFO game=4 side=P2 L  W-D-L=2-0-2  score=0.500  Elo(A-B)=-0 [-301, +301]  LLR=-0.029  continue
+2026-08-06 16:44:33 head_to_head INFO game=5 side=P1 L  W-D-L=2-0-3  score=0.400  Elo(A-B)=-58 [-350, +209]  LLR=-0.200  continue
+2026-08-06 16:44:48 head_to_head INFO game=6 side=P2 L  W-D-L=2-0-4  score=0.333  Elo(A-B)=-102 [-388, +147]  LLR=-2.300  continue
+2026-08-06 16:44:58 head_to_head INFO game=7 side=P1 L  W-D-L=2-0-5  score=0.286  Elo(A-B)=-137 [-419, +101]  LLR=-0.518  continue
+2026-08-06 16:45:11 head_to_head INFO game=8 side=P2 L  W-D-L=2-0-6  score=0.250  Elo(A-B)=-166 [-445, +64]  LLR=-0.990  continue
+2026-08-06 16:45:38 head_to_head INFO game=9 side=P1 W  W-D-L=3-0-6  score=0.333  Elo(A-B)=-108 [-345, +104]  LLR=-0.880  continue
+2026-08-06 16:46:17 head_to_head INFO game=10 side=P2 W  W-D-L=4-0-6  score=0.400  Elo(A-B)=-64 [-278, +137]  LLR=-0.500  continue
+2026-08-06 16:46:30 head_to_head INFO game=11 side=P1 L  W-D-L=4-0-7  score=0.364  Elo(A-B)=-89 [-299, +105]  LLR=-0.223  continue
+2026-08-06 16:46:34 head_to_head INFO game=12 side=P2 W  W-D-L=5-0-7  score=0.417  Elo(A-B)=-54 [-248, +131]  LLR=-0.232  continue
+2026-08-06 16:46:54 head_to_head INFO game=13 side=P1 W  W-D-L=6-0-7  score=0.462  Elo(A-B)=-25 [-208, +154]  LLR=-0.275  continue
+2026-08-06 16:47:02 head_to_head INFO game=14 side=P2 L  W-D-L=6-0-8  score=0.429  Elo(A-B)=-47 [-226, +126]  LLR=-0.286  continue
+2026-08-06 16:47:20 head_to_head INFO game=15 side=P1 L  W-D-L=6-0-9  score=0.400  Elo(A-B)=-66 [-243, +102]  LLR=-0.331  continue
+2026-08-06 16:47:53 head_to_head INFO game=16 side=P2 W  W-D-L=7-0-9  score=0.438  Elo(A-B)=-41 [-209, +122]  LLR=-0.343  continue
+2026-08-06 16:47:59 head_to_head INFO game=17 side=P1 L  W-D-L=7-0-10  score=0.412  Elo(A-B)=-58 [-224, +100]  LLR=-0.390  continue
+2026-08-06 16:48:34 head_to_head INFO game=18 side=P2 W  W-D-L=8-0-10  score=0.444  Elo(A-B)=-37 [-195, +117]  LLR=-0.403  continue
+2026-08-06 16:48:48 head_to_head INFO game=19 side=P1 L  W-D-L=8-0-11  score=0.421  Elo(A-B)=-53 [-209, +98]  LLR=-0.452  continue
+2026-08-06 16:48:56 head_to_head INFO game=20 side=P2 L  W-D-L=8-0-12  score=0.400  Elo(A-B)=-67 [-221, +80]  LLR=-0.779  continue
+2026-08-06 16:49:13 head_to_head INFO game=21 side=P1 W  W-D-L=9-0-12  score=0.429  Elo(A-B)=-48 [-196, +96]  LLR=-0.694  continue
+2026-08-06 16:49:24 head_to_head INFO game=22 side=P2 L  W-D-L=9-0-13  score=0.409  Elo(A-B)=-61 [-207, +80]  LLR=-0.708  continue
+2026-08-06 16:49:29 head_to_head INFO game=23 side=P1 L  W-D-L=9-0-14  score=0.391  Elo(A-B)=-73 [-218, +65]  LLR=-0.771  continue
+2026-08-06 16:50:08 head_to_head INFO game=24 side=P2 L  W-D-L=9-0-15  score=0.375  Elo(A-B)=-85 [-229, +51]  LLR=-1.089  continue
+2026-08-06 16:50:39 head_to_head INFO game=25 side=P1 W  W-D-L=10-0-15  score=0.400  Elo(A-B)=-68 [-206, +65]  LLR=-1.016  continue
+2026-08-06 16:51:46 head_to_head INFO game=26 side=P2 W  W-D-L=11-0-15  score=0.423  Elo(A-B)=-52 [-186, +78]  LLR=-0.748  continue
+2026-08-06 16:52:09 head_to_head INFO game=27 side=P1 L  W-D-L=11-0-16  score=0.407  Elo(A-B)=-63 [-195, +65]  LLR=-0.605  continue
+2026-08-06 16:53:00 head_to_head INFO game=28 side=P2 W  W-D-L=12-0-16  score=0.429  Elo(A-B)=-48 [-177, +77]  LLR=-0.617  continue
+2026-08-06 16:53:10 head_to_head INFO game=29 side=P1 L  W-D-L=12-0-17  score=0.414  Elo(A-B)=-58 [-186, +65]  LLR=-0.662  continue
+2026-08-06 16:53:22 head_to_head INFO game=30 side=P2 L  W-D-L=12-0-18  score=0.400  Elo(A-B)=-68 [-195, +54]  LLR=-0.919  continue
+2026-08-06 16:53:43 head_to_head INFO game=31 side=P1 L  W-D-L=12-0-19  score=0.387  Elo(A-B)=-77 [-203, +43]  LLR=-0.879  continue
+2026-08-06 16:53:52 head_to_head INFO game=32 side=P2 W  W-D-L=13-0-19  score=0.406  Elo(A-B)=-64 [-186, +54]  LLR=-0.891  continue
+2026-08-06 16:54:16 head_to_head INFO game=33 side=P1 W  W-D-L=14-0-19  score=0.424  Elo(A-B)=-51 [-171, +65]  LLR=-0.944  continue
+2026-08-06 16:54:56 head_to_head INFO game=34 side=P2 W  W-D-L=15-0-19  score=0.441  Elo(A-B)=-40 [-157, +74]  LLR=-0.708  continue
+2026-08-06 16:55:13 head_to_head INFO game=35 side=P1 W  W-D-L=16-0-19  score=0.457  Elo(A-B)=-29 [-143, +84]  LLR=-0.624  continue
+2026-08-06 16:55:28 head_to_head INFO game=36 side=P2 L  W-D-L=16-0-20  score=0.444  Elo(A-B)=-38 [-151, +73]  LLR=-0.635  continue
+2026-08-06 16:55:37 head_to_head INFO game=37 side=P1 L  W-D-L=16-0-21  score=0.432  Elo(A-B)=-46 [-158, +64]  LLR=-0.671  continue
+2026-08-06 16:55:45 head_to_head INFO game=38 side=P2 L  W-D-L=16-0-22  score=0.421  Elo(A-B)=-54 [-165, +55]  LLR=-0.914  continue
+2026-08-06 16:56:24 head_to_head INFO game=39 side=P1 W  W-D-L=17-0-22  score=0.436  Elo(A-B)=-44 [-153, +63]  LLR=-0.880  continue
+2026-08-06 16:56:40 head_to_head INFO game=40 side=P2 W  W-D-L=18-0-22  score=0.450  Elo(A-B)=-34 [-141, +72]  LLR=-0.669  continue
+2026-08-06 16:56:46 head_to_head INFO game=41 side=P1 L  W-D-L=18-0-23  score=0.439  Elo(A-B)=-42 [-148, +63]  LLR=-0.612  continue
+2026-08-06 16:57:00 head_to_head INFO game=42 side=P2 W  W-D-L=19-0-23  score=0.452  Elo(A-B)=-32 [-137, +71]  LLR=-0.622  continue
+2026-08-06 16:57:10 head_to_head INFO game=43 side=P1 L  W-D-L=19-0-24  score=0.442  Elo(A-B)=-40 [-144, +62]  LLR=-0.653  continue
+2026-08-06 16:58:31 head_to_head INFO game=44 side=P2 W  W-D-L=20-0-24  score=0.455  Elo(A-B)=-31 [-133, +70]  LLR=-0.664  continue
+2026-08-06 16:58:48 head_to_head INFO game=45 side=P1 L  W-D-L=20-0-25  score=0.444  Elo(A-B)=-38 [-139, +62]  LLR=-0.695  continue
+2026-08-06 17:00:11 head_to_head INFO game=46 side=P2 W  W-D-L=21-0-25  score=0.457  Elo(A-B)=-30 [-130, +69]  LLR=-0.706  continue
+2026-08-06 17:00:18 head_to_head INFO game=47 side=P1 W  W-D-L=22-0-25  score=0.468  Elo(A-B)=-22 [-120, +76]  LLR=-0.737  continue
+2026-08-06 17:01:15 head_to_head INFO game=48 side=P2 W  W-D-L=23-0-25  score=0.479  Elo(A-B)=-14 [-112, +83]  LLR=-0.515  continue
+2026-08-06 17:01:40 head_to_head INFO game=49 side=P1 W  W-D-L=24-0-25  score=0.490  Elo(A-B)=-7 [-103, +89]  LLR=-0.482  continue
+2026-08-06 17:02:01 head_to_head INFO game=50 side=P2 W  W-D-L=25-0-25  score=0.500  Elo(A-B)=-0 [-95, +95]  LLR=-0.274  continue
+2026-08-06 17:02:20 head_to_head INFO game=51 side=P1 W  W-D-L=26-0-25  score=0.510  Elo(A-B)=+7 [-87, +101]  LLR=-0.260  continue
+2026-08-06 17:02:31 head_to_head INFO game=52 side=P2 L  W-D-L=26-0-26  score=0.500  Elo(A-B)=-0 [-93, +93]  LLR=-0.271  continue
+2026-08-06 17:02:36 head_to_head INFO game=53 side=P1 W  W-D-L=27-0-26  score=0.509  Elo(A-B)=+6 [-86, +99]  LLR=-0.282  continue
+2026-08-06 17:03:25 head_to_head INFO game=54 side=P2 W  W-D-L=28-0-26  score=0.519  Elo(A-B)=+13 [-79, +105]  LLR=-0.076  continue
+2026-08-06 17:03:31 head_to_head INFO game=55 side=P1 L  W-D-L=28-0-27  score=0.509  Elo(A-B)=+6 [-84, +97]  LLR=-0.073  continue
+2026-08-06 17:04:07 head_to_head INFO game=56 side=P2 W  W-D-L=29-0-27  score=0.518  Elo(A-B)=+12 [-78, +102]  LLR=-0.083  continue
+2026-08-06 17:04:14 head_to_head INFO game=57 side=P1 L  W-D-L=29-0-28  score=0.509  Elo(A-B)=+6 [-83, +95]  LLR=-0.086  continue
+2026-08-06 17:04:30 head_to_head INFO game=58 side=P2 L  W-D-L=29-0-29  score=0.500  Elo(A-B)=-0 [-88, +88]  LLR=-0.313  continue
+2026-08-06 17:04:41 head_to_head INFO game=59 side=P1 W  W-D-L=30-0-29  score=0.508  Elo(A-B)=+6 [-82, +94]  LLR=-0.300  continue
+
+Script done on 2026-08-06 17:04:47+01:00 [COMMAND_EXIT_CODE="0"]

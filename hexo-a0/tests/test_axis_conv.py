@@ -251,3 +251,82 @@ def test_fused_forward_and_backward_match_original_without_global_edges():
     # In addition to numeric parity, the shared helper verifies that all global
     # parameters retain grad=None when the old implementation skipped them.
     _assert_fused_forward_and_backward_match(None)
+
+
+def test_separate_global_star_matches_general_edge_scatter_and_gradients():
+    torch.manual_seed(19)
+    general = AxisRelationalConv(
+        in_dim=5,
+        out_dim=5,
+        window=4,
+        use_global=True,
+    ).train()
+    star = copy.deepcopy(general).train()
+    edge_index, edge_type, edge_dist = _random_axis_graph(
+        5,
+        [
+            (0, 1, 0, 1),
+            (1, 0, 0, 1),
+            (1, 2, 1, 2),
+            (2, 1, 1, 2),
+            (2, 3, 2, 3),
+            (3, 2, 2, 3),
+        ],
+    )
+    # Node four is the dummy. Match Rust's alternating pair contract exactly.
+    global_edge_index = torch.tensor(
+        [
+            [4, 0, 4, 1, 4, 2, 4, 3],
+            [0, 4, 1, 4, 2, 4, 3, 4],
+        ],
+        dtype=torch.long,
+    )
+    x_general = torch.randn(5, 5, requires_grad=True)
+    x_star = x_general.detach().clone().requires_grad_(True)
+
+    expected = general(
+        x_general,
+        edge_index,
+        edge_type,
+        edge_dist,
+        global_edge_index,
+    )
+    actual = star(
+        x_star,
+        edge_index,
+        edge_type,
+        edge_dist,
+        global_edge_index,
+        separate_global_star=True,
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+    probe = torch.randn_like(actual)
+    (expected * probe).sum().backward()
+    (actual * probe).sum().backward()
+    torch.testing.assert_close(
+        x_star.grad,
+        x_general.grad,
+        atol=2e-6,
+        rtol=1e-5,
+    )
+    for (general_name, general_parameter), (
+        star_name,
+        star_parameter,
+    ) in zip(
+        general.named_parameters(),
+        star.named_parameters(),
+        strict=True,
+    ):
+        assert star_name == general_name
+        assert (star_parameter.grad is None) == (
+            general_parameter.grad is None
+        )
+        if star_parameter.grad is not None:
+            torch.testing.assert_close(
+                star_parameter.grad,
+                general_parameter.grad,
+                atol=2e-6,
+                rtol=1e-5,
+                msg=lambda msg, name=star_name: f"{name}: {msg}",
+            )

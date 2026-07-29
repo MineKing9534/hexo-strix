@@ -14,6 +14,12 @@ This is the first model to test. It compiles the current axis-relational graph a
 8. Apply the same node-update MLP and outer residual/ReLU as the current representation network.
 9. Preserve JK-cat, policy, Q, distributional value, and horizon heads.
 
+The compact API projects active input cells once and keeps the complete block
+stack and JK representation compact. KLENT gathers legal embeddings directly
+from that representation. The separate dense-map API remains the readable
+reference and direct-inference path; there is no compact-to-dense compatibility
+wrapper.
+
 The included checkpoint converter maps the current modules into their dense equivalents. Floating-point reduction order changes, so use close numerical parity rather than bit parity as the acceptance test.
 
 Recommended first acceptance gates:
@@ -96,17 +102,27 @@ v_k = (pi_k * q).sum()
 
 ## Performance path
 
-CUDA/ROCm execution uses a custom Triton destination-gather which performs:
+CUDA/ROCm execution uses a custom Triton active-cell gather which performs:
 
 ```text
 gather + distance projection + ReLU + masked axis accumulation
 ```
 
-without materializing every shifted tensor. Its custom backward combines input
-and learned-distance gradients in one traversal. The surrounding GINE MLPs
-gather only active cells, use the checkpoint-compatible linear weights, then
-scatter their outputs back into the raster. CPU execution keeps the readable
-reference path for portability and parity testing.
+without materializing every shifted or padded-axis tensor. It reads Rust's
+packed ray words directly, returns `[active,3,channels]`, and uses a
+source-centric custom backward. Normalization, the GINE and global MLPs,
+real-to-global reduction, and the node update remain in active-cell order
+throughout the compact API.
+CPU execution reconstructs the readable dense reference for portability and
+parity testing.
+
+The persistent-ray side stream has its own fused forward/backward gather. It
+consumes compact projected sources and emits six directed messages directly
+in active-cell order instead of scattering a source raster or materializing
+thirty shifted `[B,C,H,W]` tensors. Its normalization, pointwise projections,
+gated update, orientation-ring mixture, and invariant fold also run only on
+active cells in the compact API. The padded implementation remains available
+as a readable CPU/reference path.
 
 ## KLENT helper
 

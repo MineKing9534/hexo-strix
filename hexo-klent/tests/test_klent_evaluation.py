@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
+import hexo_rs
 from hexo_a0.config import ModelConfig
 from hexo_a0.model import HeXONet
 from hexo_klent import evaluation
@@ -16,6 +17,7 @@ from hexo_klent.evaluation import (
     evaluate_vs_random,
     resolve_lagged_checkpoint,
 )
+from hexo_klent.mcts_adapter import KlentMCTSAdapter
 from hexo_klent.model import KlentNet
 
 
@@ -55,7 +57,7 @@ def test_batched_greedy_evaluation_completes_both_model_sides():
         KlentNet(model_config),
         model_config=model_config,
         game_config=GameConfig(
-            win_length=6, placement_radius=1, rollout_horizon=2
+            win_length=6, placement_radius=1, rollout_horizon=4
         ),
         games=4,
         device=torch.device("cpu"),
@@ -204,7 +206,7 @@ def test_checkpoint_evaluation_accepts_cross_format_opponents(
         KlentNet(model_config),
         model_config=model_config,
         game_config=GameConfig(
-            win_length=6, placement_radius=1, rollout_horizon=2
+            win_length=6, placement_radius=1, rollout_horizon=4
         ),
         games=4,
         checkpoint=str(checkpoint_path),
@@ -212,12 +214,130 @@ def test_checkpoint_evaluation_accepts_cross_format_opponents(
         seed=13,
         opponent_mcts_simulations=4,
         opponent_mcts_actions=2,
+        opening_plies=2,
     )
 
     assert stats.games == 4
     assert stats.wins == stats.losses == 0
     assert stats.truncations == 4
     assert stats.mean_opponent_depth == 0.0
+    assert stats.opening_pairs == 2
+
+
+def test_checkpoint_evaluation_replays_paired_openings_and_disables_noise(
+    monkeypatch,
+    tmp_path,
+):
+    model_config = _tiny_model_config()
+    checkpoint_path = tmp_path / "anchor.pt"
+    opponent = HeXONet(model_config)
+    torch.save(
+        {
+            "train_steps": 11,
+            "model_state_dict": opponent.state_dict(),
+            "model_config": dataclasses.asdict(model_config),
+        },
+        checkpoint_path,
+    )
+
+    original_game_state = hexo_rs.GameState
+    created_games = []
+
+    class RecordingGame:
+        def __init__(self, config):
+            self.inner = original_game_state(config)
+            self.applied = []
+            created_games.append(self)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def apply_move(self, q, r):
+            self.applied.append((int(q), int(r)))
+            return self.inner.apply_move(q, r)
+
+    sample_calls = []
+
+    def fake_sample_opening(
+        generator,
+        rust_config,
+        device,
+        k,
+        temperature,
+        seed,
+        model_config,
+    ):
+        del device, temperature
+        probe = original_game_state(rust_config)
+        opening = []
+        for ply in range(k):
+            legal = probe.legal_moves()
+            q, r = legal[(seed + ply) % len(legal)]
+            probe.apply_move(q, r)
+            opening.append((int(q), int(r)))
+        sample_calls.append((generator, model_config, seed, opening))
+        return opening
+
+    noise_settings = []
+
+    def fake_candidate_selector(*args, **kwargs):
+        del args
+        noise_settings.append(("candidate", kwargs["disable_gumbel_noise"]))
+        return None
+
+    def fake_opponent_selector(*args, **kwargs):
+        del args
+        noise_settings.append(("opponent", kwargs["disable_gumbel_noise"]))
+        return None
+
+    def greedy_candidate(_model, states, **kwargs):
+        del kwargs
+        return [torch.zeros(len(state.legal_moves())) for state in states]
+
+    def greedy_opponent(_model, states, **kwargs):
+        del kwargs
+        return (
+            [torch.zeros(len(state.legal_moves())) for state in states],
+            [torch.tensor(0.0) for _state in states],
+        )
+
+    monkeypatch.setattr(hexo_rs, "GameState", RecordingGame)
+    monkeypatch.setattr("hexo_a0.evaluate.sample_opening", fake_sample_opening)
+    monkeypatch.setattr(evaluation, "_mcts_move_selector", fake_candidate_selector)
+    monkeypatch.setattr(
+        evaluation,
+        "_compatible_mcts_move_selector",
+        fake_opponent_selector,
+    )
+    monkeypatch.setattr(evaluation, "_klent_policy_chunks", greedy_candidate)
+    monkeypatch.setattr(evaluation, "_compatible_outputs", greedy_opponent)
+
+    stats = evaluate_vs_checkpoint(
+        KlentNet(model_config),
+        model_config=model_config,
+        game_config=GameConfig(
+            win_length=6,
+            placement_radius=1,
+            rollout_horizon=4,
+        ),
+        games=4,
+        checkpoint=str(checkpoint_path),
+        device=torch.device("cpu"),
+        seed=13,
+        opening_plies=2,
+        opening_temperature=0.5,
+        opening_generator="alternate",
+    )
+
+    assert [call[2] for call in sample_calls] == [13, 14]
+    assert isinstance(sample_calls[0][0], HeXONet)
+    assert isinstance(sample_calls[1][0], KlentMCTSAdapter)
+    assert created_games[0].applied[:2] == created_games[1].applied[:2]
+    assert created_games[2].applied[:2] == created_games[3].applied[:2]
+    assert created_games[0].applied[:2] != created_games[2].applied[:2]
+    assert noise_settings == [("candidate", True), ("opponent", True)]
+    assert stats.opening_pairs == 2
+    assert stats.frac_unique_opening == 1.0
 
 
 def test_checkpoint_cache_loads_a_fixed_model_once(monkeypatch, tmp_path):

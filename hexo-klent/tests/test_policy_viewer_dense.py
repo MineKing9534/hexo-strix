@@ -8,7 +8,11 @@ import torch
 
 from hexo_klent.config import AlgorithmConfig, KlentModelConfig
 from hexo_klent.mcts_adapter import KlentMCTSAdapter
-from hexo_klent.model import DenseAxisKlentNet, make_klent_net
+from hexo_klent.model import (
+    DenseAxisKlentNet,
+    PersistentRayKlentNet,
+    make_klent_net,
+)
 
 
 def _load_policy_viewer():
@@ -24,10 +28,14 @@ def _load_policy_viewer():
     return module
 
 
-def _tiny_dense_config() -> KlentModelConfig:
+def _tiny_dense_config(
+    architecture: str = "dense_axis",
+) -> KlentModelConfig:
     return KlentModelConfig(
-        architecture="dense_axis",
+        architecture=architecture,
         dense_ray_radius=5,
+        ray_channels=4,
+        ray_update_hidden=8,
         hidden_dim=8,
         num_layers=1,
         num_heads=1,
@@ -47,11 +55,22 @@ def _tiny_dense_config() -> KlentModelConfig:
     )
 
 
-def test_policy_viewer_bridges_dense_klent_checkpoint_everywhere(tmp_path):
-    config = _tiny_dense_config()
+@pytest.mark.parametrize(
+    ("architecture", "network_type"),
+    [
+        ("dense_axis", DenseAxisKlentNet),
+        ("persistent_ray_axis", PersistentRayKlentNet),
+    ],
+)
+def test_policy_viewer_bridges_dense_klent_checkpoint_everywhere(
+    tmp_path,
+    architecture,
+    network_type,
+):
+    config = _tiny_dense_config(architecture)
     algorithm = AlgorithmConfig()
     network = make_klent_net(config)
-    assert isinstance(network, DenseAxisKlentNet)
+    assert isinstance(network, network_type)
     with torch.no_grad():
         network.q_head.fc2.bias.fill_(math.atanh(0.25))
 
@@ -71,7 +90,7 @@ def test_policy_viewer_bridges_dense_klent_checkpoint_everywhere(tmp_path):
     model, loaded_config = viewer._load_model(str(checkpoint))
 
     assert isinstance(model, KlentMCTSAdapter)
-    assert loaded_config.architecture == "dense_axis"
+    assert loaded_config.architecture == architecture
 
     analysis = viewer._analyze(
         [[0, 0]],

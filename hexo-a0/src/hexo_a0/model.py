@@ -323,27 +323,14 @@ class RepresentationNetwork(nn.Module):
             # Defensive clamp into the per-hop embedding table's valid range.
             edge_dist = edge_dist.long().clamp(1, self.axis_window)
 
-            # Fold the optional global relation into the same fixed-shape edge
-            # bucket representation once for the whole stack. Each relational
-            # layer can then aggregate all axes + global edges in one scatter,
-            # without repeating concatenation or data-dependent edge splits.
+            # Keep the optional global relation separate. It is an exact
+            # bidirectional dummy-node star, so each layer can evaluate it as
+            # a broadcast plus one per-dummy reduction instead of placing two
+            # edges per real node in the general relation scatter.
             has_global_edges = (
                 global_edge_index is not None
                 and global_edge_index.numel() > 0
             )
-            if has_global_edges:
-                num_global = global_edge_index.shape[1]
-                edge_index = torch.cat(
-                    [edge_index, global_edge_index], dim=1
-                )
-                edge_type = torch.cat(
-                    [edge_type, edge_type.new_full((num_global,), 3)]
-                )
-                # Distance is unused for global messages; keep a valid table
-                # index so the per-edge projection remains branchless.
-                edge_dist = torch.cat(
-                    [edge_dist, edge_dist.new_ones((num_global,))]
-                )
         else:
             gine_unique = gine_inverse = None
             if hasattr(self, "edge_proj"):
@@ -393,9 +380,13 @@ class RepresentationNetwork(nn.Module):
                 x = norm(x)
                 if self.axis_relational:
                     x = conv(
-                        x, edge_index, edge_type, edge_dist,
-                        prebucketed=True,
+                        x,
+                        edge_index,
+                        edge_type,
+                        edge_dist,
+                        global_edge_index,
                         has_global_edges=has_global_edges,
+                        separate_global_star=True,
                     )
                 elif isinstance(conv, DedupGINEConv) and gine_unique is not None \
                         and not getattr(conv, "_dedup_force_stock", False):
@@ -412,9 +403,13 @@ class RepresentationNetwork(nn.Module):
             else:
                 if self.axis_relational:
                     x = conv(
-                        x, edge_index, edge_type, edge_dist,
-                        prebucketed=True,
+                        x,
+                        edge_index,
+                        edge_type,
+                        edge_dist,
+                        global_edge_index,
                         has_global_edges=has_global_edges,
+                        separate_global_star=True,
                     )
                 elif isinstance(conv, DedupGINEConv) and gine_unique is not None \
                         and not getattr(conv, "_dedup_force_stock", False):

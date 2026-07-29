@@ -1,0 +1,163 @@
+# Axis-GINE KLENT S4 continuation (win length 6, placement radius 8).
+#
+# This is the graph-backend counterpart to the larger-data/larger-batch S4
+# arm: 131,072 fresh positions and an effective optimizer batch of 2,048.
+# The 250k physical edge budget is the measured S4 throughput knee on this
+# Radeon 8060S. Gradient accumulation preserves the 2,048-position update
+# while splitting each update into memory-safe graph microbatches.
+#
+# Start as a manual curriculum continuation from the completed graph S2 run:
+#
+#   uv run hexo-klent train \
+#     --config configs/klent/axis-gine/s4.toml \
+#     --resume runs/klent/reference-s2/checkpoints/final.pt \
+#     --iterations 80 \
+#     --tui
+#
+# Continue this output later with the ordinary `--resume latest`.
+
+[model]
+architecture = "graph"
+
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 8
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.03
+beta = 0.10
+tau = 8.0
+
+[collection]
+positions_per_iteration = 131_072
+# Four actors own 128 live games each.  On the actual 131k S2 -> S4
+# generation, 512 lanes / batch 256 collected 322 pos/s versus 268 pos/s at
+# 256 / 128, while retaining more host-memory headroom. Terminal-only
+# collection now drains these lanes instead of bootstrapping them, so 512 is
+# the intentional ceiling on drain-tail overshoot rather than a value to scale
+# without limit. The edge budget still caps physical GPU graph batches.
+parallel_games = 512
+inference_batch_size = 256
+# The earlier graph S2 replay found that 500k reduced splitting but slowed
+# collection relative to 250k. Keep inference independently at that measured
+# knee; the FIT investigation in this change concerns training.edge_budget.
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 2_048
+# Matched compact-S4 sweeps put 200k and 250k at the throughput plateau.
+# 250k removes one physical pass per 512 equivalent positions; 500k and 1M
+# reduce splitting further but are 1--4% slower and use substantially more
+# memory. This is a physical microbatch cap, not the optimizer batch size.
+edge_budget = 250_000
+policy_diagnostic_samples = 2_048
+grad_accumulation = true
+prefetch_batches = true
+# FIT-only max-autotune selects much faster Triton weight-gradient GEMMs, but
+# ragged graph row counts make runtime autotuning unsafe. Compile once from a
+# representative mid-distribution fragment instead. On the saved full-depth
+# S4 corpus this raised median FIT throughput from 122.9 to 163.4 pos/s while
+# leaving collection/inference compilation on the default dynamic path.
+fit_max_autotune = true
+fit_compile_seed_nodes = 16_384
+learning_rate = 1e-3
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 1.5
+
+[evaluation]
+interval = 10
+
+[[evaluation.opponents]]
+name = "lag_25"
+kind = "lagged"
+lag_iterations = 25
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_100"
+kind = "lagged"
+lag_iterations = 100
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "strix_jkcat_rel2_full"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00237000.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "dense_s4_230"
+kind = "checkpoint"
+checkpoint = "runs/klent/dense-from-scratch/s4/checkpoints/checkpoint_000230.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "persistent_ray_peak_60"
+kind = "checkpoint"
+checkpoint = "runs/klent/persistent-ray/s4-graft/checkpoints/checkpoint_000060.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot_r8_d2"
+kind = "sealbot"
+games = 16
+depth = 2
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+# Resuming S2 iteration 1500 without --iterations runs through 1580.
+iterations = 1_580
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/axis-gine/s4"
+checkpoint_interval = 5
+seed = 0

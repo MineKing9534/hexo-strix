@@ -22,6 +22,22 @@ def test_tui_can_be_forced_or_disabled():
     assert disabled.tui is False
 
 
+def test_resume_configured_lr_flag_is_explicit():
+    args = _parser().parse_args(
+        [
+            "train",
+            "--config",
+            str(FIXTURE),
+            "--resume",
+            "checkpoint.pt",
+            "--resume-configured-lr",
+        ]
+    )
+
+    assert args.resume == "checkpoint.pt"
+    assert args.resume_configured_lr is True
+
+
 def test_sprt_defaults_match_klent_ablation_evaluation():
     args = _parser().parse_args(
         ["sprt", "--candidate", "candidate.pt", "--opponent", "opponent.pt"]
@@ -54,6 +70,22 @@ def test_resume_latest_uses_most_recent_complete_checkpoint(tmp_path):
 def test_resume_latest_requires_an_existing_checkpoint(tmp_path):
     with pytest.raises(SystemExit, match="found no checkpoints"):
         _resolve_resume("latest", tmp_path)
+
+
+def test_resume_configured_lr_requires_resume():
+    with pytest.raises(SystemExit, match="requires --resume"):
+        main(
+            [
+                "train",
+                "--config",
+                str(FIXTURE),
+                "--resume-configured-lr",
+                "--iterations",
+                "1",
+                "--no-tensorboard",
+                "--no-tui",
+            ]
+        )
 
 
 def test_keyboard_interrupt_exits_cleanly_with_status_130(

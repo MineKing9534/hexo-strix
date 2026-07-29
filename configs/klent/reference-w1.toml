@@ -34,7 +34,7 @@ moves_scope = "node"
 win_length = 4
 placement_radius = 2
 # HeXO has no draws. Positions still alive after this many placements are
-# truncated and bootstrapped from the final frozen-network value.
+# discarded from FIT if it ever reaches this safety horizon.
 rollout_horizon = 30
 
 [algorithm]

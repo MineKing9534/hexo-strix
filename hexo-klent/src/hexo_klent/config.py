@@ -19,6 +19,11 @@ class KlentModelConfig(ModelConfig):
 
     architecture: str = "graph"
     dense_ray_radius: int = 5
+    ray_channels: int = 12
+    ray_update_hidden: int = 48
+    ray_branch_scale: float = 1.0
+    exact_graft_init: bool = True
+    ray_after_layers: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -73,9 +78,14 @@ class TrainingConfig:
 
     batch_size: int = 256
     edge_budget: int = 250_000
+    policy_diagnostic_samples: int = 2_048
     grad_accumulation: bool = True
     prefetch_batches: bool = True
+    fit_max_autotune: bool = False
+    fit_compile_seed_nodes: int = 0
     learning_rate: float = 1e-3
+    learning_rate_warmup_iterations: int = 0
+    learning_rate_warmup_start_factor: float = 0.1
     weight_decay: float = 1e-4
     q_loss_weight: float = 1.0
     max_grad_norm: float = 1.0
@@ -89,6 +99,7 @@ class EvaluationOpponentConfig:
     kind: str = "random"
     checkpoint: str = ""
     lag_iterations: int = 0
+    best_promotion_win_rate: float = 0.55
     games: int = 64
     depth: int = 0
     placement_radius: int = 0
@@ -107,6 +118,13 @@ class EvaluationConfig:
     """Periodic evaluation against configured opponents."""
 
     interval: int = 10
+    # Fixed/lagged checkpoint matches use the same paired-opening protocol as
+    # head-to-head: sample one opening per pair, replay it with sides swapped,
+    # then disable in-tree Gumbel noise.  Random and SealBot probes retain
+    # their existing protocols.
+    opening_plies: int = 8
+    opening_temperature: float = 0.5
+    opening_generator: str = "alternate"
     opponents: list[EvaluationOpponentConfig] = field(
         default_factory=_default_evaluation_opponents
     )
@@ -189,6 +207,9 @@ def _load_evaluation_section(raw: Any) -> EvaluationConfig:
         ]
     return EvaluationConfig(
         interval=raw.get("interval", 10),
+        opening_plies=raw.get("opening_plies", 8),
+        opening_temperature=raw.get("opening_temperature", 0.5),
+        opening_generator=raw.get("opening_generator", "alternate"),
         opponents=opponents,
     )
 
@@ -228,11 +249,12 @@ def _validate(cfg: Config) -> None:
         )
     if (
         cfg.collection.dense_position_cell_limit > 0
-        and cfg.model.architecture != "dense_axis"
+        and cfg.model.architecture
+        not in {"dense_axis", "persistent_ray_axis"}
     ):
         raise ValueError(
             "collection.dense_position_cell_limit is only valid for "
-            "model.architecture='dense_axis'"
+            "dense raster model architectures"
         )
     if cfg.collection.workers <= 0:
         raise ValueError("collection.workers must be positive")
@@ -242,8 +264,22 @@ def _validate(cfg: Config) -> None:
         raise ValueError("training.batch_size must be positive")
     if cfg.training.edge_budget < 0:
         raise ValueError("training.edge_budget cannot be negative")
+    if cfg.training.policy_diagnostic_samples < 0:
+        raise ValueError(
+            "training.policy_diagnostic_samples cannot be negative"
+        )
+    if cfg.training.fit_compile_seed_nodes < 0:
+        raise ValueError("training.fit_compile_seed_nodes cannot be negative")
     if cfg.training.learning_rate <= 0:
         raise ValueError("training.learning_rate must be positive")
+    if cfg.training.learning_rate_warmup_iterations < 0:
+        raise ValueError(
+            "training.learning_rate_warmup_iterations cannot be negative"
+        )
+    if not 0 <= cfg.training.learning_rate_warmup_start_factor <= 1:
+        raise ValueError(
+            "training.learning_rate_warmup_start_factor must be in [0, 1]"
+        )
     if cfg.training.q_loss_weight < 0:
         raise ValueError("training.q_loss_weight cannot be negative")
     if cfg.run.iterations <= 0:
@@ -254,6 +290,20 @@ def _validate(cfg: Config) -> None:
         raise ValueError("run.precision must be 'float32' or 'bf16'")
     if cfg.evaluation.interval < 0:
         raise ValueError("evaluation interval cannot be negative")
+    if cfg.evaluation.opening_plies < 0:
+        raise ValueError("evaluation opening_plies cannot be negative")
+    if cfg.evaluation.opening_temperature <= 0:
+        raise ValueError("evaluation opening_temperature must be positive")
+    if cfg.evaluation.opening_generator not in {
+        "alternate",
+        "a",
+        "b",
+        "champion",
+    }:
+        raise ValueError(
+            "evaluation opening_generator must be 'alternate', 'a', 'b', "
+            "or 'champion'"
+        )
     opponent_names: set[str] = set()
     for opponent in cfg.evaluation.opponents:
         if opponent.kind not in {
@@ -261,6 +311,7 @@ def _validate(cfg: Config) -> None:
             "sealbot",
             "checkpoint",
             "lagged",
+            "best_so_far",
         }:
             raise ValueError(
                 f"unknown evaluation opponent kind: {opponent.kind}"
@@ -278,20 +329,52 @@ def _validate(cfg: Config) -> None:
         opponent_names.add(opponent_name)
         if opponent.games <= 0:
             raise ValueError("evaluation opponent games must be positive")
+        if (
+            cfg.evaluation.opening_plies > 0
+            and opponent.kind in {
+                "checkpoint",
+                "lagged",
+                "best_so_far",
+            }
+            and opponent.games % 2 != 0
+        ):
+            raise ValueError(
+                "paired-opening checkpoint evaluation requires an even "
+                "number of games"
+            )
+        if (
+            cfg.evaluation.opening_plies > 0
+            and opponent.kind in {
+                "checkpoint",
+                "lagged",
+                "best_so_far",
+            }
+            and cfg.evaluation.opening_plies >= cfg.game.rollout_horizon
+        ):
+            raise ValueError(
+                "evaluation opening_plies must be below the rollout horizon"
+            )
         if opponent.kind == "sealbot" and opponent.depth <= 0:
             raise ValueError("SealBot evaluation depth must be positive")
         if opponent.kind != "sealbot" and opponent.depth != 0:
             raise ValueError(
                 "evaluation depth is only supported for SealBot"
             )
-        if opponent.kind == "checkpoint" and not opponent.checkpoint:
+        if (
+            opponent.kind in {"checkpoint", "best_so_far"}
+            and not opponent.checkpoint
+        ):
             raise ValueError(
-                "checkpoint evaluation opponent requires a checkpoint path"
+                f"{opponent.kind} evaluation opponent requires a "
+                "checkpoint path"
             )
-        if opponent.kind != "checkpoint" and opponent.checkpoint:
+        if (
+            opponent.kind not in {"checkpoint", "best_so_far"}
+            and opponent.checkpoint
+        ):
             raise ValueError(
                 "evaluation checkpoint is only supported for checkpoint "
-                "opponents"
+                "and best_so_far opponents"
             )
         if opponent.kind == "lagged" and opponent.lag_iterations <= 0:
             raise ValueError(
@@ -301,6 +384,13 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 "evaluation lag_iterations is only supported for lagged "
                 "opponents"
+            )
+        if (
+            opponent.kind == "best_so_far"
+            and not 0.5 <= opponent.best_promotion_win_rate <= 1.0
+        ):
+            raise ValueError(
+                "best_so_far promotion win rate must be in [0.5, 1]"
             )
         if opponent.placement_radius < 0:
             raise ValueError(
@@ -323,13 +413,13 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 "evaluation opponent opponent_mcts_actions must be positive"
             )
-        if opponent.kind != "checkpoint" and (
+        if opponent.kind not in {"checkpoint", "best_so_far"} and (
             opponent.opponent_mcts_simulations != 0
             or opponent.opponent_mcts_actions != 16
         ):
             raise ValueError(
                 "opponent-side MCTS settings are only supported for "
-                "checkpoint opponents"
+                "checkpoint and best_so_far opponents"
             )
     if cfg.model.num_layers <= 0:
         raise ValueError("model.num_layers must be positive")
@@ -337,16 +427,25 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             "model.axis_window must be at least game.win_length - 1"
         )
-    if cfg.model.architecture not in {"graph", "dense_axis"}:
+    if cfg.model.architecture not in {
+        "graph",
+        "dense_axis",
+        "persistent_ray_axis",
+    }:
         raise ValueError(
-            "model.architecture must be 'graph' or 'dense_axis'"
+            "model.architecture must be 'graph', 'dense_axis', or "
+            "'persistent_ray_axis'"
         )
     if not 1 <= cfg.model.dense_ray_radius <= 5:
         raise ValueError("model.dense_ray_radius must be between 1 and 5")
-    if cfg.model.architecture == "dense_axis":
+    if cfg.model.architecture in {
+        "dense_axis",
+        "persistent_ray_axis",
+    }:
+        architecture = cfg.model.architecture
         if cfg.game.win_length - 1 > cfg.model.dense_ray_radius:
             raise ValueError(
-                "dense_axis requires model.dense_ray_radius to cover "
+                f"{architecture} requires model.dense_ray_radius to cover "
                 "game.win_length - 1"
             )
         required = {
@@ -364,12 +463,32 @@ def _validate(cfg: Config) -> None:
             actual = getattr(cfg.model, name)
             if actual != expected:
                 raise ValueError(
-                    f"dense_axis requires model.{name}={expected!r}, "
+                    f"{architecture} requires model.{name}={expected!r}, "
                     f"got {actual!r}"
                 )
         if cfg.model.use_jk and cfg.model.jk_mode not in {"sum", "cat"}:
             raise ValueError(
-                "dense_axis supports JK modes 'sum' and 'cat'"
+                f"{architecture} supports JK modes 'sum' and 'cat'"
+            )
+    if cfg.model.architecture == "persistent_ray_axis":
+        if cfg.model.ray_channels <= 0:
+            raise ValueError("model.ray_channels must be positive")
+        if cfg.model.ray_update_hidden <= 0:
+            raise ValueError("model.ray_update_hidden must be positive")
+        if not math.isfinite(cfg.model.ray_branch_scale):
+            raise ValueError("model.ray_branch_scale must be finite")
+        if len(set(cfg.model.ray_after_layers)) != len(
+            cfg.model.ray_after_layers
+        ):
+            raise ValueError("model.ray_after_layers must not contain duplicates")
+        invalid_layers = [
+            layer
+            for layer in cfg.model.ray_after_layers
+            if layer < 0 or layer >= cfg.model.num_layers
+        ]
+        if invalid_layers:
+            raise ValueError(
+                "model.ray_after_layers entries must be valid layer indices"
             )
 
 
