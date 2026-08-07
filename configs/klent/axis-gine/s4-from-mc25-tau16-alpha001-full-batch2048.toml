@@ -1,0 +1,188 @@
+# Full joint KLENT continuation after the protected Monte Carlo warm-up.
+#
+# Checkpoint selection was based on matched 64/16 forcing-off games with
+# paired 8-ply openings and colour-swapped replay. Generation 25 of the
+# lambda=1, terminal-only, heads-only arm preserved the protected generation
+# 20 anchor (197-185, +11 Elo, 95% CI [-24, +46], non-inferiority LLR 3.11).
+# Generation 125 did not (38-74, -115 Elo, LLR -3.04), so extending the MC
+# policy fit further is explicitly rejected even though its local critic
+# calibration remained healthy.
+#
+# This stage changes only the intended algorithmic transition:
+#   * tau inf -> 16 (lambda ~= 0.939; about eight two-placement HeXO turns),
+#   * shared trunk updates off -> on.
+# It retains terminal-only on-policy collection, alpha=0.01, batch 2,048,
+# 131k target positions, LR 5e-5, and unclipped finite-guarded optimization.
+# The first five resumed generations ramp LR from 0.1x to 1.0x because the
+# trunk and its AdamW moments have been frozen since the earlier stage.
+# Generation 50 is the first 25-generation observational gate. The run now
+# continues through generation 500 after recovering against both fixed Strix
+# checkpoints by generation 195; the longer horizon lets us distinguish that
+# trend from noisy short evaluation windows and transient entropy cycles.
+# Checkpoint every generation for this unattended run: at roughly 8 MiB each,
+# the complete stage costs about 3.8 GiB and bounds recovery loss to the
+# currently active generation.
+#
+#   .venv/bin/hexo-klent train \
+#     --config configs/klent/axis-gine/s4-from-mc25-tau16-alpha001-full-batch2048.toml \
+#     --resume runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-heads-only-batch2048-from-qhead20/checkpoints/checkpoint_000025.pt \
+#     --resume-configured-lr \
+#     --tui
+
+[model]
+architecture = "graph"
+
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 8
+rollout_horizon = 500
+
+[algorithm]
+alpha = 0.01
+beta = 0.10
+tau = 16.0
+
+[collection]
+positions_per_iteration = 131_072
+parallel_games = 512
+inference_batch_size = 256
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 2_048
+edge_budget = 250_000
+policy_diagnostic_samples = 2_048
+grad_accumulation = true
+prefetch_batches = true
+fit_max_autotune = true
+fit_compile_seed_nodes = 16_384
+learning_rate = 5e-5
+learning_rate_warmup_iterations = 5
+learning_rate_warmup_start_iteration = 25
+learning_rate_warmup_start_factor = 0.1
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 0.0
+critic_head_only = false
+heads_only = false
+
+[evaluation]
+interval = 20
+opening_plies = 8
+opening_temperature = 0.5
+opening_generator = "alternate"
+
+[[evaluation.opponents]]
+name = "source_d6_qhead_215547"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "mc_start_gen25"
+kind = "checkpoint"
+checkpoint = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-heads-only-batch2048-from-qhead20/checkpoints/checkpoint_000025.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "protected_qhead20"
+kind = "checkpoint"
+checkpoint = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-qhead-only-from10/checkpoints/checkpoint_000020.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "best_so_far"
+kind = "best_so_far"
+checkpoint = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-heads-only-batch2048-from-qhead20/checkpoints/checkpoint_000025.pt"
+best_promotion_win_rate = 0.55
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "strix_jkcat_rel2_full"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00237000.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_5"
+kind = "lagged"
+lag_iterations = 5
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot_r8_d2"
+kind = "sealbot"
+games = 8
+depth = 2
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot_r8_d4"
+kind = "sealbot"
+games = 8
+depth = 4
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+iterations = 500
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/axis-gine/s4-from-mc25-tau16-alpha001-full-batch2048"
+checkpoint_interval = 1
+seed = 0

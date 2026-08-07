@@ -95,6 +95,48 @@ ramps a generation-level learning rate from
 configured rate. The applied value is recorded as `training/learning_rate` in
 JSONL and TensorBoard. Because it is derived from the committed iteration,
 ordinary checkpoint resume requires no separate scheduler state.
+`training.learning_rate_warmup_start_iteration` may be set to the iteration of
+a checkpoint that begins a new training stage; the following generation then
+becomes warm-up step one. This is useful when re-enabling a previously frozen
+trunk without renumbering checkpoints. Its default of zero preserves the
+fresh-run schedule.
+
+For a protected Monte Carlo critic warm-up, set
+`training.critic_head_only = true` together with `algorithm.tau = inf` and
+terminal-only collection. FIT then updates only `model.q_head`; the raw policy
+head and shared representation are frozen bit-for-bit. AdamW also leaves their
+weight decay and moment state untouched because frozen parameters have no
+gradient. This is an opt-in calibration phase rather than the reference joint
+KLENT update. Resume its checkpoint under an ordinary config to re-enable the
+full shared policy/Q fit.
+
+For a shared-representation isolation ablation, set
+`training.heads_only = true`. FIT then updates both `model.policy_head` and
+`model.q_head`, while the shared trunk and its AdamW moments remain bit-for-bit
+frozen. This distinguishes harmful policy/Q targets from destructive shared-
+feature movement; it is not the reference joint KLENT update. It is mutually
+exclusive with `training.critic_head_only`.
+
+### Sparse fixed-search Q ablation
+
+The reference KLENT objective supervises Q only for the played action. Set
+`training.search_q_teacher_samples` above zero to run an explicitly opt-in
+stability ablation that also labels alternative root actions visited by a
+deterministic Gumbel search from `training.search_q_teacher_checkpoint`.
+`search_q_teacher_simulations`, `search_q_teacher_actions`, and
+`search_q_teacher_root_batch_size` set its search budget. Root Gumbel noise and
+the forcing solver are disabled. The played action always retains its genuine
+terminal TD(lambda) target; fixed-search completed-Q is attached only to
+unplayed visited actions.
+
+The auxiliary labels participate in the normal joint policy/Q FIT, where they
+can teach the shared representation. An optional
+`search_q_teacher_refit_epochs` then freezes the policy head and shared trunk
+and applies Q-only correction passes to the same labelled positions. This
+prevents the correction itself from rewriting policy logits. Zero teacher
+samples and zero refit epochs preserve the historical KLENT path. This is a
+controlled deviation from the paper objective, so playing-strength conclusions
+still require matched fixed-opponent evaluation.
 
 KLENT's test-time MCTS adapter follows Appendix M of the paper and reconstructs
 the state value as the raw learned-policy expectation
@@ -366,6 +408,11 @@ the JSONL record.
 | `collection/mean_abs_q` | Per-position mean absolute predicted Q across all legal actions, then averaged equally across positions. |
 | `collection/mean_q_span` | Per-position `max(Q) - min(Q)` across legal actions, then averaged. A small span means the Q head sees little separation between available moves, irrespective of its absolute value scale. |
 | `collection/mean_abs_return` | Mean absolute TD(lambda) return for terminal-game sampled actions. |
+| `collection/played_q_outcome_positions` | Genuinely terminal on-policy positions used for the zero-extra-forward critic calibration diagnostic. Truncated games and legacy samples without a frozen played-action Q are excluded. |
+| `collection/played_q_outcome_mse`, `..._mae`, `..._bias` | Error between the frozen critic's Q for the action actually sampled and the eventual `+1/-1` winner from that acting player's perspective. Bias is `mean(Q - outcome)`. MSE includes irreducible game-outcome variance, so compare its trajectory and matched checkpoints rather than expecting zero. |
+| `collection/played_q_outcome_sign_accuracy`, `..._pearson_r` | Sign agreement and Pearson correlation between played-action Q and terminal outcome. These measure discrimination, not probability calibration by themselves. |
+| `collection/played_q_outcome_calibration_slope`, `..._calibration_intercept` | Least-squares terminal outcome fit `outcome ~= intercept + slope * Q`. A slope near one and intercept near zero are desirable, but must be read with MSE, bias, and strength evaluation. |
+| `collection/opening_played_q_outcome_*` | The same diagnostics restricted to each game's first 16 placements (eight ordinary two-placement HeXO turns). This prevents plentiful terminal-adjacent positions from hiding a poorly propagated opening critic. The TUI displays all-position/opening MSE and slope as `ALL / OPEN`. |
 | `collection/mean_abs_bootstrap_value` | Legacy compatibility metric. Terminal-only collection records zero. |
 | `collection/worker_processes` | CPU actor processes participating in the chunk. |
 | `collection/elapsed_seconds` | Collection wall time. |
@@ -405,6 +452,7 @@ on the number of legal actions and the configured `alpha` and `beta`.
 | Metric | Meaning |
 | --- | --- |
 | `training/examples` | Fresh positions fitted once during the epoch. Normally equal to `collection/positions`. |
+| `training/q_labels` | Q targets consumed by the joint FIT. Ordinary KLENT has one played-action terminal target per example. The sparse search-Q ablation adds unplayed visited-action labels. |
 | `training/microbatches` | Edge-budgeted graph batches sent through the model. |
 | `training/optimizer_steps` | AdamW updates. With accumulation enabled, normally `ceil(examples / training.batch_size)`. |
 | `training/mean_microbatch_size` | Mean positions in one edge-budgeted model batch. |
@@ -423,13 +471,24 @@ on the number of legal actions and the configured `alpha` and `beta`.
 | `training/policy_target_progress` | `1 - policy_target_kl_after / policy_target_kl_before`, displayed as **target retention**. Positive values mean the frozen target gap shrank; negative values mean the joint update rewrote the policy away from that old target. This is a diagnostic of alternating policy/Q optimization and does not independently affect TUI health. It is reported as zero when the pre-fit gap is numerically zero. |
 | `training/policy_target_top1_agreement_before`, `policy_target_top1_agreement_after` | Fraction of diagnostic positions where the raw policy and stored improved-policy target choose the same top action, before and after FIT. This distinguishes argmax rewrites from KL movement confined to lower-ranked probability mass. |
 | `training/policy_target_top1_agreement_delta` | Post-fit minus pre-fit top-action agreement. This is still a target-fit signal, not a direct strength measurement. |
-| `training/q_loss` | MSE between the played action's Q prediction and its TD(lambda) return. Unplayed actions receive no direct Q regression target. |
-| `training/total_loss` | `policy_loss + q_loss_weight * q_loss`. |
-| `training/trunk_gradient_diagnostic_examples` | Positions in the deterministic post-fit diagnostic slice used to compare the two objectives on the shared representation. Gradients are accumulated as an example-weighted mean across every edge-budgeted microbatch; this diagnostic does not update parameters or optimizer state. |
+| `training/q_loss` | Mean Q-target MSE. In ordinary KLENT this is the played action against its TD(lambda) return. With sparse search-Q enabled it also includes the fixed teacher's unplayed visited actions, normalized over Q labels rather than states. |
+| `training/total_loss` | The optimized scalar: normally `policy_loss + q_loss_weight * q_loss`; in critic-head-only mode it is `q_loss_weight * q_loss`. Heads-only mode retains the normal joint head loss. |
+| `training/critic_head_only` | `1` when FIT protected the policy and shared representation and updated only the action-Q head; otherwise `0`. |
+| `training/heads_only` | `1` when FIT updated the policy and Q heads while preserving the shared representation; otherwise `0`. |
+| `training/policy_updates_enabled` | `0` in critic-head-only mode and `1` for ordinary joint KLENT FIT. `training/policy_loss` remains available as a diagnostic even when it is not optimized. |
+| `training/shared_trunk_updates_enabled` | `0` in critic-head-only and heads-only modes; `1` for ordinary joint KLENT FIT. |
+| `training/trunk_gradient_diagnostic_examples`, `training/trunk_gradient_diagnostic_q_labels` | Positions and Q labels in the deterministic post-fit diagnostic slice used to compare the two objectives on the shared representation. Policy gradients are state-weighted; Q gradients are Q-label-weighted. This diagnostic does not update parameters or optimizer state. Both counts are zero in critic-head-only and heads-only modes because the trunk was deliberately frozen and no trunk interaction occurred. |
 | `training/trunk_gradient_diagnostic_seconds` | Wall time of the extra policy/Q trunk-gradient diagnostic. It performs two backwards per edge-budgeted microbatch in the diagnostic slice. |
 | `training/policy_trunk_grad_norm` | L2 norm of the collection-wide mean policy-loss gradient over shared-trunk parameters; policy-head parameters are excluded. |
 | `training/q_trunk_grad_norm` | L2 norm of the configured `q_loss_weight * q_loss` collection-wide mean gradient over the same shared-trunk parameters. This makes its magnitude directly comparable with `policy_trunk_grad_norm`. |
 | `training/policy_q_trunk_grad_cosine` | Cosine similarity between the policy and weighted-Q shared-trunk gradients after averaging across the diagnostic slice. Positive values mean the objectives agree in aggregate, values near zero mean mostly independent directions, and negative values expose net trunk-gradient conflict. This is a sampled post-fit diagnostic rather than an optimizer-step average. |
+| `training/search_q_teacher_states`, `training/search_q_teacher_auxiliary_labels` | Deterministically sampled on-policy roots and unplayed completed-Q labels attached by the fixed search teacher. |
+| `training/search_q_teacher_q_mse_before`, `..._after_fit`, `..._after` | Held auxiliary-action Q MSE before joint FIT, immediately after joint FIT, and after the optional Q-head-only refit. The TUI abbreviates these as **B/F/A**. |
+| `training/search_q_teacher_q_correlation_before`, `..._after_fit`, `..._after` | Population correlation between the current Q predictions and fixed-teacher completed-Q labels at the same three phase boundaries. |
+| `training/search_q_teacher_q_mse_fit_progress` | `1 - after_fit / before`. Negative means the joint update moved alternative-action Q farther from the fixed anchor. |
+| `training/search_q_teacher_q_mse_refit_progress` | `1 - after / after_fit`. Positive means the Q-only correction recovered some of the joint FIT drift. Emitted only when refitting is enabled. |
+| `training/search_q_teacher_q_mse_progress` | `1 - after / before`, displayed as **Q anchor retention**. Positive means the complete generation ended closer to the fixed search-Q labels. This is an anchor diagnostic, not a strength result. |
+| `training/search_q_teacher_refit_*` | Cost, label applications, optimizer steps, gradients, clipping, and Q-head parameter movement for the optional frozen-trunk correction. Label count includes repeated applications across refit epochs. |
 | `training/mean_grad_norm` | Optimizer-step mean of the total gradient norm before clipping. |
 | `training/grad_norm_p50`, `grad_norm_p95`, `grad_norm_max` | Median, 95th percentile, and maximum pre-clipping total gradient norm across optimizer steps. |
 | `training/clipped_optimizer_steps` | Number of optimizer steps whose raw gradient norm exceeded `training.max_grad_norm`; zero when clipping is disabled. |

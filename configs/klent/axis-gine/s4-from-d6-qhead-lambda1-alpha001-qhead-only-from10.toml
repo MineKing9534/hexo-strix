@@ -1,18 +1,18 @@
-# Monte Carlo critic-calibration arm forked from generation 10 of the fresh
-# tau=16, alpha=0.01, unclipped Axis-GINE run. This is matched to the completed
-# batch-256 arm except that tau=inf makes lambda=exp(-1/tau) exactly 1.0.
-# Every FIT sample now comes from a naturally completed game, so lambda=1 gives
-# a full terminal Monte Carlo return at every played action. The position count
-# is a soft budget; live games drain to a winner before fitting begins.
+# Protected Monte Carlo critic-calibration arm forked from generation 10 of
+# the fresh tau=16, alpha=0.01, unclipped Axis-GINE run. This is matched to the
+# failed joint lambda=1 batch-256 arm except that FIT updates only the action-Q
+# head. The policy head, shared representation, their AdamW moments, and their
+# weight decay remain bit-for-bit frozen.
 #
-# The first ten-generation diagnostic was too short to distinguish a transient
-# policy dip from critic calibration. Continue through generation 50, retaining
-# checkpoints every five generations and evaluating against both the production
-# source and the fixed generation-10 fork point. Do not lower lambda until the
-# held terminal-return calibration and matched strength trajectory agree.
+# Every FIT sample comes from a naturally completed game. With tau=inf, every
+# played-action Q label is the full terminal Monte Carlo outcome. This tests
+# critic calibration without permitting the strong grafted policy to collapse
+# before the critic is ready. If held terminal calibration improves, resume the
+# resulting checkpoint under an ordinary joint-KLENT config to re-enable all
+# model parameters.
 #
 #   uv run hexo-klent train \
-#     --config configs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-noclip-lr5e5-batch256-from10.toml \
+#     --config configs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-qhead-only-from10.toml \
 #     --resume runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt \
 #     --resume-configured-lr \
 #     --tui
@@ -51,8 +51,6 @@ rollout_horizon = 300
 [algorithm]
 alpha = 0.01
 beta = 0.10
-# Python's TOML parser accepts IEEE infinity. The configured mapping then gives
-# exp(-1 / inf) = 1.0 without approximating Monte Carlo with a very large tau.
 tau = inf
 
 [collection]
@@ -75,6 +73,7 @@ learning_rate = 5e-5
 weight_decay = 1e-4
 q_loss_weight = 1.0
 max_grad_norm = 0.0
+critic_head_only = true
 
 [evaluation]
 interval = 5
@@ -155,10 +154,10 @@ mcts_simulations = 24
 mcts_actions = 8
 
 [run]
-iterations = 50
+iterations = 20
 device = "cuda"
 precision = "bf16"
 compile = true
-output_dir = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-noclip-lr5e5-batch256-terminal-from10"
+output_dir = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-qhead-only-from10"
 checkpoint_interval = 5
 seed = 0

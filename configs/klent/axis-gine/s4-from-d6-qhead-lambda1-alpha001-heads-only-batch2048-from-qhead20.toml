@@ -1,23 +1,25 @@
-# Monte Carlo critic-calibration arm forked from generation 10 of the fresh
-# tau=16, alpha=0.01, unclipped Axis-GINE run. This is matched to the completed
-# batch-256 arm except that tau=inf makes lambda=exp(-1/tau) exactly 1.0.
-# Every FIT sample now comes from a naturally completed game, so lambda=1 gives
-# a full terminal Monte Carlo return at every played action. The position count
-# is a soft budget; live games drain to a winner before fitting begins.
+# Lower-update-density policy/Q-head isolation arm.
 #
-# The first ten-generation diagnostic was too short to distinguish a transient
-# policy dip from critic calibration. Continue through generation 50, retaining
-# checkpoints every five generations and evaluating against both the production
-# source and the fixed generation-10 fork point. Do not lower lambda until the
-# held terminal-return calibration and matched strength trajectory agree.
+# This is identical to the batch-256 heads-only arm except for the effective
+# optimizer batch: 256 -> 2,048. With roughly 131k+ retained terminal positions
+# per generation, that reduces the number of AdamW policy-head updates by about
+# eightfold while retaining the same on-policy data, lambda=1 Monte Carlo
+# targets, alpha, learning rate, frozen shared trunk, and evaluation protocol.
+# It also shortens FIT, making it the hardware-efficient test of whether the
+# 41.5% policy-head displacement seen over ten batch-256 generations was simply
+# too much target fitting per policy refresh. Generations 20-50 remained
+# numerically stable, retained exact trunk weights, and showed no recurrence of
+# the rapid policy collapse. Because the grafted anchor is already very strong
+# and the matched strength estimates over this short window remain noisy, the
+# same training regime now continues unchanged through generation 200. Periodic
+# evaluation is reduced to every 25 generations so the longer run spends its
+# time collecting and fitting rather than repeating small 32-game samples.
 #
-#   uv run hexo-klent train \
-#     --config configs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-noclip-lr5e5-batch256-from10.toml \
-#     --resume runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt \
+#   .venv/bin/hexo-klent train \
+#     --config configs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-heads-only-batch2048-from-qhead20.toml \
+#     --resume runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-qhead-only-from10/checkpoints/checkpoint_000020.pt \
 #     --resume-configured-lr \
 #     --tui
-#
-# Continue the same output later with the ordinary `--resume latest`.
 
 [model]
 architecture = "graph"
@@ -51,8 +53,6 @@ rollout_horizon = 300
 [algorithm]
 alpha = 0.01
 beta = 0.10
-# Python's TOML parser accepts IEEE infinity. The configured mapping then gives
-# exp(-1 / inf) = 1.0 without approximating Monte Carlo with a very large tau.
 tau = inf
 
 [collection]
@@ -64,7 +64,7 @@ workers = 4
 batch_timeout_ms = 2.0
 
 [training]
-batch_size = 256
+batch_size = 2_048
 edge_budget = 250_000
 policy_diagnostic_samples = 2_048
 grad_accumulation = true
@@ -75,9 +75,10 @@ learning_rate = 5e-5
 weight_decay = 1e-4
 q_loss_weight = 1.0
 max_grad_norm = 0.0
+heads_only = true
 
 [evaluation]
-interval = 5
+interval = 25
 opening_plies = 8
 opening_temperature = 0.5
 opening_generator = "alternate"
@@ -105,9 +106,20 @@ opponent_mcts_simulations = 24
 opponent_mcts_actions = 8
 
 [[evaluation.opponents]]
+name = "heads_start_qhead20"
+kind = "checkpoint"
+checkpoint = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-qhead-only-from10/checkpoints/checkpoint_000020.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
 name = "best_so_far"
 kind = "best_so_far"
-checkpoint = "runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt"
+checkpoint = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-qhead-only-from10/checkpoints/checkpoint_000020.pt"
 best_promotion_win_rate = 0.55
 games = 32
 placement_radius = 8
@@ -155,10 +167,10 @@ mcts_simulations = 24
 mcts_actions = 8
 
 [run]
-iterations = 50
+iterations = 200
 device = "cuda"
 precision = "bf16"
 compile = true
-output_dir = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-noclip-lr5e5-batch256-terminal-from10"
+output_dir = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-heads-only-batch2048-from-qhead20"
 checkpoint_interval = 5
 seed = 0

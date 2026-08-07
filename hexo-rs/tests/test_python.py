@@ -1,6 +1,7 @@
 """Tests for the hexo_rs Python bindings (PyO3)."""
 
 import copy
+import math
 
 import pytest
 
@@ -408,6 +409,39 @@ class TestBatchedGumbelMcts:
         r2 = hexo_rs.batched_gumbel_mcts([g], self._dummy_eval, mcts, seed=42)
         assert r1 == r2
 
+    def test_diagnostics_are_aligned_and_preserve_root_budget(self):
+        cfg, _ = self._cfgs()
+        mcts = hexo_rs.MCTSConfig(
+            n_simulations=4,
+            m_actions=4,
+            c_visit=50,
+            c_scale=1.0,
+            disable_gumbel_noise=True,
+            disable_forcing_solver=True,
+        )
+        games = []
+        for first in ((1, 0), (1, 1)):
+            game = hexo_rs.GameState(cfg)
+            game.apply_move(*first)
+            games.append(game)
+
+        results = hexo_rs.batched_gumbel_mcts_with_diagnostics(
+            games, self._dummy_eval, mcts, seed=17
+        )
+        assert len(results) == len(games)
+        for result, game in zip(results, games, strict=True):
+            action, policy, visits, q_values, priors, candidates = result
+            legal = game.legal_moves()
+            assert tuple(action) in legal
+            assert len(policy) == len(legal)
+            assert len(visits) == len(legal)
+            assert len(q_values) == len(legal)
+            assert len(priors) == len(legal)
+            assert len(candidates) == min(4, len(legal))
+            assert sum(visits) == 4
+            assert sum(priors) == pytest.approx(1.0)
+            assert all(math.isfinite(value) for value in q_values)
+
     def test_terminal_state_rejected(self):
         cfg, mcts = self._cfgs()
         g = hexo_rs.GameState(cfg)
@@ -423,7 +457,16 @@ class TestBatchedGumbelMcts:
             hexo_rs.batched_gumbel_mcts([g], self._dummy_eval, mcts, seed=1)
 
     def test_eval_exception_propagates(self):
-        cfg, mcts = self._cfgs()
+        cfg, _ = self._cfgs()
+        # The forcing shortcut may prove this tiny position without invoking
+        # the evaluator. Disable it so this test exercises callback errors.
+        mcts = hexo_rs.MCTSConfig(
+            n_simulations=4,
+            m_actions=4,
+            c_visit=50,
+            c_scale=1.0,
+            disable_forcing_solver=True,
+        )
         g = hexo_rs.GameState(cfg)
         g.apply_move(1, 0)
 

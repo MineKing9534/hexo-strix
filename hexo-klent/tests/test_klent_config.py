@@ -25,9 +25,18 @@ def test_config_fixture_loads_algorithm_collection_and_model():
     assert config.training.fit_max_autotune is False
     assert config.training.fit_compile_seed_nodes == 0
     assert config.training.learning_rate_warmup_iterations == 0
+    assert config.training.learning_rate_warmup_start_iteration == 0
     assert config.training.learning_rate_warmup_start_factor == pytest.approx(
         0.1
     )
+    assert config.training.critic_head_only is False
+    assert config.training.heads_only is False
+    assert config.training.search_q_teacher_samples == 0
+    assert config.training.search_q_teacher_checkpoint == ""
+    assert config.training.search_q_teacher_simulations == 32
+    assert config.training.search_q_teacher_actions == 8
+    assert config.training.search_q_teacher_root_batch_size == 16
+    assert config.training.search_q_teacher_refit_epochs == 0
     assert config.run.compile is False
 
 
@@ -113,6 +122,45 @@ def test_policy_diagnostic_sample_count_cannot_be_negative(tmp_path):
         load_config(path)
 
 
+def test_protected_training_modes_are_mutually_exclusive(tmp_path):
+    path = tmp_path / "conflicting-protected-modes.toml"
+    path.write_text(
+        "[training]\ncritic_head_only = true\nheads_only = true\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        load_config(path)
+
+
+def test_search_q_teacher_requires_a_checkpoint_when_enabled(tmp_path):
+    path = tmp_path / "missing-search-q-teacher.toml"
+    path.write_text(
+        "[training]\nsearch_q_teacher_samples = 16\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="search_q_teacher_samples requires search_q_teacher_checkpoint",
+    ):
+        load_config(path)
+
+
+def test_search_q_refit_requires_search_q_samples(tmp_path):
+    path = tmp_path / "search-q-refit-without-labels.toml"
+    path.write_text(
+        "[training]\nsearch_q_teacher_refit_epochs = 1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="search_q_teacher_refit_epochs requires search_q_teacher_samples",
+    ):
+        load_config(path)
+
+
 @pytest.mark.parametrize(
     ("setting", "value", "message"),
     [
@@ -120,6 +168,11 @@ def test_policy_diagnostic_sample_count_cannot_be_negative(tmp_path):
             "learning_rate_warmup_iterations",
             "-1",
             "learning_rate_warmup_iterations cannot be negative",
+        ),
+        (
+            "learning_rate_warmup_start_iteration",
+            "-1",
+            "learning_rate_warmup_start_iteration cannot be negative",
         ),
         (
             "learning_rate_warmup_start_factor",

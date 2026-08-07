@@ -23,6 +23,14 @@ pub struct BatchedMCTSResult {
     pub action: Coord,
     pub improved_policy: Vec<f64>,
     pub coords: Vec<Coord>,
+    /// Root child visits aligned with `coords`.
+    pub visit_counts: Vec<u32>,
+    /// Completed root-child Q values from the root player's perspective.
+    pub per_child_q: Vec<f64>,
+    /// Root network prior aligned with `coords`.
+    pub per_child_prior: Vec<f64>,
+    /// Indices of the root candidates admitted to sequential halving.
+    pub candidate_indices: Vec<usize>,
 }
 
 /// Per-search state held between phases.
@@ -30,6 +38,7 @@ struct SearchState {
     root: MCTSNode,
     coords: Vec<Coord>,
     logits: Vec<f64>,
+    priors: Vec<f64>,
     candidate_indices: Vec<usize>,
     gumbel_samples: Vec<f64>,
     remaining: Vec<usize>,
@@ -127,17 +136,37 @@ where
                         None
                     };
                     let mut improved_policy = vec![0.0; coords.len()];
+                    let mut visit_counts = vec![0; coords.len()];
+                    let mut per_child_q = vec![0.0; coords.len()];
+                    let mut candidate_indices = vec![idx];
                     match pv1_idx {
                         Some(idx2) => {
                             improved_policy[idx] = 0.5;
                             improved_policy[idx2] = 0.5;
+                            visit_counts[idx] = 1;
+                            visit_counts[idx2] = 1;
+                            per_child_q[idx] = 1.0;
+                            per_child_q[idx2] = 1.0;
+                            candidate_indices.push(idx2);
                         }
-                        None => improved_policy[idx] = 1.0,
+                        None => {
+                            improved_policy[idx] = 1.0;
+                            visit_counts[idx] = 1;
+                            per_child_q[idx] = 1.0;
+                        }
                     }
                     results[pos] = Some(BatchedMCTSResult {
                         // `action` stays pv[0] (greedy determinism).
                         action: w.first_move,
                         improved_policy,
+                        // The forced solver runs before root network
+                        // evaluation in the batched fast path. Exact winning
+                        // Q labels remain valid; the unavailable prior is
+                        // represented explicitly as all zeroes.
+                        visit_counts,
+                        per_child_q,
+                        per_child_prior: vec![0.0; coords.len()],
+                        candidate_indices,
                         coords,
                     });
                     continue;
@@ -202,6 +231,7 @@ where
             root,
             coords,
             logits,
+            priors: priors_vec,
             candidate_indices,
             gumbel_samples,
             remaining,
@@ -399,10 +429,30 @@ where
         }
 
         let pos = search_pos[search_i];
+        let visit_counts = search
+            .coords
+            .iter()
+            .map(|coord| {
+                search
+                    .root
+                    .children
+                    .get(coord)
+                    .map_or(0, |child| child.visit_count)
+            })
+            .collect();
+        let per_child_q = search
+            .coords
+            .iter()
+            .map(|coord| qctx.completed_q[coord])
+            .collect();
         results[pos] = Some(BatchedMCTSResult {
             action: selected_coord,
             improved_policy,
             coords: search.coords.clone(),
+            visit_counts,
+            per_child_q,
+            per_child_prior: search.priors.clone(),
+            candidate_indices: search.candidate_indices.clone(),
         });
     }
 
@@ -574,6 +624,25 @@ mod tests {
         // n=64/m=16 sims, visits spread across more than one candidate, so
         // the improved_policy must NOT collapse to a one-hot vector.
         let quiet_result = &results[1];
+        let legal_count = quiet_game.legal_moves().len();
+        assert_eq!(quiet_result.visit_counts.len(), legal_count);
+        assert_eq!(quiet_result.per_child_q.len(), legal_count);
+        assert_eq!(quiet_result.per_child_prior.len(), legal_count);
+        assert_eq!(quiet_result.candidate_indices.len(), 16);
+        assert_eq!(
+            quiet_result.visit_counts.iter().sum::<u32>(),
+            config.n_simulations,
+            "diagnostic visits must expose the complete root budget"
+        );
+        assert!(
+            quiet_result.per_child_q.iter().all(|value| value.is_finite()),
+            "completed Q diagnostics must be finite"
+        );
+        assert!(
+            (quiet_result.per_child_prior.iter().sum::<f64>() - 1.0).abs()
+                < 1e-9,
+            "network priors must remain normalized"
+        );
         let quiet_nonzero = quiet_result
             .improved_policy
             .iter()

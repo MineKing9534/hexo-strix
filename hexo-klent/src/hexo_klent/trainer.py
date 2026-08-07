@@ -13,8 +13,9 @@ import re
 import resource
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 from torch.nn import functional as F
@@ -25,6 +26,7 @@ from hexo_klent.actor import (
     _autocast,
     collect_games_parallel,
     flatten_trajectories,
+    terminal_played_q_calibration,
 )
 from hexo_klent.batching import (
     move_batch_to_device,
@@ -46,6 +48,10 @@ from hexo_klent.model import (
     load_production_axis_weights,
     load_production_graph_weights,
     make_klent_net,
+)
+from hexo_klent.search_q_teacher import (
+    FixedCheckpointSearchQTeacher,
+    SearchQLabels,
 )
 
 if TYPE_CHECKING:
@@ -92,10 +98,18 @@ def _learning_rate_for_iteration(
 
     if iteration <= 0:
         raise ValueError("iteration must be positive")
-    warmup = training.learning_rate_warmup_iterations
-    if warmup <= 1 or iteration >= warmup:
+    relative_iteration = (
+        iteration - training.learning_rate_warmup_start_iteration
+    )
+    # A delayed warm-up is intended for a stage resumed after the configured
+    # iteration. If this config is inspected or run before that boundary, do
+    # not unexpectedly throttle the preceding stage.
+    if relative_iteration <= 0:
         return training.learning_rate
-    progress = (iteration - 1) / (warmup - 1)
+    warmup = training.learning_rate_warmup_iterations
+    if warmup <= 1 or relative_iteration >= warmup:
+        return training.learning_rate
+    progress = (relative_iteration - 1) / (warmup - 1)
     factor = training.learning_rate_warmup_start_factor + progress * (
         1.0 - training.learning_rate_warmup_start_factor
     )
@@ -388,17 +402,58 @@ def _flat_training_targets(
         output_size=target_policy.numel(),
     )
     offsets = counts.cumsum(0) - counts
-    chosen = offsets + torch.tensor(
-        [sample.action_index for sample in samples],
-        dtype=torch.long,
-    )
-    if bool((chosen < offsets).any()) or bool((chosen >= offsets + counts).any()):
-        raise ValueError("KLENT sample action index is outside its policy")
+    chosen_chunks: list[torch.Tensor] = []
+    target_q_chunks: list[torch.Tensor] = []
+    for sample_index, sample in enumerate(samples):
+        count = int(counts[sample_index].item())
+        if not 0 <= sample.action_index < count:
+            raise ValueError("KLENT sample action index is outside its policy")
+        if sample.return_target is None:
+            raise ValueError("KLENT sample has no return target")
+        relative_indices = torch.tensor(
+            [sample.action_index], dtype=torch.long
+        )
+        q_targets = torch.tensor(
+            [sample.return_target], dtype=torch.float32
+        )
 
-    target_q = torch.tensor(
-        [sample.return_target for sample in samples],
-        dtype=torch.float32,
-    )
+        auxiliary_indices = sample.auxiliary_q_action_indices
+        auxiliary_targets = sample.auxiliary_q_targets
+        if (auxiliary_indices is None) != (auxiliary_targets is None):
+            raise ValueError(
+                "auxiliary Q action indices and targets must be paired"
+            )
+        if auxiliary_indices is not None and auxiliary_targets is not None:
+            auxiliary_indices = auxiliary_indices.detach().to(
+                device="cpu", dtype=torch.long
+            ).reshape(-1)
+            auxiliary_targets = auxiliary_targets.detach().to(
+                device="cpu", dtype=torch.float32
+            ).reshape(-1)
+            if auxiliary_indices.numel() != auxiliary_targets.numel():
+                raise ValueError(
+                    "auxiliary Q action indices and targets must align"
+                )
+            if bool(
+                ((auxiliary_indices < 0) | (auxiliary_indices >= count)).any()
+            ):
+                raise ValueError("auxiliary Q action index is outside its policy")
+            if bool((auxiliary_indices == sample.action_index).any()):
+                raise ValueError(
+                    "played action must not be duplicated in auxiliary Q labels"
+                )
+            if auxiliary_indices.unique().numel() != auxiliary_indices.numel():
+                raise ValueError("auxiliary Q action indices must be unique")
+            if not bool(torch.isfinite(auxiliary_targets).all()):
+                raise ValueError("auxiliary Q targets must be finite")
+            relative_indices = torch.cat((relative_indices, auxiliary_indices))
+            q_targets = torch.cat((q_targets, auxiliary_targets))
+
+        chosen_chunks.append(offsets[sample_index] + relative_indices)
+        target_q_chunks.append(q_targets)
+
+    chosen = torch.cat(chosen_chunks)
+    target_q = torch.cat(target_q_chunks)
     target_top1 = sum(
         int(sample.target_policy.argmax().item()) == sample.action_index
         for sample in samples
@@ -498,6 +553,166 @@ def _policy_diagnostic_slice(
         samples[min(len(samples) - 1, int((index + 0.5) * stride))]
         for index in range(limit)
     ]
+
+
+def _attach_search_q_teacher_labels(
+    samples: list[TrajectoryStep],
+    labels: list[SearchQLabels],
+) -> dict[str, float]:
+    """Attach unplayed, visited-action search labels to selected samples."""
+
+    if len(samples) != len(labels):
+        raise ValueError("search-Q labels must align one-to-one with samples")
+    visited_labels = 0
+    auxiliary_labels = 0
+    legal_actions = 0
+    absolute_target_sum = 0.0
+    for sample, label in zip(samples, labels, strict=True):
+        expected_legal = sample.target_policy.numel()
+        if label.legal_actions != expected_legal:
+            raise ValueError(
+                "search-Q label legal-action count does not match sample"
+            )
+        action_indices = label.action_indices.detach().to(
+            device="cpu", dtype=torch.long
+        ).reshape(-1)
+        targets = label.targets.detach().to(
+            device="cpu", dtype=torch.float32
+        ).reshape(-1)
+        if action_indices.numel() != targets.numel():
+            raise ValueError("search-Q action indices and targets must align")
+        if action_indices.unique().numel() != action_indices.numel():
+            raise ValueError("search-Q action indices must be unique")
+        if bool(((action_indices < 0) | (action_indices >= expected_legal)).any()):
+            raise ValueError("search-Q action index is outside its policy")
+        if not bool(torch.isfinite(targets).all()):
+            raise ValueError("search-Q targets must be finite")
+
+        visited_labels += action_indices.numel()
+        legal_actions += expected_legal
+        keep = action_indices != sample.action_index
+        action_indices = action_indices[keep]
+        targets = targets[keep]
+        sample.auxiliary_q_action_indices = action_indices
+        sample.auxiliary_q_targets = targets
+        auxiliary_labels += action_indices.numel()
+        absolute_target_sum += float(targets.abs().sum().item())
+
+    return {
+        "search_q_teacher_states": float(len(samples)),
+        "search_q_teacher_visited_labels": float(visited_labels),
+        "search_q_teacher_auxiliary_labels": float(auxiliary_labels),
+        "search_q_teacher_mean_auxiliary_labels": (
+            auxiliary_labels / max(len(samples), 1)
+        ),
+        "search_q_teacher_visited_coverage": (
+            visited_labels / max(legal_actions, 1)
+        ),
+        "search_q_teacher_mean_abs_target": (
+            absolute_target_sum / max(auxiliary_labels, 1)
+        ),
+    }
+
+
+def _measure_auxiliary_q_diagnostics(
+    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+    samples: list[TrajectoryStep],
+    *,
+    model_config,
+    device: torch.device,
+    precision: str,
+    batch_size: int,
+    edge_budget: int,
+) -> dict[str, float]:
+    """Measure current Q predictions on the fixed teacher's unplayed labels."""
+
+    selected = [
+        sample
+        for sample in samples
+        if sample.auxiliary_q_action_indices is not None
+        and sample.auxiliary_q_action_indices.numel() > 0
+    ]
+    if not selected:
+        return {
+            "search_q_teacher_q_labels": 0.0,
+            "search_q_teacher_q_mse": 0.0,
+            "search_q_teacher_q_mae": 0.0,
+            "search_q_teacher_q_correlation": 0.0,
+        }
+
+    was_training = model.training
+    totals = torch.zeros(8, device=device, dtype=torch.float64)
+    fit_q_is_selected = isinstance(model, KlentNet)
+    model.eval()
+    try:
+        with torch.inference_mode():
+            for prepared in _prepared_training_batches(
+                selected,
+                batch_size=batch_size,
+                model_config=model_config,
+                edge_budget=edge_budget,
+                prefetch=False,
+            ):
+                for batch_cpu, packed_samples, packed_targets in prepared:
+                    segment_lengths_cpu = packed_targets[-1]
+                    offsets = segment_lengths_cpu.cumsum(0) - segment_lengths_cpu
+                    chosen = torch.cat(
+                        [
+                            offsets[index]
+                            + sample.auxiliary_q_action_indices.to(
+                                dtype=torch.long
+                            )
+                            for index, sample in enumerate(packed_samples)
+                        ]
+                    ).to(device)
+                    target_q = torch.cat(
+                        [
+                            sample.auxiliary_q_targets.to(dtype=torch.float32)
+                            for sample in packed_samples
+                        ]
+                    ).to(device)
+                    batch = move_batch_to_device(batch_cpu, device)
+                    with _autocast(device, precision):
+                        if fit_q_is_selected:
+                            output = model.forward_fit(batch, chosen)
+                            predicted_q = output.q_values
+                        else:
+                            output = model.forward_batch(batch)
+                            predicted_q = output.q_values.index_select(0, chosen)
+                    predicted_q = predicted_q.float()
+                    difference = predicted_q - target_q
+                    count = float(target_q.numel())
+                    totals.add_(
+                        torch.stack(
+                            (
+                                torch.tensor(count, device=device),
+                                predicted_q.sum(),
+                                target_q.sum(),
+                                predicted_q.square().sum(),
+                                target_q.square().sum(),
+                                (predicted_q * target_q).sum(),
+                                difference.square().sum(),
+                                difference.abs().sum(),
+                            )
+                        ).to(torch.float64)
+                    )
+                    del batch, chosen, target_q, output, predicted_q, difference
+    finally:
+        model.train(was_training)
+
+    values = totals.cpu().tolist()
+    count, sum_x, sum_y, sum_x2, sum_y2, sum_xy, sum_sq, sum_abs = values
+    covariance = sum_xy - sum_x * sum_y / count
+    variance_x = max(0.0, sum_x2 - sum_x * sum_x / count)
+    variance_y = max(0.0, sum_y2 - sum_y * sum_y / count)
+    denominator = math.sqrt(variance_x * variance_y)
+    correlation = covariance / denominator if denominator > 0.0 else 0.0
+    return {
+        "search_q_teacher_q_labels": count,
+        "search_q_teacher_q_mse": sum_sq / count,
+        "search_q_teacher_q_mae": sum_abs / count,
+        "search_q_teacher_q_correlation": max(-1.0, min(1.0, correlation)),
+    }
 
 
 def _stored_policy_target_kl(
@@ -630,10 +845,11 @@ def _measure_policy_q_trunk_gradients(
     This deliberately excludes both output heads. The cosine therefore
     measures whether the two losses agree about the shared representation,
     which is the only route by which the Q objective can rewrite policy
-    features. Gradients are accumulated as example-weighted means across all
-    edge-budgeted microbatches. Using the complete deterministic slice avoids
-    mistaking one small graph-shape-dependent microbatch for a generation-wide
-    interaction, while leaving the optimizer and model parameters unchanged.
+    features. Policy gradients are accumulated by state population and Q
+    gradients by supervised-action population, matching the two independently
+    normalized losses used during FIT. Using the complete deterministic slice
+    avoids mistaking one small graph-shape-dependent microbatch for a
+    generation-wide interaction, while leaving optimizer and model unchanged.
     """
 
     if not samples:
@@ -665,6 +881,7 @@ def _measure_policy_q_trunk_gradients(
             for parameter in trunk_parameters
         ]
         seen = 0
+        q_seen = 0
         fit_q_is_selected = isinstance(model, KlentNet)
         for prepared in _prepared_training_batches(
             samples,
@@ -689,6 +906,7 @@ def _measure_policy_q_trunk_gradients(
                 target_q = target_q_cpu.to(device)
                 segment_lengths = segment_lengths_cpu.to(device)
                 count = len(packed_samples)
+                q_count = target_q.numel()
 
                 def component_losses() -> tuple[torch.Tensor, torch.Tensor]:
                     # Independent calls are intentional. Compiled AOTAutograd
@@ -747,9 +965,10 @@ def _measure_policy_q_trunk_gradients(
                     if q_gradient is not None:
                         q_gradient_sums[index].add_(
                             q_gradient.detach().float(),
-                            alpha=count,
+                            alpha=q_count,
                         )
                 seen += count
+                q_seen += q_count
                 del (
                     batch,
                     target_policy,
@@ -770,13 +989,14 @@ def _measure_policy_q_trunk_gradients(
         q_sq = torch.zeros((), device=device)
         dot = torch.zeros((), device=device)
         inverse_seen = 1.0 / seen
+        inverse_q_seen = 1.0 / q_seen
         for policy_gradient, q_gradient in zip(
             policy_gradient_sums,
             q_gradient_sums,
             strict=True,
         ):
             policy_gradient.mul_(inverse_seen)
-            q_gradient.mul_(inverse_seen)
+            q_gradient.mul_(inverse_q_seen)
             policy_sq.add_(policy_gradient.square().sum())
             q_sq.add_(q_gradient.square().sum())
             dot.add_((policy_gradient * q_gradient).sum())
@@ -795,6 +1015,7 @@ def _measure_policy_q_trunk_gradients(
 
     return {
         "trunk_gradient_diagnostic_examples": float(seen),
+        "trunk_gradient_diagnostic_q_labels": float(q_seen),
         "trunk_gradient_diagnostic_seconds": time.monotonic() - started_at,
         "policy_trunk_grad_norm": float(values[0]),
         "q_trunk_grad_norm": float(values[1]),
@@ -949,6 +1170,7 @@ def train_epoch(
     max_grad_norm: float,
     seed: int | None,
     prefetch_batches: bool = True,
+    optimize_policy: bool = True,
 ) -> dict[str, float]:
     """Fit every fresh on-policy position exactly once."""
 
@@ -963,7 +1185,6 @@ def train_epoch(
     totals = {
         "policy_loss": torch.zeros((), device=device),
         "q_loss": torch.zeros((), device=device),
-        "total_loss": torch.zeros((), device=device),
     }
     grad_norms: list[torch.Tensor] = []
     update_norms: list[torch.Tensor] = []
@@ -988,6 +1209,8 @@ def train_epoch(
     target_top1_total = 0
     seen = 0
     updated_examples = 0
+    q_labels = 0
+    updated_q_labels = 0
     skipped_nonfinite_examples = 0
     microbatches = 0
     attempted_optimizer_steps = 0
@@ -1043,11 +1266,16 @@ def train_epoch(
             )
             if group_examples <= 0:
                 raise RuntimeError("prepared an empty optimizer batch")
+            group_q_labels = sum(
+                int(targets[3].numel())
+                for _batch, _packed_samples, targets in optimizer_group
+            )
+            if group_q_labels <= 0:
+                raise RuntimeError("prepared an optimizer batch without Q labels")
             optimizer.zero_grad(set_to_none=True)
             group_totals = {
                 "policy_loss": torch.zeros((), device=device),
                 "q_loss": torch.zeros((), device=device),
-                "total_loss": torch.zeros((), device=device),
             }
             group_target_top1 = 0
 
@@ -1067,6 +1295,7 @@ def train_epoch(
                 target_q = target_q_cpu.to(device)
                 segment_lengths = segment_lengths_cpu.to(device)
                 count = len(packed_samples)
+                q_count = target_q.numel()
                 with _autocast(device, precision):
                     fit_q_is_selected = isinstance(model, KlentNet)
                     if fit_q_is_selected:
@@ -1092,20 +1321,35 @@ def train_epoch(
                         else output.q_values.index_select(0, chosen)
                     ).float()
                     q_loss = F.mse_loss(predicted_q, target_q)
-                    total_loss = policy_loss + q_loss_weight * q_loss
+                    total_loss = q_loss_weight * q_loss
+                    if optimize_policy:
+                        total_loss = policy_loss + total_loss
 
-                # Each microbatch loss is already a per-example mean. Its
-                # population share reconstructs the exact outer-batch mean.
-                (total_loss * (count / group_examples)).backward()
+                # Policy is a mean over states while Q is a mean over labelled
+                # actions. Reconstruct both outer-batch populations exactly;
+                # in ordinary KLENT each state has one Q label, reducing to
+                # the historical total-loss scaling bit for bit.
+                if q_count == count and group_q_labels == group_examples:
+                    backward_loss = total_loss * (count / group_examples)
+                else:
+                    backward_loss = (
+                        q_loss_weight
+                        * q_loss
+                        * (q_count / group_q_labels)
+                    )
+                    if optimize_policy:
+                        backward_loss = (
+                            policy_loss * (count / group_examples)
+                            + backward_loss
+                        )
+                backward_loss.backward()
                 seen += count
+                q_labels += q_count
                 microbatches += 1
                 group_totals["policy_loss"].add_(
                     policy_loss.detach() * count
                 )
-                group_totals["q_loss"].add_(q_loss.detach() * count)
-                group_totals["total_loss"].add_(
-                    total_loss.detach() * count
-                )
+                group_totals["q_loss"].add_(q_loss.detach() * q_count)
                 group_target_top1 += target_top1
                 del (
                     batch,
@@ -1120,6 +1364,7 @@ def train_epoch(
                     predicted_q,
                     q_loss,
                     total_loss,
+                    backward_loss,
                 )
                 cache_pressure.step()
 
@@ -1145,7 +1390,6 @@ def train_epoch(
                             grad_norm.detach().float(),
                             group_totals["policy_loss"].float(),
                             group_totals["q_loss"].float(),
-                            group_totals["total_loss"].float(),
                         )
                     )
                 )
@@ -1167,6 +1411,7 @@ def train_epoch(
                 totals[name].add_(value)
             target_top1_total += group_target_top1
             updated_examples += group_examples
+            updated_q_labels += group_q_labels
             with torch.no_grad():
                 torch._foreach_copy_(
                     parameter_snapshot,
@@ -1197,24 +1442,12 @@ def train_epoch(
         )
 
     summary = torch.cat(
-        (
-            torch.stack(
-                [
-                    totals["policy_loss"],
-                    totals["q_loss"],
-                    totals["total_loss"],
-                ]
-            ),
-            torch.stack(grad_norms),
-        )
+        (torch.stack([totals["policy_loss"], totals["q_loss"]]),
+         torch.stack(grad_norms))
     ).cpu()
-    (
-        policy_loss_total,
-        q_loss_total,
-        total_loss_total,
-    ) = summary[:3].tolist()
+    policy_loss_total, q_loss_total = summary[:2].tolist()
     gradient_stats = _gradient_clip_statistics(
-        summary[3:],
+        summary[2:],
         max_grad_norm,
     )
     update_stats = _optimizer_update_statistics(
@@ -1223,9 +1456,14 @@ def train_epoch(
     )
     elapsed_seconds = time.monotonic() - started_at
 
+    mean_policy_loss = policy_loss_total / updated_examples
+    mean_q_loss = q_loss_total / updated_q_labels
     return {
         "examples": float(seen),
         "updated_examples": float(updated_examples),
+        "q_labels": float(q_labels),
+        "updated_q_labels": float(updated_q_labels),
+        "mean_q_labels_per_example": q_labels / seen,
         "skipped_nonfinite_examples": float(skipped_nonfinite_examples),
         "microbatches": float(microbatches),
         "attempted_optimizer_steps": float(attempted_optimizer_steps),
@@ -1238,14 +1476,252 @@ def train_epoch(
         ),
         "elapsed_seconds": elapsed_seconds,
         "examples_per_second": seen / elapsed_seconds,
-        "policy_loss": policy_loss_total / updated_examples,
-        "q_loss": q_loss_total / updated_examples,
-        "total_loss": total_loss_total / updated_examples,
+        "policy_loss": mean_policy_loss,
+        "q_loss": mean_q_loss,
+        "total_loss": (
+            (mean_policy_loss if optimize_policy else 0.0)
+            + q_loss_weight * mean_q_loss
+        ),
+        "policy_updates_enabled": float(optimize_policy),
         **gradient_stats,
         **update_stats,
         "played_action_target_top1": target_top1_total / updated_examples,
         **cache_pressure.metrics(),
     }
+
+
+@contextmanager
+def _output_heads_only_scope(
+    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+    *,
+    include_policy: bool,
+) -> Iterator[list[torch.nn.Parameter]]:
+    """Temporarily restrict training to selected output heads.
+
+    AdamW skips parameters whose gradient is ``None``, including weight decay
+    and moment updates. Restoring ``requires_grad`` afterwards therefore
+    preserves both frozen trunk weights and their existing optimizer state.
+    """
+
+    q_head = getattr(model, "q_head", None)
+    if not isinstance(q_head, torch.nn.Module):
+        raise ValueError("head-only training requires an action-Q head")
+    trainable_parameters = list(q_head.parameters())
+    if include_policy:
+        policy_head = getattr(model, "policy_head", None)
+        if not isinstance(policy_head, torch.nn.Module):
+            raise ValueError("heads-only training requires a policy head")
+        trainable_parameters.extend(policy_head.parameters())
+    if not trainable_parameters:
+        raise ValueError("action-Q head has no trainable parameters")
+    trainable_parameter_ids = {
+        id(parameter) for parameter in trainable_parameters
+    }
+    original_requires_grad = {
+        id(parameter): parameter.requires_grad
+        for parameter in model.parameters()
+    }
+    for parameter in model.parameters():
+        parameter.requires_grad_(id(parameter) in trainable_parameter_ids)
+    try:
+        yield trainable_parameters
+    finally:
+        for parameter in model.parameters():
+            parameter.requires_grad_(original_requires_grad[id(parameter)])
+
+
+@contextmanager
+def _critic_head_only_scope(
+    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+) -> Iterator[list[torch.nn.Parameter]]:
+    """Temporarily make the action-Q head the only trainable module."""
+
+    with _output_heads_only_scope(model, include_policy=False) as parameters:
+        yield parameters
+
+
+@contextmanager
+def _heads_only_scope(
+    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+) -> Iterator[list[torch.nn.Parameter]]:
+    """Temporarily train both output heads but not their shared trunk."""
+
+    with _output_heads_only_scope(model, include_policy=True) as parameters:
+        yield parameters
+
+
+def _refit_search_q_head(
+    model: KlentNet,
+    optimizer: torch.optim.Optimizer,
+    samples: list[TrajectoryStep],
+    *,
+    model_config,
+    device: torch.device,
+    precision: str,
+    batch_size: int,
+    edge_budget: int,
+    epochs: int,
+    max_grad_norm: float,
+    seed: int | None,
+) -> dict[str, float]:
+    """Give the Q head a final sparse correction without moving the trunk.
+
+    The ordinary joint FIT already consumes these labels and remains the only
+    path by which they may teach shared features. This short final pass freezes
+    every non-Q parameter, preventing fixed-teacher supervision from directly
+    changing policy logits while restoring action ranking that the much larger
+    on-policy objective may have overwritten later in the shuffled epoch.
+    """
+
+    if epochs <= 0:
+        raise ValueError("search-Q refit epochs must be positive")
+    selected = [
+        sample
+        for sample in samples
+        if sample.auxiliary_q_action_indices is not None
+        and sample.auxiliary_q_action_indices.numel() > 0
+    ]
+    if not selected:
+        raise ValueError("search-Q refit requires auxiliary Q labels")
+    if not isinstance(model, KlentNet):
+        raise ValueError("search-Q head refit currently requires graph KLENT")
+
+    started_at = time.monotonic()
+    was_training = model.training
+    loss_sum = torch.zeros((), device=device)
+    updated_labels = 0
+    optimizer_steps = 0
+    nonfinite_optimizer_steps = 0
+    grad_norms: list[torch.Tensor] = []
+    update_norms: list[torch.Tensor] = []
+    update_ratios: list[torch.Tensor] = []
+    model.eval()
+    try:
+        scope = _critic_head_only_scope(model)
+        q_parameters = scope.__enter__()
+        parameter_snapshot = [
+            torch.empty_like(parameter, memory_format=torch.preserve_format)
+            for parameter in q_parameters
+        ]
+        for epoch in range(epochs):
+            shuffled = list(selected)
+            epoch_seed = None if seed is None else seed + epoch
+            random.Random(epoch_seed).shuffle(shuffled)
+            for prepared in _prepared_training_batches(
+                shuffled,
+                batch_size=batch_size,
+                model_config=model_config,
+                edge_budget=edge_budget,
+                prefetch=False,
+            ):
+                group_q_labels = sum(
+                    int(targets[3].numel())
+                    for _batch, _packed_samples, targets in prepared
+                )
+                optimizer.zero_grad(set_to_none=True)
+                group_loss_sum = torch.zeros((), device=device)
+                for batch_cpu, _packed_samples, packed_targets in prepared:
+                    chosen_cpu = packed_targets[2]
+                    target_q_cpu = packed_targets[3]
+                    chosen = chosen_cpu.to(device)
+                    target_q = target_q_cpu.to(device)
+                    batch = move_batch_to_device(batch_cpu, device)
+                    with _autocast(device, precision):
+                        output = model.forward_fit(batch, chosen)
+                        q_loss = F.mse_loss(
+                            output.q_values.float(), target_q
+                        )
+                    q_count = target_q.numel()
+                    (q_loss * (q_count / group_q_labels)).backward()
+                    group_loss_sum.add_(q_loss.detach() * q_count)
+                    del batch, chosen, target_q, output, q_loss
+
+                if max_grad_norm > 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        q_parameters, max_grad_norm
+                    )
+                else:
+                    grad_norm = torch.linalg.vector_norm(
+                        torch.stack(
+                            [
+                                parameter.grad.detach().norm()
+                                for parameter in q_parameters
+                                if parameter.grad is not None
+                            ]
+                        )
+                    )
+                finite = bool(
+                    torch.isfinite(
+                        torch.stack(
+                            (grad_norm.detach().float(), group_loss_sum.float())
+                        )
+                    ).all().item()
+                )
+                if not finite:
+                    nonfinite_optimizer_steps += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    logger.warning(
+                        "discarding non-finite search-Q refit group labels=%d",
+                        group_q_labels,
+                    )
+                    continue
+
+                with torch.no_grad():
+                    torch._foreach_copy_(parameter_snapshot, q_parameters)
+                    parameter_norm = _global_l2_norm(parameter_snapshot)
+                optimizer.step()
+                with torch.no_grad():
+                    torch._foreach_sub_(parameter_snapshot, q_parameters)
+                    update_norm = _global_l2_norm(parameter_snapshot)
+                    update_ratio = update_norm / parameter_norm.clamp_min(
+                        torch.finfo(parameter_norm.dtype).tiny
+                    )
+                loss_sum.add_(group_loss_sum)
+                updated_labels += group_q_labels
+                optimizer_steps += 1
+                grad_norms.append(grad_norm.detach())
+                update_norms.append(update_norm.detach())
+                update_ratios.append(update_ratio.detach())
+    finally:
+        optimizer.zero_grad(set_to_none=True)
+        if "scope" in locals():
+            scope.__exit__(None, None, None)
+        model.train(was_training)
+
+    if optimizer_steps == 0:
+        raise RuntimeError("all search-Q refit optimizer groups were non-finite")
+    gradient_stats = _gradient_clip_statistics(
+        torch.stack(grad_norms), max_grad_norm
+    )
+    update_stats = _optimizer_update_statistics(
+        torch.stack(update_norms), torch.stack(update_ratios)
+    )
+    metrics = {
+        "search_q_teacher_refit_epochs": float(epochs),
+        "search_q_teacher_refit_states": float(len(selected)),
+        "search_q_teacher_refit_q_labels": float(updated_labels),
+        "search_q_teacher_refit_optimizer_steps": float(optimizer_steps),
+        "search_q_teacher_refit_nonfinite_optimizer_steps": float(
+            nonfinite_optimizer_steps
+        ),
+        "search_q_teacher_refit_q_loss": float(
+            loss_sum.cpu().item() / updated_labels
+        ),
+        "search_q_teacher_refit_seconds": time.monotonic() - started_at,
+    }
+    metrics.update(
+        {
+            f"search_q_teacher_refit_{key}": value
+            for key, value in gradient_stats.items()
+        }
+    )
+    metrics.update(
+        {
+            f"search_q_teacher_refit_{key}": value
+            for key, value in update_stats.items()
+        }
+    )
+    return metrics
 
 
 class Trainer:
@@ -1309,6 +1785,7 @@ class Trainer:
         self.writer = None
         self._actors = None
         self._checkpoint_opponents = CheckpointOpponentCache()
+        self._search_q_teacher: FixedCheckpointSearchQTeacher | None = None
         self._checkpoint_history_dirs = [self.checkpoint_dir.resolve()]
         self.initial_checkpoint: dict[str, object] | None = None
         try:
@@ -1372,6 +1849,28 @@ class Trainer:
             self.initial_checkpoint = initial_checkpoint
         logger.info("resumed %s at iteration %d", path, self.iteration)
 
+    def _get_search_q_teacher(self) -> FixedCheckpointSearchQTeacher:
+        """Lazily load and retain the configured fixed search-Q teacher."""
+
+        if self._search_q_teacher is None:
+            training = self.config.training
+            self._search_q_teacher = FixedCheckpointSearchQTeacher(
+                training.search_q_teacher_checkpoint,
+                device=self.device,
+                precision=self.config.run.precision,
+                simulations=training.search_q_teacher_simulations,
+                actions=training.search_q_teacher_actions,
+                root_batch_size=training.search_q_teacher_root_batch_size,
+            )
+            logger.info(
+                "loaded search-Q teacher %s sims=%d actions=%d roots=%d",
+                training.search_q_teacher_checkpoint,
+                training.search_q_teacher_simulations,
+                training.search_q_teacher_actions,
+                training.search_q_teacher_root_batch_size,
+            )
+        return self._search_q_teacher
+
     def initialize_from_production(self, path: str | Path) -> None:
         """Initialize KLENT from a compatible trained checkpoint."""
 
@@ -1415,7 +1914,7 @@ class Trainer:
             if not isinstance(self.model, PersistentRayKlentNet):
                 raise ValueError(
                     "a KLENT checkpoint may be used with --init-from only "
-                    "to graft persistent_ray_axis from dense_axis"
+                    "to graft persistent_ray_axis from graph or dense_axis"
                 )
             raw_config = checkpoint.get("model_config", {})
             if not isinstance(raw_config, dict):
@@ -1433,12 +1932,15 @@ class Trainer:
                     if key in known
                 }
             )
-            if source_config.architecture != "dense_axis":
+            source_architecture = source_config.architecture
+            if source_architecture not in {"graph", "dense_axis"}:
                 raise ValueError(
-                    "persistent-ray graft source must use "
-                    "model.architecture='dense_axis'"
+                    "persistent-ray graft source must use model.architecture="
+                    "'graph' or 'dense_axis'"
                 )
-            fields = (*compatibility_fields, "dense_ray_radius")
+            fields = compatibility_fields
+            if source_architecture == "dense_axis":
+                fields = (*fields, "dense_ray_radius")
             mismatches = [
                 f"{name}: source={getattr(source_config, name)!r}, "
                 f"target={getattr(self.config.model, name)!r}"
@@ -1448,20 +1950,34 @@ class Trainer:
             ]
             if mismatches:
                 raise ValueError(
-                    "dense KLENT checkpoint does not match persistent-ray "
+                    f"{source_architecture} KLENT checkpoint does not match "
+                    "persistent-ray "
                     "target: " + "; ".join(mismatches)
                 )
-            copied = load_dense_klent_graft(self.model, checkpoint)
+            if source_architecture == "dense_axis":
+                copied = load_dense_klent_graft(self.model, checkpoint)
+            else:
+                if not self.model.config.exact_graft_init:
+                    raise ValueError(
+                        "graph KLENT checkpoint grafting requires "
+                        "model.exact_graft_init=true"
+                    )
+                copied = load_production_axis_weights(
+                    self.model,
+                    checkpoint,
+                ).copied
             self.initial_checkpoint = {
                 "path": str(path),
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                 "iteration": checkpoint.get("iteration"),
                 "copied_tensors": len(copied),
                 "graft": "persistent_ray_axis",
+                "source_architecture": source_architecture,
             }
             logger.info(
-                "initialized persistent-ray KLENT from %s "
+                "initialized persistent-ray KLENT from %s %s "
                 "(%d tensors, source iteration=%s); optimizer starts fresh",
+                source_architecture,
                 path,
                 len(copied),
                 checkpoint.get("iteration", "?"),
@@ -1657,6 +2173,10 @@ class Trainer:
 
         actors, self._actors = self._actors, None
         writer, self.writer = self.writer, None
+        search_q_teacher, self._search_q_teacher = (
+            self._search_q_teacher,
+            None,
+        )
         try:
             if actors is not None:
                 actors.close()
@@ -1664,6 +2184,7 @@ class Trainer:
             if writer is not None:
                 writer.close()
             self._checkpoint_opponents.clear()
+            del search_q_teacher
 
     def run_iteration(self) -> dict[str, float]:
         next_iteration = self.iteration + 1
@@ -1710,7 +2231,58 @@ class Trainer:
             self.device,
             phase="collection",
         )
+        critic_calibration = terminal_played_q_calibration(trajectories)
         samples = flatten_trajectories(trajectories)
+        search_q_samples: list[TrajectoryStep] = []
+        search_q_metrics: dict[str, float] = {}
+        search_q_diagnostic_seconds = 0.0
+        if self.config.training.search_q_teacher_samples > 0:
+            search_q_samples = _policy_diagnostic_slice(
+                samples,
+                self.config.training.search_q_teacher_samples,
+            )
+            if self.display is not None:
+                self.display.set_phase(
+                    "FIT",
+                    next_iteration,
+                    (
+                        f"fixed search-Q labels // "
+                        f"{len(search_q_samples):,} roots"
+                    ),
+                )
+            search_started = time.monotonic()
+            search_labels = self._get_search_q_teacher().label(
+                [sample.state for sample in search_q_samples],
+                seed=seed,
+            )
+            search_q_metrics.update(
+                _attach_search_q_teacher_labels(
+                    search_q_samples,
+                    search_labels,
+                )
+            )
+            search_q_metrics["search_q_teacher_search_seconds"] = (
+                time.monotonic() - search_started
+            )
+            diagnostic_started = time.monotonic()
+            before = _measure_auxiliary_q_diagnostics(
+                self.model,
+                search_q_samples,
+                model_config=self.config.model,
+                device=self.device,
+                precision=self.config.run.precision,
+                batch_size=self.config.training.batch_size,
+                edge_budget=self.config.training.edge_budget,
+            )
+            search_q_diagnostic_seconds += (
+                time.monotonic() - diagnostic_started
+            )
+            search_q_metrics["search_q_teacher_q_labels"] = before.pop(
+                "search_q_teacher_q_labels"
+            )
+            search_q_metrics.update(
+                {f"{key}_before": value for key, value in before.items()}
+            )
         diagnostic_samples = _policy_diagnostic_slice(
             samples,
             self.config.training.policy_diagnostic_samples,
@@ -1737,10 +2309,21 @@ class Trainer:
             )
             policy_diagnostic_seconds += time.monotonic() - diagnostic_started
         if self.display is not None:
+            fit_detail = f"one epoch across {len(samples):,} fresh examples"
+            if self.config.training.critic_head_only:
+                fit_detail = (
+                    f"Q-head-only MC calibration across {len(samples):,} "
+                    "fresh examples"
+                )
+            elif self.config.training.heads_only:
+                fit_detail = (
+                    f"policy/Q heads only across {len(samples):,} "
+                    "fresh examples"
+                )
             self.display.set_phase(
                 "FIT",
                 next_iteration,
-                f"one epoch across {len(samples):,} fresh examples",
+                fit_detail,
             )
         if self.config.training.learning_rate_warmup_iterations > 0:
             scheduled_learning_rate = _learning_rate_for_iteration(
@@ -1749,20 +2332,35 @@ class Trainer:
             )
             for group in self.optimizer.param_groups:
                 group["lr"] = scheduled_learning_rate
-        training = train_epoch(
-            self.model,
-            self.optimizer,
-            samples,
-            model_config=self.config.model,
-            device=self.device,
-            precision=self.config.run.precision,
-            batch_size=self.config.training.batch_size,
-            edge_budget=self.config.training.edge_budget,
-            grad_accumulation=self.config.training.grad_accumulation,
-            q_loss_weight=self.config.training.q_loss_weight,
-            max_grad_norm=self.config.training.max_grad_norm,
-            seed=seed,
-            prefetch_batches=self.config.training.prefetch_batches,
+        critic_head_only = self.config.training.critic_head_only
+        heads_only = self.config.training.heads_only
+        if critic_head_only:
+            fit_scope = _critic_head_only_scope(self.model)
+        elif heads_only:
+            fit_scope = _heads_only_scope(self.model)
+        else:
+            fit_scope = nullcontext()
+        with fit_scope:
+            training = train_epoch(
+                self.model,
+                self.optimizer,
+                samples,
+                model_config=self.config.model,
+                device=self.device,
+                precision=self.config.run.precision,
+                batch_size=self.config.training.batch_size,
+                edge_budget=self.config.training.edge_budget,
+                grad_accumulation=self.config.training.grad_accumulation,
+                q_loss_weight=self.config.training.q_loss_weight,
+                max_grad_norm=self.config.training.max_grad_norm,
+                seed=seed,
+                prefetch_batches=self.config.training.prefetch_batches,
+                optimize_policy=not critic_head_only,
+            )
+        training["critic_head_only"] = float(critic_head_only)
+        training["heads_only"] = float(heads_only)
+        training["shared_trunk_updates_enabled"] = float(
+            not critic_head_only and not heads_only
         )
         learning_rates = {
             float(group["lr"]) for group in self.optimizer.param_groups
@@ -1772,19 +2370,143 @@ class Trainer:
                 "KLENT metrics require one shared optimizer learning rate"
             )
         training["learning_rate"] = learning_rates.pop()
-        if diagnostic_samples:
-            training.update(
-                _measure_policy_q_trunk_gradients(
+        if search_q_samples:
+            diagnostic_started = time.monotonic()
+            after_fit = _measure_auxiliary_q_diagnostics(
+                self.model,
+                search_q_samples,
+                model_config=self.config.model,
+                device=self.device,
+                precision=self.config.run.precision,
+                batch_size=self.config.training.batch_size,
+                edge_budget=self.config.training.edge_budget,
+            )
+            search_q_diagnostic_seconds += (
+                time.monotonic() - diagnostic_started
+            )
+            after_labels = after_fit.pop("search_q_teacher_q_labels")
+            if after_labels != search_q_metrics["search_q_teacher_q_labels"]:
+                raise RuntimeError(
+                    "search-Q diagnostic label population changed during FIT"
+                )
+            search_q_metrics.update(
+                {f"{key}_after_fit": value for key, value in after_fit.items()}
+            )
+            before_mse = search_q_metrics[
+                "search_q_teacher_q_mse_before"
+            ]
+            after_fit_mse = search_q_metrics[
+                "search_q_teacher_q_mse_after_fit"
+            ]
+            search_q_metrics["search_q_teacher_q_mse_fit_progress"] = (
+                0.0
+                if before_mse <= 1e-12
+                else 1.0 - after_fit_mse / before_mse
+            )
+            final_diagnostics = after_fit
+            refit_epochs = self.config.training.search_q_teacher_refit_epochs
+            if refit_epochs > 0:
+                if self.display is not None:
+                    self.display.set_phase(
+                        "FIT",
+                        next_iteration,
+                        "sparse fixed-search Q-head correction",
+                    )
+                search_q_metrics.update(
+                    _refit_search_q_head(
+                        self.model,
+                        self.optimizer,
+                        search_q_samples,
+                        model_config=self.config.model,
+                        device=self.device,
+                        precision=self.config.run.precision,
+                        batch_size=self.config.training.batch_size,
+                        edge_budget=self.config.training.edge_budget,
+                        epochs=refit_epochs,
+                        max_grad_norm=self.config.training.max_grad_norm,
+                        seed=seed,
+                    )
+                )
+                diagnostic_started = time.monotonic()
+                after_refit = _measure_auxiliary_q_diagnostics(
                     self.model,
-                    diagnostic_samples,
+                    search_q_samples,
                     model_config=self.config.model,
                     device=self.device,
                     precision=self.config.run.precision,
                     batch_size=self.config.training.batch_size,
                     edge_budget=self.config.training.edge_budget,
-                    q_loss_weight=self.config.training.q_loss_weight,
                 )
+                search_q_diagnostic_seconds += (
+                    time.monotonic() - diagnostic_started
+                )
+                refit_labels = after_refit.pop(
+                    "search_q_teacher_q_labels"
+                )
+                if refit_labels != after_labels:
+                    raise RuntimeError(
+                        "search-Q diagnostic label population changed during "
+                        "Q-head refit"
+                    )
+                search_q_metrics.update(
+                    {
+                        f"{key}_after_refit": value
+                        for key, value in after_refit.items()
+                    }
+                )
+                after_refit_mse = search_q_metrics[
+                    "search_q_teacher_q_mse_after_refit"
+                ]
+                search_q_metrics["search_q_teacher_q_mse_refit_progress"] = (
+                    0.0
+                    if after_fit_mse <= 1e-12
+                    else 1.0 - after_refit_mse / after_fit_mse
+                )
+                final_diagnostics = after_refit
+            search_q_metrics.update(
+                {f"{key}_after": value for key, value in final_diagnostics.items()}
             )
+            after_mse = search_q_metrics[
+                "search_q_teacher_q_mse_after"
+            ]
+            search_q_metrics["search_q_teacher_q_mse_progress"] = (
+                0.0 if before_mse <= 1e-12 else 1.0 - after_mse / before_mse
+            )
+            search_q_metrics["search_q_teacher_diagnostic_seconds"] = (
+                search_q_diagnostic_seconds
+            )
+            training.update(search_q_metrics)
+        if diagnostic_samples:
+            if critic_head_only or heads_only:
+                # The compiled FIT graph was specialized while the trunk (and
+                # optionally policy head) was intentionally frozen. Asking it
+                # for a hypothetical trunk gradient after restoring
+                # requires_grad would both recompile and misrepresent the
+                # update that just occurred. Record the actual protected
+                # condition explicitly.
+                training.update(
+                    {
+                        "trunk_gradient_diagnostic_examples": 0.0,
+                        "trunk_gradient_diagnostic_q_labels": 0.0,
+                        "trunk_gradient_diagnostic_seconds": 0.0,
+                        "policy_trunk_grad_norm": 0.0,
+                        "q_trunk_grad_norm": 0.0,
+                        "policy_q_trunk_grad_cosine": 0.0,
+                    }
+                )
+            else:
+                training.update(
+                    _measure_policy_q_trunk_gradients(
+                        self.model,
+                        diagnostic_samples,
+                        model_config=self.config.model,
+                        device=self.device,
+                        precision=self.config.run.precision,
+                        batch_size=self.config.training.batch_size,
+                        edge_budget=self.config.training.edge_budget,
+                        q_loss_weight=self.config.training.q_loss_weight,
+                    )
+                )
             diagnostic_started = time.monotonic()
             (
                 policy_target_kl_after,
@@ -1860,6 +2582,10 @@ class Trainer:
             "collection/positions_per_second": (
                 collection.positions / collection.elapsed_seconds
             ),
+            **{
+                f"collection/{key}": value
+                for key, value in critic_calibration.items()
+            },
             **{f"training/{key}": value for key, value in training.items()},
             **memory_metrics,
         }

@@ -85,10 +85,33 @@ class TrainingConfig:
     fit_compile_seed_nodes: int = 0
     learning_rate: float = 1e-3
     learning_rate_warmup_iterations: int = 0
+    # Last already-completed generation before the warm-up stage. Zero keeps
+    # the historical fresh-run schedule (generation 1 is warm-up step 1).
+    # Setting this to a resumed checkpoint iteration lets a newly unfrozen
+    # training stage ramp safely without resetting the global iteration.
+    learning_rate_warmup_start_iteration: int = 0
     learning_rate_warmup_start_factor: float = 0.1
     weight_decay: float = 1e-4
     q_loss_weight: float = 1.0
     max_grad_norm: float = 1.0
+    # Protected critic calibration: update only the action-Q head. The policy
+    # head and shared representation remain bit-for-bit frozen, so a
+    # terminal-return warm-up cannot erase a strong grafted policy.
+    critic_head_only: bool = False
+    # Shared-trunk isolation ablation: update both output heads while keeping
+    # the representation and its AdamW state bit-for-bit frozen. This tests
+    # whether policy collapse comes from the KLENT head targets themselves or
+    # from their joint gradients through the shared representation.
+    heads_only: bool = False
+    # Optional sparse alternative-action critic labels from a deterministic
+    # batched search by a fixed checkpoint. Zero samples leaves the historical
+    # KLENT objective and execution path unchanged.
+    search_q_teacher_samples: int = 0
+    search_q_teacher_checkpoint: str = ""
+    search_q_teacher_simulations: int = 32
+    search_q_teacher_actions: int = 8
+    search_q_teacher_root_batch_size: int = 16
+    search_q_teacher_refit_epochs: int = 0
 
 
 @dataclass
@@ -276,12 +299,63 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             "training.learning_rate_warmup_iterations cannot be negative"
         )
+    if cfg.training.learning_rate_warmup_start_iteration < 0:
+        raise ValueError(
+            "training.learning_rate_warmup_start_iteration cannot be negative"
+        )
     if not 0 <= cfg.training.learning_rate_warmup_start_factor <= 1:
         raise ValueError(
             "training.learning_rate_warmup_start_factor must be in [0, 1]"
         )
     if cfg.training.q_loss_weight < 0:
         raise ValueError("training.q_loss_weight cannot be negative")
+    if cfg.training.critic_head_only and cfg.training.heads_only:
+        raise ValueError(
+            "training.critic_head_only and training.heads_only are "
+            "mutually exclusive"
+        )
+    if cfg.training.search_q_teacher_samples < 0:
+        raise ValueError(
+            "training.search_q_teacher_samples cannot be negative"
+        )
+    if cfg.training.search_q_teacher_simulations <= 0:
+        raise ValueError(
+            "training.search_q_teacher_simulations must be positive"
+        )
+    if cfg.training.search_q_teacher_actions <= 0:
+        raise ValueError("training.search_q_teacher_actions must be positive")
+    if cfg.training.search_q_teacher_root_batch_size <= 0:
+        raise ValueError(
+            "training.search_q_teacher_root_batch_size must be positive"
+        )
+    if cfg.training.search_q_teacher_refit_epochs < 0:
+        raise ValueError(
+            "training.search_q_teacher_refit_epochs cannot be negative"
+        )
+    if (
+        cfg.training.search_q_teacher_samples > 0
+        and not cfg.training.search_q_teacher_checkpoint
+    ):
+        raise ValueError(
+            "training.search_q_teacher_samples requires "
+            "search_q_teacher_checkpoint"
+        )
+    if (
+        cfg.training.search_q_teacher_refit_epochs > 0
+        and cfg.training.search_q_teacher_samples <= 0
+    ):
+        raise ValueError(
+            "training.search_q_teacher_refit_epochs requires "
+            "search_q_teacher_samples"
+        )
+    if (
+        cfg.training.search_q_teacher_refit_epochs > 0
+        and cfg.model.architecture != "graph"
+    ):
+        raise ValueError(
+            "training.search_q_teacher_refit_epochs currently requires "
+            "model.architecture='graph'"
+        )
     if cfg.run.iterations <= 0:
         raise ValueError("run.iterations must be positive")
     if cfg.run.checkpoint_interval < 0:

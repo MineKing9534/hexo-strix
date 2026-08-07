@@ -546,6 +546,89 @@ fn py_batched_gumbel_mcts(
         .collect())
 }
 
+/// Run lockstep Gumbel MCTS and preserve per-root search diagnostics.
+///
+/// This is the batched counterpart of `gumbel_mcts_with_diagnostics`.  It is
+/// intended for audits and sparse teacher generation where discarding the
+/// visited-action Q estimates would force the caller back onto many serial
+/// searches.
+///
+/// Returns one tuple per input state, with every vector aligned to that
+/// state's `legal_moves()` order:
+///
+/// `(action, improved_policy, visit_counts, per_child_q, per_child_prior,
+///   candidate_indices)`.
+#[pyfunction(name = "batched_gumbel_mcts_with_diagnostics")]
+#[pyo3(signature = (games, eval_fn, config, seed=None))]
+fn py_batched_gumbel_mcts_with_diagnostics(
+    py: Python<'_>,
+    games: Vec<PyRef<PyGameState>>,
+    eval_fn: Py<PyAny>,
+    config: &PyMCTSConfig,
+    seed: Option<u64>,
+) -> PyResult<
+    Vec<(
+        (i32, i32),
+        Vec<f64>,
+        Vec<u32>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<usize>,
+    )>,
+> {
+    use crate::mcts::batched::batched_gumbel_mcts;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let states: Vec<GameState> = games.iter().map(|game| game.inner.clone()).collect();
+    if let Some(index) = states.iter().position(|state| state.is_terminal()) {
+        return Err(PyValueError::new_err(format!(
+            "batched_gumbel_mcts_with_diagnostics: state {index} is terminal"
+        )));
+    }
+
+    let mut rng = match seed {
+        Some(value) => ChaCha8Rng::seed_from_u64(value),
+        None => ChaCha8Rng::from_os_rng(),
+    };
+    let mut eval_error: Option<String> = None;
+    let eval_fn_ref = &eval_fn;
+    let mut eval = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+        match call_python_eval(py, eval_fn_ref, states) {
+            Ok(result) => result,
+            Err(error) => {
+                eval_error = Some(error);
+                let dummy = states.iter().map(|_| HashMap::default()).collect();
+                (dummy, vec![0.0; states.len()])
+            }
+        }
+    };
+
+    let results = batched_gumbel_mcts(&states, &config.inner, &mut rng, &mut eval)
+        .map_err(PyValueError::new_err)?;
+    if let Some(error) = eval_error {
+        return Err(if error.contains("KeyboardInterrupt") {
+            pyo3::exceptions::PyKeyboardInterrupt::new_err(error)
+        } else {
+            PyValueError::new_err(error)
+        });
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|result| {
+            (
+                result.action,
+                result.improved_policy,
+                result.visit_counts,
+                result.per_child_q,
+                result.per_child_prior,
+                result.candidate_indices,
+            )
+        })
+        .collect())
+}
+
 /// Run Gumbel MCTS and return root visit counts alongside the standard outputs.
 ///
 /// Equivalent to `gumbel_mcts` except the returned tuple also contains a
@@ -2034,6 +2117,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMCTSConfig>()?;
     m.add_function(wrap_pyfunction!(py_gumbel_mcts, m)?)?;
     m.add_function(wrap_pyfunction!(py_batched_gumbel_mcts, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_batched_gumbel_mcts_with_diagnostics,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(py_gumbel_mcts_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(py_gumbel_mcts_with_diagnostics, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_graph_raw, m)?)?;

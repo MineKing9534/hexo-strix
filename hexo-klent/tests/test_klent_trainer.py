@@ -27,17 +27,22 @@ from hexo_klent.evaluation import EvaluationStats
 from hexo_klent.trainer import (
     Trainer,
     _CudaCachePressureGate,
+    _attach_search_q_teacher_labels,
+    _critic_head_only_scope,
     _ensure_compiler_nofile_limit,
     _flat_training_targets,
     _gradient_clip_statistics,
+    _heads_only_scope,
     _learning_rate_for_iteration,
     _optimizer_update_statistics,
     _prepared_training_batches,
     _release_cuda_cache,
+    _refit_search_q_head,
     _seed_fit_compilation,
     _segmented_log_softmax,
     train_epoch,
 )
+from hexo_klent.search_q_teacher import SearchQLabels
 
 
 def test_learning_rate_warmup_reaches_target_on_fifth_generation():
@@ -52,6 +57,22 @@ def test_learning_rate_warmup_reaches_target_on_fifth_generation():
         for iteration in range(1, 8)
     ] == pytest.approx(
         [2e-5, 6.5e-5, 1.1e-4, 1.55e-4, 2e-4, 2e-4, 2e-4]
+    )
+
+
+def test_learning_rate_warmup_can_start_after_resumed_iteration():
+    training = TrainingConfig(
+        learning_rate=2e-4,
+        learning_rate_warmup_iterations=5,
+        learning_rate_warmup_start_iteration=125,
+        learning_rate_warmup_start_factor=0.1,
+    )
+
+    assert [
+        _learning_rate_for_iteration(training, iteration)
+        for iteration in (125, 126, 127, 128, 129, 130, 131)
+    ] == pytest.approx(
+        [2e-4, 2e-5, 6.5e-5, 1.1e-4, 1.55e-4, 2e-4, 2e-4]
     )
 
 
@@ -204,6 +225,294 @@ def test_flat_training_targets_preserve_variable_action_alignment():
     assert target_q.tolist() == pytest.approx([0.5, -0.25])
     assert target_top1 == 1
     assert segment_lengths.tolist() == [3, 2]
+
+
+def test_flat_training_targets_append_unplayed_search_q_labels():
+    sample = TrajectoryStep(
+        state=object(),
+        target_policy=torch.tensor([0.1, 0.2, 0.3, 0.4]),
+        action_index=2,
+        player="P1",
+        state_value=0.0,
+        return_target=-0.5,
+        auxiliary_q_action_indices=torch.tensor([0, 3]),
+        auxiliary_q_targets=torch.tensor([0.75, -0.25]),
+    )
+
+    _policy, _segments, chosen, target_q, _top1, _lengths = (
+        _flat_training_targets([sample])
+    )
+
+    assert chosen.tolist() == [2, 0, 3]
+    assert target_q.tolist() == pytest.approx([-0.5, 0.75, -0.25])
+
+
+def test_search_q_labels_keep_terminal_target_authoritative_for_played_move():
+    sample = TrajectoryStep(
+        state=object(),
+        target_policy=torch.full((4,), 0.25),
+        action_index=1,
+        player="P1",
+        state_value=0.0,
+        return_target=1.0,
+    )
+
+    metrics = _attach_search_q_teacher_labels(
+        [sample],
+        [
+            SearchQLabels(
+                action_indices=torch.tensor([0, 1, 3]),
+                targets=torch.tensor([0.25, -0.75, 0.5]),
+                legal_actions=4,
+            )
+        ],
+    )
+
+    assert sample.auxiliary_q_action_indices.tolist() == [0, 3]
+    assert sample.auxiliary_q_targets.tolist() == pytest.approx([0.25, 0.5])
+    packed = _flat_training_targets([sample])
+    assert packed[2].tolist() == [1, 0, 3]
+    assert packed[3].tolist() == pytest.approx([1.0, 0.25, 0.5])
+    assert metrics == pytest.approx(
+        {
+            "search_q_teacher_states": 1.0,
+            "search_q_teacher_visited_labels": 3.0,
+            "search_q_teacher_auxiliary_labels": 2.0,
+            "search_q_teacher_mean_auxiliary_labels": 2.0,
+            "search_q_teacher_visited_coverage": 0.75,
+            "search_q_teacher_mean_abs_target": 0.375,
+        }
+    )
+
+
+def test_search_q_head_refit_does_not_move_policy_or_shared_trunk():
+    config = tiny_model_config()
+    game_config = hexo_rs.GameConfig(2, 1, 4)
+    samples = [
+        TrajectoryStep(
+            state=hexo_rs.GameState(game_config),
+            target_policy=torch.full((6,), 1 / 6),
+            action_index=index,
+            player="P1",
+            state_value=0.0,
+            return_target=(-1.0) ** index,
+            auxiliary_q_action_indices=torch.tensor([2, 3]),
+            auxiliary_q_targets=torch.tensor([0.8, -0.6]),
+        )
+        for index in range(2)
+    ]
+    model = KlentNet(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    before = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
+
+    metrics = _refit_search_q_head(
+        model,
+        optimizer,
+        samples,
+        model_config=config,
+        device=torch.device("cpu"),
+        precision="float32",
+        batch_size=2,
+        edge_budget=0,
+        epochs=1,
+        max_grad_norm=0.0,
+        seed=7,
+    )
+
+    changed_q = False
+    for name, value in model.state_dict().items():
+        if name.startswith("q_head."):
+            changed_q = changed_q or not torch.equal(value, before[name])
+        else:
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    assert changed_q
+    assert all(parameter.requires_grad for parameter in model.parameters())
+    assert metrics["search_q_teacher_refit_states"] == 2.0
+    assert metrics["search_q_teacher_refit_q_labels"] == 6.0
+    assert metrics["search_q_teacher_refit_optimizer_steps"] == 1.0
+    assert metrics["search_q_teacher_refit_nonfinite_optimizer_steps"] == 0.0
+    assert metrics["search_q_teacher_refit_q_loss"] > 0.0
+
+
+def test_critic_head_only_epoch_preserves_policy_trunk_and_optimizer_state():
+    config = tiny_model_config()
+    game_config = hexo_rs.GameConfig(2, 1, 4)
+    target_policy = torch.tensor([0.45, 0.2, 0.1, 0.1, 0.1, 0.05])
+    samples = [
+        TrajectoryStep(
+            state=hexo_rs.GameState(game_config),
+            target_policy=target_policy,
+            action_index=index,
+            player="P1",
+            state_value=0.0,
+            return_target=(-1.0) ** index,
+        )
+        for index in range(2)
+    ]
+    model = KlentNet(config)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=1e-2, weight_decay=1e-3
+    )
+    arguments = dict(
+        samples=samples,
+        model_config=config,
+        device=torch.device("cpu"),
+        precision="float32",
+        batch_size=2,
+        edge_budget=0,
+        grad_accumulation=True,
+        q_loss_weight=1.0,
+        max_grad_norm=0.0,
+        seed=7,
+        prefetch_batches=False,
+    )
+
+    # Populate AdamW moments for the complete model before the protected pass,
+    # matching a warm-up resumed from an already-trained graft.
+    train_epoch(model, optimizer, optimize_policy=True, **arguments)
+    optimizer.zero_grad(set_to_none=True)
+    before = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
+    q_parameter_ids = {id(parameter) for parameter in model.q_head.parameters()}
+    frozen_optimizer_state = {
+        id(parameter): {
+            key: value.detach().clone() if torch.is_tensor(value) else value
+            for key, value in optimizer.state.get(parameter, {}).items()
+        }
+        for parameter in model.parameters()
+        if id(parameter) not in q_parameter_ids
+    }
+
+    with _critic_head_only_scope(model):
+        metrics = train_epoch(
+            model,
+            optimizer,
+            optimize_policy=False,
+            **arguments,
+        )
+
+    changed_q = False
+    for name, value in model.state_dict().items():
+        if name.startswith("q_head."):
+            changed_q = changed_q or not torch.equal(value, before[name])
+        else:
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    assert changed_q
+    assert all(parameter.requires_grad for parameter in model.parameters())
+    for parameter in model.parameters():
+        if id(parameter) in q_parameter_ids:
+            continue
+        actual = optimizer.state.get(parameter, {})
+        expected = frozen_optimizer_state[id(parameter)]
+        assert actual.keys() == expected.keys()
+        for key, expected_value in expected.items():
+            actual_value = actual[key]
+            if torch.is_tensor(expected_value):
+                torch.testing.assert_close(
+                    actual_value, expected_value, rtol=0, atol=0
+                )
+            else:
+                assert actual_value == expected_value
+    assert metrics["policy_updates_enabled"] == 0.0
+    assert metrics["total_loss"] == pytest.approx(metrics["q_loss"])
+
+
+def test_heads_only_epoch_preserves_trunk_and_optimizer_state():
+    config = tiny_model_config()
+    game_config = hexo_rs.GameConfig(2, 1, 4)
+    samples = [
+        TrajectoryStep(
+            state=hexo_rs.GameState(game_config),
+            target_policy=torch.tensor(
+                [0.45, 0.2, 0.1, 0.1, 0.1, 0.05]
+            ),
+            action_index=index,
+            player="P1",
+            state_value=0.0,
+            return_target=(-1.0) ** index,
+        )
+        for index in range(2)
+    ]
+    model = KlentNet(config)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=1e-2, weight_decay=1e-3
+    )
+    arguments = dict(
+        samples=samples,
+        model_config=config,
+        device=torch.device("cpu"),
+        precision="float32",
+        batch_size=2,
+        edge_budget=0,
+        grad_accumulation=True,
+        q_loss_weight=1.0,
+        max_grad_norm=0.0,
+        seed=7,
+        prefetch_batches=False,
+        optimize_policy=True,
+    )
+
+    # Populate every AdamW slot before checking the protected pass.
+    train_epoch(model, optimizer, **arguments)
+    optimizer.zero_grad(set_to_none=True)
+    before = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
+    head_parameter_ids = {
+        id(parameter)
+        for head in (model.policy_head, model.q_head)
+        for parameter in head.parameters()
+    }
+    frozen_optimizer_state = {
+        id(parameter): {
+            key: value.detach().clone() if torch.is_tensor(value) else value
+            for key, value in optimizer.state.get(parameter, {}).items()
+        }
+        for parameter in model.parameters()
+        if id(parameter) not in head_parameter_ids
+    }
+
+    with _heads_only_scope(model):
+        metrics = train_epoch(model, optimizer, **arguments)
+
+    changed_policy = False
+    changed_q = False
+    for name, value in model.state_dict().items():
+        if name.startswith("policy_head."):
+            changed_policy = changed_policy or not torch.equal(
+                value, before[name]
+            )
+        elif name.startswith("q_head."):
+            changed_q = changed_q or not torch.equal(value, before[name])
+        else:
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    assert changed_policy
+    assert changed_q
+    assert all(parameter.requires_grad for parameter in model.parameters())
+    for parameter in model.parameters():
+        if id(parameter) in head_parameter_ids:
+            continue
+        actual = optimizer.state.get(parameter, {})
+        expected = frozen_optimizer_state[id(parameter)]
+        assert actual.keys() == expected.keys()
+        for key, expected_value in expected.items():
+            actual_value = actual[key]
+            if torch.is_tensor(expected_value):
+                torch.testing.assert_close(
+                    actual_value, expected_value, rtol=0, atol=0
+                )
+            else:
+                assert actual_value == expected_value
+    assert metrics["policy_updates_enabled"] == 1.0
+    assert metrics["total_loss"] == pytest.approx(
+        metrics["policy_loss"] + metrics["q_loss"]
+    )
 
 
 def test_gradient_clip_statistics_report_frequency_distribution_and_scale():
@@ -391,6 +700,13 @@ def test_accumulated_microbatches_match_unsplit_outer_batch(monkeypatch):
         )
         for index in range(4)
     ]
+    # Make the two edge-budgeted microbatches contain different Q-label
+    # densities. Exact state-weighting would now be wrong; the accumulated
+    # gradient must instead reconstruct the six-label outer Q population.
+    samples[0].auxiliary_q_action_indices = torch.tensor([1])
+    samples[0].auxiliary_q_targets = torch.tensor([0.7])
+    samples[3].auxiliary_q_action_indices = torch.tensor([0])
+    samples[3].auxiliary_q_targets = torch.tensor([-0.8])
 
     def fake_prepared(
         shuffled,
@@ -479,6 +795,10 @@ def test_accumulated_microbatches_match_unsplit_outer_batch(monkeypatch):
     assert accumulated_metrics["mean_optimizer_batch_size"] == 4.0
     assert accumulated_metrics["mean_microbatch_size"] == 2.0
     assert accumulated_metrics["mean_microbatches_per_step"] == 2.0
+    assert accumulated_metrics["q_labels"] == 6.0
+    assert accumulated_metrics["mean_q_labels_per_example"] == pytest.approx(
+        1.5
+    )
     assert per_microbatch_metrics["optimizer_steps"] == 2.0
     assert per_microbatch_metrics["microbatches"] == 2.0
     assert per_microbatch_metrics["mean_optimizer_batch_size"] == 2.0
@@ -704,6 +1024,7 @@ def test_tiny_cpu_iteration_collects_fits_and_checkpoints(tmp_path):
     assert len(lines) == 1
     assert json.loads(lines[0])["iteration"] == 1.0
 
+
     resumed = Trainer(config, tensorboard=False, resume=checkpoint)
     assert resumed.iteration == 1
     assert resumed.optimizer.param_groups[0]["lr"] == pytest.approx(1e-3)
@@ -747,6 +1068,122 @@ def test_tiny_cpu_iteration_collects_fits_and_checkpoints(tmp_path):
         if key != "lr"
     }
     assert not checkpoint.with_suffix(".pt.tmp").exists()
+
+
+def test_tiny_critic_head_only_iteration_freezes_policy_and_trunk(tmp_path):
+    config = Config(
+        model=tiny_model_config(),
+        game=GameConfig(
+            win_length=2, placement_radius=1, rollout_horizon=4
+        ),
+        collection=CollectionConfig(
+            positions_per_iteration=6,
+            parallel_games=2,
+            inference_batch_size=2,
+        ),
+        training=TrainingConfig(
+            batch_size=16,
+            edge_budget=0,
+            learning_rate=1e-3,
+            weight_decay=1e-4,
+            critic_head_only=True,
+        ),
+        evaluation=EvaluationConfig(interval=0, opponents=[]),
+        run=RunConfig(
+            iterations=1,
+            device="cpu",
+            precision="float32",
+            output_dir=str(tmp_path),
+            checkpoint_interval=0,
+            seed=13,
+        ),
+    )
+    trainer = Trainer(config, tensorboard=False)
+    before = {
+        name: value.detach().clone()
+        for name, value in trainer.model.state_dict().items()
+    }
+
+    metrics = trainer.run_iteration()
+    trainer.close()
+
+    changed_q = False
+    for name, value in trainer.model.state_dict().items():
+        if name.startswith("q_head."):
+            changed_q = changed_q or not torch.equal(value, before[name])
+        else:
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    assert changed_q
+    assert metrics["training/critic_head_only"] == 1.0
+    assert metrics["training/policy_updates_enabled"] == 0.0
+    assert metrics["training/trunk_gradient_diagnostic_examples"] == 0.0
+    assert metrics["training/q_trunk_grad_norm"] == 0.0
+    assert metrics["training/policy_trunk_grad_norm"] == 0.0
+    assert metrics["training/policy_target_kl_after"] == pytest.approx(
+        metrics["training/policy_target_kl_before"], abs=1e-8
+    )
+    assert metrics["training/policy_target_top1_agreement_after"] == (
+        metrics["training/policy_target_top1_agreement_before"]
+    )
+
+
+def test_tiny_heads_only_iteration_freezes_shared_trunk(tmp_path):
+    config = Config(
+        model=tiny_model_config(),
+        game=GameConfig(
+            win_length=2, placement_radius=1, rollout_horizon=4
+        ),
+        collection=CollectionConfig(
+            positions_per_iteration=6,
+            parallel_games=2,
+            inference_batch_size=2,
+        ),
+        training=TrainingConfig(
+            batch_size=16,
+            edge_budget=0,
+            learning_rate=1e-3,
+            weight_decay=1e-4,
+            heads_only=True,
+        ),
+        evaluation=EvaluationConfig(interval=0, opponents=[]),
+        run=RunConfig(
+            iterations=1,
+            device="cpu",
+            precision="float32",
+            output_dir=str(tmp_path),
+            checkpoint_interval=0,
+            seed=17,
+        ),
+    )
+    trainer = Trainer(config, tensorboard=False)
+    before = {
+        name: value.detach().clone()
+        for name, value in trainer.model.state_dict().items()
+    }
+
+    metrics = trainer.run_iteration()
+    trainer.close()
+
+    changed_policy = False
+    changed_q = False
+    for name, value in trainer.model.state_dict().items():
+        if name.startswith("policy_head."):
+            changed_policy = changed_policy or not torch.equal(
+                value, before[name]
+            )
+        elif name.startswith("q_head."):
+            changed_q = changed_q or not torch.equal(value, before[name])
+        else:
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    assert changed_policy
+    assert changed_q
+    assert metrics["training/critic_head_only"] == 0.0
+    assert metrics["training/heads_only"] == 1.0
+    assert metrics["training/policy_updates_enabled"] == 1.0
+    assert metrics["training/shared_trunk_updates_enabled"] == 0.0
+    assert metrics["training/trunk_gradient_diagnostic_examples"] == 0.0
+    assert metrics["training/q_trunk_grad_norm"] == 0.0
+    assert metrics["training/policy_trunk_grad_norm"] == 0.0
 
 
 def test_learning_rate_warmup_is_applied_and_resumes_by_iteration(tmp_path):
@@ -908,6 +1345,75 @@ def test_persistent_trainer_grafts_dense_klent_checkpoint(tmp_path):
             else:
                 assert actual_value == expected_value
     resumed.close()
+
+
+def test_persistent_trainer_grafts_graph_klent_checkpoint(tmp_path):
+    graph_model = tiny_model_config()
+    graph_model.threat_features = True
+    graph_model.axis_window = 5
+    graph_model.use_jk = True
+    graph_model.jk_mode = "cat"
+    source_config = Config(
+        model=graph_model,
+        game=GameConfig(
+            win_length=2,
+            placement_radius=1,
+            rollout_horizon=4,
+        ),
+        collection=CollectionConfig(
+            positions_per_iteration=4,
+            parallel_games=2,
+            inference_batch_size=2,
+        ),
+        training=TrainingConfig(batch_size=4),
+        evaluation=EvaluationConfig(interval=0, opponents=[]),
+        run=RunConfig(
+            iterations=1,
+            device="cpu",
+            precision="float32",
+            output_dir=str(tmp_path / "graph"),
+            checkpoint_interval=0,
+        ),
+    )
+    source = Trainer(source_config, tensorboard=False)
+    source.iteration = 25
+    source_checkpoint = source.save_checkpoint(final=True)
+    source.close()
+
+    persistent_model = KlentModelConfig(
+        **vars(graph_model),
+        architecture="persistent_ray_axis",
+        dense_ray_radius=5,
+        ray_channels=4,
+        ray_update_hidden=8,
+        exact_graft_init=True,
+    )
+    target_config = dataclasses.replace(
+        source_config,
+        model=persistent_model,
+        run=dataclasses.replace(
+            source_config.run,
+            output_dir=str(tmp_path / "persistent"),
+        ),
+    )
+    target = Trainer(
+        target_config,
+        tensorboard=False,
+        init_from=source_checkpoint,
+    )
+
+    assert isinstance(target.model, PersistentRayKlentNet)
+    assert target.iteration == 0
+    assert target.initial_checkpoint is not None
+    assert target.initial_checkpoint["iteration"] == 25
+    assert target.initial_checkpoint["graft"] == "persistent_ray_axis"
+    assert target.initial_checkpoint["source_architecture"] == "graph"
+    assert target.initial_checkpoint["copied_tensors"] > 0
+    assert any(
+        key.startswith("ray_mixers.")
+        for key in target.model.state_dict()
+    )
+    target.close()
 
 
 def test_graph_trainer_initializes_from_production_checkpoint(tmp_path):

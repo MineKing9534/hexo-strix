@@ -1,0 +1,150 @@
+# Short terminal-only persistent-ray probe grafted from the strong graph run.
+#
+# Graph generation 244 was sealed while the source run was still materially
+# improving.  The persistent-ray graft copies its graph trunk and policy/Q
+# heads, while exact_graft_init keeps every new ray branch behind a
+# zero-initialized fold.  Generation zero is therefore function-equivalent to
+# the graph source; the optimizer starts fresh and receives a five-generation
+# LR warm-up while the new ray path begins learning.
+#
+# The current collector admits only genuinely terminal games to FIT.  Games
+# that reach H500 or the dense-cell safety cap are discarded whole.
+#
+#   .venv/bin/hexo-klent train \
+#     --config configs/klent/persistent-ray/s4-from-graph244-terminal.toml \
+#     --init-from runs/klent/axis-gine/s4-from-mc25-tau16-alpha001-full-batch2048/checkpoints/checkpoint_000244.pt \
+#     --tui
+#
+# Continue this output later with the ordinary `--resume latest`.
+
+[model]
+architecture = "persistent_ray_axis"
+dense_ray_radius = 5
+
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+
+ray_channels = 12
+ray_update_hidden = 48
+ray_branch_scale = 1.0
+exact_graft_init = true
+ray_after_layers = [0, 1, 2, 3]
+
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 8
+rollout_horizon = 500
+
+[algorithm]
+alpha = 0.01
+beta = 0.10
+tau = 16.0
+
+[collection]
+positions_per_iteration = 131_072
+parallel_games = 64
+inference_batch_size = 64
+inference_edge_budget = 1_000_000
+dense_position_cell_limit = 200_000
+workers = 8
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 2_048
+edge_budget = 500_000
+policy_diagnostic_samples = 2_048
+grad_accumulation = true
+prefetch_batches = true
+learning_rate = 5e-5
+learning_rate_warmup_iterations = 5
+learning_rate_warmup_start_iteration = 0
+learning_rate_warmup_start_factor = 0.1
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 0.0
+critic_head_only = false
+heads_only = false
+
+[evaluation]
+interval = 10
+opening_plies = 8
+opening_temperature = 0.5
+opening_generator = "alternate"
+
+[[evaluation.opponents]]
+name = "source_graph_gen244"
+kind = "checkpoint"
+checkpoint = "runs/klent/axis-gine/s4-from-mc25-tau16-alpha001-full-batch2048/checkpoints/checkpoint_000244.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "source_d6_qhead_215547"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "strix_jkcat_rel2_full"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-jkcat-rel2/checkpoints/checkpoint_00237000.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_5"
+kind = "lagged"
+lag_iterations = 5
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot_r8_d4"
+kind = "sealbot"
+games = 8
+depth = 4
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+iterations = 20
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/persistent-ray/s4-from-graph244-terminal"
+checkpoint_interval = 1
+seed = 0

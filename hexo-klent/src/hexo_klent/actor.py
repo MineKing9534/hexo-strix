@@ -38,9 +38,18 @@ class TrajectoryStep:
     action_index: int
     player: str
     state_value: float
+    # Frozen critic prediction for the action sampled at this state.  Once the
+    # game terminates this can be compared directly with the +/-1 outcome,
+    # giving on-policy critic calibration telemetry without another forward.
+    played_q: float | None = None
     target_prior_kl: float | None = None
     reward: float = 0.0
     return_target: float | None = None
+    # Optional fixed-search completed-Q labels for unplayed legal actions.
+    # The played action always retains return_target as its authoritative
+    # KLENT target and is therefore excluded from these tensors.
+    auxiliary_q_action_indices: Tensor | None = None
+    auxiliary_q_targets: Tensor | None = None
 
 
 @dataclass
@@ -367,6 +376,7 @@ def _collect_with_inference(
                         action_index=action_index,
                         player=player,
                         state_value=float(torch.dot(policy, q_f).item()),
+                        played_q=float(q_f[action_index].item()),
                         target_prior_kl=target_prior_kl,
                     )
                 )
@@ -1293,3 +1303,102 @@ def flatten_trajectories(
     trajectories: list[Trajectory],
 ) -> list[TrajectoryStep]:
     return [step for trajectory in trajectories for step in trajectory.steps]
+
+
+def terminal_played_q_calibration(
+    trajectories: list[Trajectory],
+    *,
+    opening_plies: int = 16,
+) -> dict[str, float]:
+    """Compare frozen played-action Q with eventual terminal outcomes.
+
+    The result is position weighted, matching the Q loss.  A second set of
+    metrics restricted to the first ``opening_plies`` placements prevents
+    terminal-adjacent positions from making a critic look calibrated while its
+    long-horizon opening estimates remain poor.  Truncated trajectories and
+    legacy steps without ``played_q`` are excluded rather than bootstrapped.
+    """
+
+    if opening_plies < 0:
+        raise ValueError("opening_plies cannot be negative")
+
+    def summarize(max_ply: int | None) -> dict[str, float]:
+        count = 0
+        sum_q = 0.0
+        sum_outcome = 0.0
+        sum_q_squared = 0.0
+        sum_outcome_squared = 0.0
+        sum_q_outcome = 0.0
+        sum_squared_error = 0.0
+        sum_absolute_error = 0.0
+        correct_sign = 0
+
+        for trajectory in trajectories:
+            if trajectory.truncated or trajectory.winner not in {"P1", "P2"}:
+                continue
+            for ply, step in enumerate(trajectory.steps):
+                if max_ply is not None and ply >= max_ply:
+                    break
+                if step.played_q is None:
+                    continue
+                q = float(step.played_q)
+                if not math.isfinite(q):
+                    raise FloatingPointError("non-finite played-action Q")
+                outcome = 1.0 if step.player == trajectory.winner else -1.0
+                error = q - outcome
+                count += 1
+                sum_q += q
+                sum_outcome += outcome
+                sum_q_squared += q * q
+                sum_outcome_squared += outcome * outcome
+                sum_q_outcome += q * outcome
+                sum_squared_error += error * error
+                sum_absolute_error += abs(error)
+                correct_sign += int(q * outcome > 0.0)
+
+        if count == 0:
+            return {}
+        inverse_count = 1.0 / count
+        mean_q = sum_q * inverse_count
+        mean_outcome = sum_outcome * inverse_count
+        q_variance = max(
+            0.0,
+            sum_q_squared - sum_q * sum_q * inverse_count,
+        )
+        outcome_variance = max(
+            0.0,
+            sum_outcome_squared
+            - sum_outcome * sum_outcome * inverse_count,
+        )
+        covariance = sum_q_outcome - sum_q * sum_outcome * inverse_count
+        slope = covariance / q_variance if q_variance > 0.0 else 0.0
+        correlation_denominator = math.sqrt(q_variance * outcome_variance)
+        return {
+            "positions": float(count),
+            "mse": sum_squared_error * inverse_count,
+            "mae": sum_absolute_error * inverse_count,
+            "bias": mean_q - mean_outcome,
+            "mean_q": mean_q,
+            "mean_outcome": mean_outcome,
+            "sign_accuracy": correct_sign * inverse_count,
+            "pearson_r": (
+                covariance / correlation_denominator
+                if correlation_denominator > 0.0
+                else 0.0
+            ),
+            "calibration_slope": slope,
+            "calibration_intercept": mean_outcome - slope * mean_q,
+        }
+
+    metrics = {
+        f"played_q_outcome_{key}": value
+        for key, value in summarize(None).items()
+    }
+    if opening_plies > 0:
+        metrics.update(
+            {
+                f"opening_played_q_outcome_{key}": value
+                for key, value in summarize(opening_plies).items()
+            }
+        )
+    return metrics

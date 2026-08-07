@@ -1,23 +1,22 @@
-# Monte Carlo critic-calibration arm forked from generation 10 of the fresh
-# tau=16, alpha=0.01, unclipped Axis-GINE run. This is matched to the completed
-# batch-256 arm except that tau=inf makes lambda=exp(-1/tau) exactly 1.0.
-# Every FIT sample now comes from a naturally completed game, so lambda=1 gives
-# a full terminal Monte Carlo return at every played action. The position count
-# is a soft budget; live games drain to a winner before fitting begins.
+# Controlled sparse search-Q replay from the same generation-10 anchor as the
+# terminal-only baseline. Everything through collection and ordinary KLENT FIT
+# is identical to `...terminal-from10.toml`. The sole experimental addition is
+# fixed-checkpoint completed-Q supervision on alternative actions visited by a
+# deterministic 32x8 Gumbel search. The actually played action always keeps its
+# genuine terminal return target.
 #
-# The first ten-generation diagnostic was too short to distinguish a transient
-# policy dip from critic calibration. Continue through generation 50, retaining
-# checkpoints every five generations and evaluating against both the production
-# source and the fixed generation-10 fork point. Do not lower lambda until the
-# held terminal-return calibration and matched strength trajectory agree.
+# 2,048 evenly spaced roots cover about 1.6% of each 131k-position generation;
+# roughly seven alternative labels per root add useful action-ranking signal
+# without turning the iteration into full MCTS self-play. Search is batched in
+# lockstep at 16 roots, with Gumbel noise and the forcing solver disabled. Four
+# final Q-head-only passes restore the fixed action-ranking anchor after joint
+# FIT without directly moving the shared trunk or policy head.
 #
 #   uv run hexo-klent train \
-#     --config configs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-noclip-lr5e5-batch256-from10.toml \
+#     --config configs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip-terminal-searchq-from10.toml \
 #     --resume runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt \
 #     --resume-configured-lr \
 #     --tui
-#
-# Continue the same output later with the ordinary `--resume latest`.
 
 [model]
 architecture = "graph"
@@ -51,9 +50,7 @@ rollout_horizon = 300
 [algorithm]
 alpha = 0.01
 beta = 0.10
-# Python's TOML parser accepts IEEE infinity. The configured mapping then gives
-# exp(-1 / inf) = 1.0 without approximating Monte Carlo with a very large tau.
-tau = inf
+tau = 16.0
 
 [collection]
 positions_per_iteration = 131_072
@@ -64,20 +61,29 @@ workers = 4
 batch_timeout_ms = 2.0
 
 [training]
-batch_size = 256
+batch_size = 2_048
 edge_budget = 250_000
 policy_diagnostic_samples = 2_048
 grad_accumulation = true
 prefetch_batches = true
 fit_max_autotune = true
 fit_compile_seed_nodes = 16_384
-learning_rate = 5e-5
+learning_rate = 2e-4
+learning_rate_warmup_iterations = 5
+learning_rate_warmup_start_factor = 0.1
 weight_decay = 1e-4
 q_loss_weight = 1.0
 max_grad_norm = 0.0
 
+search_q_teacher_samples = 2_048
+search_q_teacher_checkpoint = "runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt"
+search_q_teacher_simulations = 32
+search_q_teacher_actions = 8
+search_q_teacher_root_batch_size = 16
+search_q_teacher_refit_epochs = 4
+
 [evaluation]
-interval = 5
+interval = 10
 opening_plies = 8
 opening_temperature = 0.5
 opening_generator = "alternate"
@@ -86,17 +92,6 @@ opening_generator = "alternate"
 name = "source_d6_qhead_215547"
 kind = "checkpoint"
 checkpoint = "runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt"
-games = 32
-placement_radius = 8
-mcts_simulations = 24
-mcts_actions = 8
-opponent_mcts_simulations = 24
-opponent_mcts_actions = 8
-
-[[evaluation.opponents]]
-name = "mc_start_gen10"
-kind = "checkpoint"
-checkpoint = "runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt"
 games = 32
 placement_radius = 8
 mcts_simulations = 24
@@ -155,10 +150,10 @@ mcts_simulations = 24
 mcts_actions = 8
 
 [run]
-iterations = 50
+iterations = 20
 device = "cuda"
 precision = "bf16"
 compile = true
-output_dir = "runs/klent/axis-gine/s4-from-d6-qhead-lambda1-alpha001-noclip-lr5e5-batch256-terminal-from10"
+output_dir = "runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip-terminal-searchq-from10"
 checkpoint_interval = 5
 seed = 0

@@ -1279,7 +1279,7 @@ class TrainingDashboard:
         table.add_column(justify="right", style=_WHITE)
         table.add_column(style=_MUTED, ratio=1)
         table.add_column(justify="right", style=_WHITE)
-        rows = (
+        rows = [
             (
                 "POSITIONS",
                 _integer(latest.get("collection/positions")),
@@ -1332,7 +1332,7 @@ class TrainingDashboard:
                     suffix="s",
                 ),
             ),
-        )
+        ]
         for row in rows:
             table.add_row(*row)
         return Panel(
@@ -1355,7 +1355,7 @@ class TrainingDashboard:
         table.add_column(justify="right", style=_WHITE)
         table.add_column(style=_MUTED, ratio=1)
         table.add_column(justify="right", style=_WHITE)
-        rows = (
+        rows = [
             (
                 "POLICY LOSS",
                 _number(latest.get("training/policy_loss")),
@@ -1520,7 +1520,79 @@ class TrainingDashboard:
                     decimals=1,
                 ),
             ),
-        )
+        ]
+        if latest.get("collection/played_q_outcome_mse") is not None:
+            rows[5] = (
+                "MC Q MSE A / O",
+                (
+                    _number(
+                        latest.get("collection/played_q_outcome_mse"),
+                        decimals=3,
+                    )
+                    + " / "
+                    + _number(
+                        latest.get(
+                            "collection/opening_played_q_outcome_mse"
+                        ),
+                        decimals=3,
+                    )
+                ),
+                "CAL SLOPE A / O",
+                (
+                    _number(
+                        latest.get(
+                            "collection/played_q_outcome_calibration_slope"
+                        ),
+                        decimals=2,
+                    )
+                    + " / "
+                    + _number(
+                        latest.get(
+                            "collection/opening_played_q_outcome_calibration_slope"
+                        ),
+                        decimals=2,
+                    )
+                ),
+            )
+        if latest.get("training/search_q_teacher_q_mse_before") is not None:
+            search_q_mse = (
+                _number(
+                    latest.get("training/search_q_teacher_q_mse_before"),
+                    decimals=2,
+                )
+                + "/"
+                + _number(
+                    latest.get("training/search_q_teacher_q_mse_after_fit"),
+                    decimals=2,
+                )
+                + "/"
+                + _number(
+                    latest.get("training/search_q_teacher_q_mse_after"),
+                    decimals=2,
+                )
+            )
+            rows[1] = (
+                "SEARCH-Q B/F/A",
+                search_q_mse,
+                "Q RET / REFIT",
+                (
+                    _percent(
+                        latest.get("training/search_q_teacher_q_mse_progress")
+                    )
+                    + "/"
+                    + _percent(
+                        latest.get(
+                            "training/search_q_teacher_q_mse_refit_progress"
+                        )
+                    )
+                ),
+            )
+            rows[2] = (
+                rows[2][0],
+                rows[2][1],
+                "TARGET RETENTION",
+                _percent(latest.get("training/policy_target_progress")),
+            )
         for row in rows:
             table.add_row(*row)
         return Panel(
@@ -1542,7 +1614,7 @@ class TrainingDashboard:
         table.add_column(ratio=1)
         table.add_column(justify="right", width=15)
         trace_width = max(8, min(34, width - 35))
-        trends = (
+        trends = [
             (
                 "POST-FIT KL",
                 "training/policy_target_kl_after",
@@ -1586,7 +1658,29 @@ class TrainingDashboard:
             ),
             ("CLIP RATE", "training/clip_fraction", _AMBER, 3),
             ("ITERATION", "iteration_seconds", _AMBER, 1),
-        )
+        ]
+        if self._series("collection/played_q_outcome_mse"):
+            trends.insert(
+                2,
+                (
+                    "MC Q MSE",
+                    "collection/played_q_outcome_mse",
+                    _CYAN,
+                    4,
+                ),
+            )
+            trends.pop()
+        if self._series("training/search_q_teacher_q_mse_after"):
+            trends.insert(
+                2,
+                (
+                    "SEARCH-Q MSE",
+                    "training/search_q_teacher_q_mse_after",
+                    _CYAN,
+                    4,
+                ),
+            )
+            trends.pop()
         for label, key, style, decimals in trends:
             values = self._series(key)
             latest = values[-1] if values else None
@@ -1828,7 +1922,7 @@ class TrainingDashboard:
         table.add_column(justify="right", style=_WHITE)
         table.add_column(style=_MUTED, ratio=1)
         table.add_column(justify="right", style=_WHITE)
-        rows = (
+        rows = [
             (
                 "FROZEN KL B / A",
                 (
@@ -1901,7 +1995,64 @@ class TrainingDashboard:
                     decimals=1,
                 ),
             ),
-        )
+        ]
+        if latest.get("collection/played_q_outcome_mse") is not None:
+            rows[3] = (
+                "MC Q MSE A / O",
+                (
+                    _number(
+                        latest.get("collection/played_q_outcome_mse"),
+                        decimals=3,
+                    )
+                    + " / "
+                    + _number(
+                        latest.get(
+                            "collection/opening_played_q_outcome_mse"
+                        ),
+                        decimals=3,
+                    )
+                ),
+                "CAL SLOPE A / O",
+                (
+                    _number(
+                        latest.get(
+                            "collection/played_q_outcome_calibration_slope"
+                        ),
+                        decimals=2,
+                    )
+                    + " / "
+                    + _number(
+                        latest.get(
+                            "collection/opening_played_q_outcome_calibration_slope"
+                        ),
+                        decimals=2,
+                    )
+                ),
+            )
+        if latest.get("training/search_q_teacher_q_mse_before") is not None:
+            rows[1] = (
+                "SEARCH-Q B/F/A",
+                (
+                    _number(
+                        latest.get("training/search_q_teacher_q_mse_before"),
+                        decimals=2,
+                    )
+                    + "/"
+                    + _number(
+                        latest.get("training/search_q_teacher_q_mse_after_fit"),
+                        decimals=2,
+                    )
+                    + "/"
+                    + _number(
+                        latest.get("training/search_q_teacher_q_mse_after"),
+                        decimals=2,
+                    )
+                ),
+                "Q ANCHOR RET",
+                _percent(
+                    latest.get("training/search_q_teacher_q_mse_progress")
+                ),
+            )
         for row in rows:
             table.add_row(*row)
         return Panel(

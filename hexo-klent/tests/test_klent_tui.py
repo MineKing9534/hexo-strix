@@ -48,6 +48,10 @@ def _metrics(
         "collection/mean_abs_q": mean_abs_q,
         "collection/mean_q_span": 0.45,
         "collection/mean_abs_return": 0.35,
+        "collection/played_q_outcome_mse": 0.40,
+        "collection/played_q_outcome_calibration_slope": 0.90,
+        "collection/opening_played_q_outcome_mse": 0.60,
+        "collection/opening_played_q_outcome_calibration_slope": 0.70,
         "collection/elapsed_seconds": 6.0,
         "collection/positions_per_second": 2.67,
         "training/examples": 16.0,
@@ -67,6 +71,11 @@ def _metrics(
         "training/policy_target_top1_agreement_delta": 0.09,
         "training/q_loss": 0.18,
         "training/total_loss": 2.59,
+        "training/search_q_teacher_q_mse_before": 0.20,
+        "training/search_q_teacher_q_mse_after_fit": 0.28,
+        "training/search_q_teacher_q_mse_after": 0.18,
+        "training/search_q_teacher_q_mse_progress": 0.10,
+        "training/search_q_teacher_q_mse_refit_progress": 0.357,
         "training/trunk_gradient_diagnostic_examples": 4.0,
         "training/trunk_gradient_diagnostic_seconds": 0.05,
         "training/policy_trunk_grad_norm": 0.7,
@@ -533,11 +542,15 @@ def test_dashboard_renders_cockpit_and_loads_metric_history(tmp_path):
     assert "T / P TOP-1" in output
     assert "LEGAL MOVES" in output
     assert "Q SPAN" in output
+    assert "MC Q MSE A / O" in output
+    assert "CAL SLOPE A / O" in output
     assert "EXCESS KL" in output
     assert "FROZEN KL B / A" in output
     assert "TARGET RETENTION" in output
     assert "ARGMAX MATCH B / A" in output
     assert "MATCH DELTA" in output
+    assert "SEARCH-Q B/F/A" in output
+    assert "Q RET / REFIT" in output
     assert "P / Q TRUNK L2" in output
     assert "TRUNK COS" in output
     assert "OPPONENT ARRAY" in output
@@ -562,5 +575,8 @@ def test_dashboard_renders_cockpit_and_loads_metric_history(tmp_path):
     assert "EXCESS KL" in compact_output
     assert "TARGET RETENTION" in compact_output
     assert "T / P TOP-1" in compact_output
-    assert "Q SPAN" in compact_output
+    assert "MC Q MSE A / O" in compact_output
+    assert "CAL SLOPE A / O" in compact_output
+    assert "SEARCH-Q B/F/A" in compact_output
+    assert "Q ANCHOR RET" in compact_output
     assert "SAFE HALT" in compact_output

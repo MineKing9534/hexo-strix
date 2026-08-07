@@ -6,11 +6,14 @@ import torch
 from hexo_a0.config import ModelConfig
 from hexo_klent.actor import (
     SharedInferenceActors,
+    Trajectory,
+    TrajectoryStep,
     _actor_worker_main,
     _collect_with_inference,
     collect_games,
     collect_games_parallel,
     flatten_trajectories,
+    terminal_played_q_calibration,
 )
 from hexo_klent.config import AlgorithmConfig, GameConfig
 from hexo_klent.model import KlentNet
@@ -59,6 +62,10 @@ def test_collect_games_drains_to_terminal_games_with_fresh_targets():
     assert stats.p1_wins + stats.p2_wins + stats.truncations == stats.games
     assert all(sample.return_target is not None for sample in samples)
     assert all(
+        sample.played_q is not None and math.isfinite(sample.played_q)
+        for sample in samples
+    )
+    assert all(
         sample.target_policy.sum().item() == pytest.approx(1.0)
         for sample in samples
     )
@@ -98,6 +105,50 @@ def test_collect_games_drains_to_terminal_games_with_fresh_targets():
         / len(samples)
     )
     assert stats.mean_q_span == pytest.approx(0.0)
+
+
+def test_terminal_played_q_calibration_uses_terminal_player_outcomes():
+    def step(player: str, q: float | None) -> TrajectoryStep:
+        return TrajectoryStep(
+            state=object(),
+            target_policy=torch.tensor([1.0]),
+            action_index=0,
+            player=player,
+            state_value=0.0,
+            played_q=q,
+        )
+
+    trajectories = [
+        Trajectory(
+            [step("P1", 0.8), step("P2", -0.6)],
+            winner="P1",
+        ),
+        Trajectory(
+            [step("P1", -0.2), step("P2", 0.4)],
+            winner="P2",
+        ),
+        # Neither an unfinished game nor a legacy step without played_q may
+        # contaminate the genuinely terminal calibration sample.
+        Trajectory([step("P1", 100.0)], truncated=True),
+        Trajectory([step("P1", None)], winner="P1"),
+    ]
+
+    metrics = terminal_played_q_calibration(trajectories, opening_plies=1)
+
+    assert metrics["played_q_outcome_positions"] == 4
+    assert metrics["played_q_outcome_mse"] == pytest.approx(0.3)
+    assert metrics["played_q_outcome_mae"] == pytest.approx(0.5)
+    assert metrics["played_q_outcome_bias"] == pytest.approx(0.1)
+    assert metrics["played_q_outcome_sign_accuracy"] == 1.0
+    assert metrics["played_q_outcome_calibration_slope"] == pytest.approx(
+        2.0 / 1.16
+    )
+    assert metrics["opening_played_q_outcome_positions"] == 2
+    assert metrics["opening_played_q_outcome_mse"] == pytest.approx(0.34)
+    assert metrics["opening_played_q_outcome_sign_accuracy"] == 1.0
+    assert metrics["opening_played_q_outcome_calibration_slope"] == pytest.approx(
+        2.0
+    )
 
 
 def test_collection_model_forward_runs_in_inference_mode():
