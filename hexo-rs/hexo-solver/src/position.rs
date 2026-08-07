@@ -55,6 +55,24 @@ pub enum SolverEngine {
     Pdspn,
 }
 
+/// A position-solver verdict plus the engine's measurable work counter.
+///
+/// IDTT does not currently expose its internal node count, so `nodes` is zero
+/// for that engine. For DFPN/PDS-PN it is MID expansions; for PNS it is
+/// best-first tree expansions. The counters are engine-specific and useful for
+/// budget accounting, but should not be compared as equivalent units of work.
+#[derive(Debug)]
+pub struct PositionSolveResult {
+    pub outcome: Outcome,
+    pub nodes: u64,
+    pub certificate: Option<prover::certificate::ProofCertificate>,
+    pub certificate_summary: Option<prover::certificate::ProofSummary>,
+}
+
+/// Native/legacy PDS-PN level-2 cap. Browser callers may override this through
+/// the configured entry points after calibrating for their device/workload.
+pub const DEFAULT_PN2_NODES: u64 = 50_000;
+
 impl SolverPosition {
     /// Build a `SolverBoard` directly from the stones, replicating the pre-sizing
     /// + reach-tracking setup that `forcing::solve_ex` does for a `GameState`:
@@ -159,16 +177,46 @@ fn spread_is_valid(stones: &[(Coord, Player)]) -> bool {
 
 /// Solve from an arbitrary position using the selected engine.
 ///
-/// `depth_cap` bounds the iterative-deepening / search depth; `node_budget` bounds
-/// the search nodes (or TT expansions). See the module docs for the
-/// engine-specific arbitrary-board caveats.
+/// For IDTT, `depth_cap` is an attacker-turn horizon and `node_budget` bounds the
+/// search work. The deep proof engines are driven by `node_budget`; their
+/// `depth_cap` is used only if a proven result needs IDTT fallback to recover a
+/// principal variation. See the module docs for the engine-specific
+/// arbitrary-board caveats.
 pub fn solve_from_position(
     position: &SolverPosition,
     engine: SolverEngine,
     depth_cap: u8,
     node_budget: u64,
 ) -> Outcome {
-    dispatch(position, engine, depth_cap, node_budget, false)
+    solve_from_position_with_stats(position, engine, depth_cap, node_budget).outcome
+}
+
+/// Like [`solve_from_position`], but retain the selected engine's node counter.
+pub fn solve_from_position_with_stats(
+    position: &SolverPosition,
+    engine: SolverEngine,
+    depth_cap: u8,
+    node_budget: u64,
+) -> PositionSolveResult {
+    solve_from_position_with_stats_configured(
+        position,
+        engine,
+        depth_cap,
+        node_budget,
+        DEFAULT_PN2_NODES,
+    )
+}
+
+/// Like [`solve_from_position_with_stats`], with an explicit PDS-PN level-2
+/// expansion cap. The value is ignored by IDTT, DFPN, and standalone PNS.
+pub fn solve_from_position_with_stats_configured(
+    position: &SolverPosition,
+    engine: SolverEngine,
+    depth_cap: u8,
+    node_budget: u64,
+    pn2_nodes: u64,
+) -> PositionSolveResult {
+    dispatch(position, engine, depth_cap, node_budget, pn2_nodes, false)
 }
 
 /// Like [`solve_from_position`] but with the experimental wide-partner generator
@@ -182,7 +230,36 @@ pub fn solve_wide_from_position(
     depth_cap: u8,
     node_budget: u64,
 ) -> Outcome {
-    dispatch(position, engine, depth_cap, node_budget, true)
+    solve_wide_from_position_with_stats(position, engine, depth_cap, node_budget).outcome
+}
+
+/// Like [`solve_wide_from_position`], but retain the selected engine's node
+/// counter.
+pub fn solve_wide_from_position_with_stats(
+    position: &SolverPosition,
+    engine: SolverEngine,
+    depth_cap: u8,
+    node_budget: u64,
+) -> PositionSolveResult {
+    solve_wide_from_position_with_stats_configured(
+        position,
+        engine,
+        depth_cap,
+        node_budget,
+        DEFAULT_PN2_NODES,
+    )
+}
+
+/// Wide-generator counterpart of
+/// [`solve_from_position_with_stats_configured`].
+pub fn solve_wide_from_position_with_stats_configured(
+    position: &SolverPosition,
+    engine: SolverEngine,
+    depth_cap: u8,
+    node_budget: u64,
+    pn2_nodes: u64,
+) -> PositionSolveResult {
+    dispatch(position, engine, depth_cap, node_budget, pn2_nodes, true)
 }
 
 /// Defensive analysis for the side to move (see [`forcing::solve_defense`]):
@@ -259,16 +336,17 @@ fn dispatch(
     engine: SolverEngine,
     depth_cap: u8,
     node_budget: u64,
+    pn2_nodes: u64,
     wide: bool,
-) -> Outcome {
+) -> PositionSolveResult {
     // The strip-scan buffers are stack-sized for win_length in 1..=MAX_WL; anything
     // else cannot be analyzed — report an honest give-up, never a bogus `No`.
     if !(1..=MAX_WL).contains(&(position.win_length as usize)) {
-        return Outcome::BudgetExceeded;
+        return budget_exceeded();
     }
     // moves_remaining must be 1 or 2 (a turn has at most two placements).
     if !(1..=2).contains(&position.moves_remaining) {
-        return Outcome::BudgetExceeded;
+        return budget_exceeded();
     }
     // Pathological-spread guard (mirrors forcing::solve_ex + KernelCtx::new_wide):
     // protects the idtt board-level path (and is a harmless belt-and-suspenders
@@ -276,13 +354,13 @@ fn dispatch(
     // coordinate spread would blow up the dense grid or overflow grid arithmetic;
     // give up honestly instead of aborting/OOMing.
     if !spread_is_valid(&position.stones) {
-        return Outcome::BudgetExceeded;
+        return budget_exceeded();
     }
 
     match engine {
         SolverEngine::Idtt => {
             let mut board = position.to_solver_board();
-            forcing::solve_from_board(
+            let outcome = forcing::solve_from_board(
                 &mut board,
                 position.to_move,
                 position.moves_remaining,
@@ -292,7 +370,13 @@ fn dispatch(
                 node_budget,
                 wide,
                 Limits::default(),
-            )
+            );
+            PositionSolveResult {
+                outcome,
+                nodes: 0,
+                certificate: None,
+                certificate_summary: None,
+            }
         }
         SolverEngine::Dfpn | SolverEngine::Pdspn | SolverEngine::Pns => {
             // Deep provers: see the module-level caveat. The search itself (KernelCtx
@@ -301,10 +385,10 @@ fn dispatch(
             // contradictory `(0,0,P2)` or any duplicate coord. Restrict to game-valid
             // positions; idtt handles arbitrary boards.
             if !is_game_valid_board(&position.stones) {
-                return Outcome::BudgetExceeded;
+                return budget_exceeded();
             }
             let prover_pos = position.to_prover_position();
-            let cfg = prover_config(engine, depth_cap, node_budget, wide);
+            let cfg = prover_config(engine, depth_cap, node_budget, pn2_nodes, wide);
             let ctl = prover::Ctl::new(0.0);
             let result = match engine {
                 SolverEngine::Dfpn => prover::dfpn::solve(&prover_pos, &cfg, &ctl),
@@ -314,14 +398,39 @@ fn dispatch(
                 SolverEngine::Pns => pns_solve(&prover_pos, &cfg, &ctl),
                 _ => unreachable!(),
             };
-            driver_to_outcome(result)
+            let nodes = result.stats.nodes;
+            let certificate = result.certificate.clone();
+            let certificate_summary = certificate
+                .as_ref()
+                .and_then(|cert| prover::certificate::verify(&prover_pos, cert).ok());
+            PositionSolveResult {
+                outcome: driver_to_outcome(result),
+                nodes,
+                certificate,
+                certificate_summary,
+            }
         }
+    }
+}
+
+fn budget_exceeded() -> PositionSolveResult {
+    PositionSolveResult {
+        outcome: Outcome::BudgetExceeded,
+        nodes: 0,
+        certificate: None,
+        certificate_summary: None,
     }
 }
 
 /// Build a [`prover::ProverConfig`] for one deep-prover run from the public
 /// dispatch params.
-fn prover_config(engine: SolverEngine, depth_cap: u8, node_budget: u64, wide: bool) -> prover::ProverConfig {
+fn prover_config(
+    engine: SolverEngine,
+    depth_cap: u8,
+    node_budget: u64,
+    pn2_nodes: u64,
+    wide: bool,
+) -> prover::ProverConfig {
     let driver = match engine {
         SolverEngine::Dfpn => prover::DriverKind::Dfpn,
         SolverEngine::Pdspn => prover::DriverKind::Pdspn,
@@ -335,8 +444,11 @@ fn prover_config(engine: SolverEngine, depth_cap: u8, node_budget: u64, wide: bo
         wide,
         depth_cap,
         node_budget,
-        tt_mb: 512,
-        pn2_nodes: 50_000,
+        // A browser worker should not reserve the native CLI's full 512 MiB TT.
+        // 128 MiB leaves room for the board, generated moves, and JS/WASM runtime
+        // while retaining a useful deep-prover table on desktop browsers.
+        tt_mb: if cfg!(target_arch = "wasm32") { 128 } else { 512 },
+        pn2_nodes: pn2_nodes.max(1),
         leaf_budget: 1_000_000,
         leaf_budget_max: 10_000_000,
         time_limit_s: 0.0,
@@ -401,7 +513,10 @@ fn pns_solve(pos: &prover::io::Position, cfg: &prover::ProverConfig, ctl: &prove
         None => return prover::DriverResult::new(Verdict::BudgetExceeded),
     };
     let root = Node::Or { placements: pos.placements_remaining };
-    let mut search = PnSearch::new(cfg.pn2_nodes);
+    // Standalone PNS is the public engine selected by the caller, so its cap is
+    // the public node budget. `pn2_nodes` is only the per-leaf level-2 cap used
+    // inside PDS-PN.
+    let mut search = PnSearch::new(cfg.node_budget);
     // `Instant::now()` traps at runtime on wasm32-unknown-unknown (no monotonic
     // clock in std for that target). The elapsed value is only used for the
     // `stats.elapsed_s` report (not correctness), so on wasm we report 0.0.
@@ -422,6 +537,7 @@ fn pns_solve(pos: &prover::io::Position, cfg: &prover::ProverConfig, ctl: &prove
         Verdict::BudgetExceeded
     };
     let mut res = prover::DriverResult::new(verdict);
+    res.stats.nodes = search.expansions();
     res.stats.elapsed_s = elapsed;
     res
 }
@@ -508,8 +624,21 @@ mod tests {
     fn pdspn_agrees_with_idtt() {
         let pos = tiny_win_position();
         let idtt = solve_from_position(&pos, SolverEngine::Idtt, 6, 20_000);
-        let pdspn = solve_from_position(&pos, SolverEngine::Pdspn, 6, 20_000);
-        assert_eq!(idtt.is_win(), pdspn.is_win(), "pdspn must agree with idtt");
+        let pdspn = solve_from_position_with_stats(&pos, SolverEngine::Pdspn, 6, 20_000);
+        assert_eq!(idtt.is_win(), pdspn.outcome.is_win(), "pdspn must agree with idtt");
+        let certificate = pdspn.certificate.as_ref().expect("pdspn WIN certificate");
+        let summary = pdspn.certificate_summary.expect("verified certificate summary");
+        assert!(summary.dag_nodes > 0);
+        assert!(summary.max_attacker_turns > 0);
+
+        // The verifier recomputes node shape instead of trusting the JSON. A
+        // defender-shaped terminal at the attacker root must be rejected.
+        let mut tampered = certificate.clone();
+        tampered.nodes[tampered.root as usize] = prover::certificate::ProofNode::Unstoppable;
+        assert!(
+            prover::certificate::verify(&pos.to_prover_position(), &tampered).is_err(),
+            "tampered root must not verify"
+        );
     }
 
     #[test]
@@ -518,6 +647,19 @@ mod tests {
         let idtt = solve_from_position(&pos, SolverEngine::Idtt, 6, 20_000);
         let pns = solve_from_position(&pos, SolverEngine::Pns, 6, 20_000);
         assert_eq!(idtt.is_win(), pns.is_win(), "pns must agree with idtt");
+    }
+
+    #[test]
+    fn deep_position_results_retain_budgeted_node_counts() {
+        let pos = tiny_win_position();
+        let dfpn = solve_from_position_with_stats(&pos, SolverEngine::Dfpn, 6, 20_000);
+        assert!(dfpn.outcome.is_win());
+        assert!(dfpn.nodes > 0 && dfpn.nodes <= 20_000);
+
+        // Standalone PNS used to ignore the public node budget and silently run
+        // its PDS-PN leaf default of 50k. A one-node request must now stop at one.
+        let pns = solve_from_position_with_stats(&pos, SolverEngine::Pns, 6, 1);
+        assert_eq!(pns.nodes, 1);
     }
 
     #[test]

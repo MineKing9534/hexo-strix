@@ -226,6 +226,11 @@ impl PnSearch {
         PnSearch { arena: Vec::new(), max_nodes: max_nodes.max(1), expansions: 0 }
     }
 
+    /// Number of nodes expanded by the most recent [`Self::search`] call.
+    pub(crate) fn expansions(&self) -> u64 {
+        self.expansions
+    }
+
     /// Run PN search from `root_node` (board in `k` must be at that position).
     /// Returns `(pn, dn)` of the root when it is (dis)proved or the node cap is
     /// hit. The board is restored to the root position on return.

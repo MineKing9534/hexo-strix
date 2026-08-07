@@ -116,7 +116,14 @@ function viewPath(mode) { return URL_PREFIX + (mode === "analysis" ? "/analysis"
 function currentPathView() {
   let p = location.pathname;
   if (URL_PREFIX && p.startsWith(URL_PREFIX)) p = p.slice(URL_PREFIX.length) || "/";
-  return /^\/analysis\/?$/.test(p) ? "analysis" : "play";
+  return /^\/analysis\/?$/.test(p) || /^\/proof\/[A-Za-z0-9_-]{43}\/?$/.test(p)
+    ? "analysis" : "play";
+}
+function savedProofIdFromPath() {
+  let p = location.pathname;
+  if (URL_PREFIX && p.startsWith(URL_PREFIX)) p = p.slice(URL_PREFIX.length) || "/";
+  const match = /^\/proof\/([A-Za-z0-9_-]{43})\/?$/.exec(p);
+  return match ? match[1] : null;
 }
 // Carry only the hash that belongs to the target view across a navigation.
 function relevantHash(mode) {

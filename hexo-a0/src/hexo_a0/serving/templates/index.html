@@ -70,6 +70,62 @@
     <label>Paste HTTTX
       <textarea id="analysis-htttx" rows="4" placeholder="version[1];\n1. [1,0][2,0];\n..."></textarea>
     </label>
+    <div id="analysis-forcing-depth-control">
+      <div class="analysis-solver-heading">
+        <div class="analysis-solver-title">Forced-win proof lab</div>
+        <span class="analysis-local-badge">on this device</span>
+      </div>
+      <label for="analysis-forcing-engine">Engine
+        <select id="analysis-forcing-engine" onchange="updateForcingSolverUi()">
+          <option value="idtt" selected>IDTT · shortest bounded proof</option>
+          <option value="dfpn">DFPN · deep proof search</option>
+          <option value="pdspn">PDS-PN · layered deep search</option>
+          <option value="pns">PNS · verdict-only cross-check</option>
+        </select>
+      </label>
+      <label for="analysis-forcing-width">Move generator
+        <select id="analysis-forcing-width">
+          <option value="wide" selected>Wide · includes quiet builders</option>
+          <option value="tight">Tight · direct threats only</option>
+        </select>
+      </label>
+      <label id="analysis-forcing-depth-row" for="analysis-forcing-depth">
+        <span id="analysis-forcing-depth-label">Attacker-turn depth cap</span>
+        <span class="analysis-depth-input"><input id="analysis-forcing-depth" type="number" min="1" max="60" value="12" step="1" inputmode="numeric"> attacker turns</span>
+      </label>
+      <label for="analysis-forcing-budget"><span id="analysis-forcing-budget-label">Work budget</span>
+        <select id="analysis-forcing-budget">
+          <option value="20000">20k · quick</option>
+          <option value="250000" selected>250k · standard</option>
+          <option value="1000000">1m · thorough</option>
+          <option value="5000000">5m · deep</option>
+          <option value="25000000">25m · composition</option>
+          <option value="100000000">100m · long run</option>
+        </select>
+      </label>
+      <label id="analysis-forcing-leaf-row" for="analysis-forcing-leaf-budget" hidden>
+        <span>PN leaf cap</span>
+        <select id="analysis-forcing-leaf-budget">
+          <option value="1000">1k · light</option>
+          <option value="2000">2k</option>
+          <option value="5000" selected>5k · recommended</option>
+          <option value="10000">10k</option>
+          <option value="25000">25k</option>
+          <option value="50000">50k · intensive</option>
+        </select>
+      </label>
+      <div class="analysis-solver-actions">
+        <button id="analysis-solve-forcing-btn" onclick="solveCurrentForcing()">Run proof search</button>
+        <button id="analysis-cancel-forcing-btn" onclick="cancelForcingSolve()" hidden>Cancel</button>
+        <button id="analysis-explore-certificate-btn" onclick="openProofExplorer()" hidden>Explore proof</button>
+        <button id="analysis-share-certificate-btn" onclick="shareForcingCertificate()" hidden>Share proof</button>
+        <button id="analysis-download-certificate-btn" onclick="downloadForcingCertificate()" hidden>Download proof</button>
+        <span id="proof-share-status" class="proof-share-status" role="status" aria-live="polite"></span>
+      </div>
+      <div id="analysis-forcing-status" role="status" aria-live="polite">Ready. The solver runs in a background worker and does not use server CPU.</div>
+      <div id="analysis-solver-help" class="analysis-depth-help">IDTT searches for the shortest forced win through the selected attacker-turn depth. The completing turn counts; a mid-turn start still counts as one turn.</div>
+      <div class="analysis-budget-help">The work budget is an engine counter, not a time limit. PDS-PN counts outer nodes and has a separate per-frontier PN leaf cap. Compare verdicts—not raw counters. Wide search is more complete but may spend the budget faster.</div>
+    </div>
     <div class="row">
       <button onclick="loadAnalysis()">Load / Analyze</button>
       <label><input type="checkbox" id="analysis-heatmap" checked onchange="rerenderCurrentAnalysis()"> Suggested moves</label>
@@ -110,6 +166,49 @@
     </div>
   </div>
 </div>
+<div id="proof-explorer" role="dialog" aria-modal="true" aria-labelledby="proof-explorer-title" hidden>
+  <header class="proof-explorer-header">
+    <div class="proof-explorer-heading">
+      <span class="proof-explorer-kicker">Verified PDS-PN strategy</span>
+      <h2 id="proof-explorer-title">Proof explorer</h2>
+      <span id="proof-explorer-summary"></span>
+    </div>
+    <div class="proof-explorer-actions">
+      <button id="proof-back-btn" onclick="proofExplorerBack()" title="Previous proof decision">&#8592; Back</button>
+      <button onclick="proofExplorerReset()" title="Return to the certificate root">Reset</button>
+      <button id="proof-worst-btn" class="proof-primary" onclick="proofExplorerWorstCase()" title="Advance along a defense that maximizes the certified bound">Next worst case &#8594;</button>
+      <button id="proof-alternatives-btn" onclick="proofExplorerFindAlternatives()" title="Jump to the nearest proof position with multiple certified attacks">Find alternatives</button>
+      <button onclick="proofFitBoard()" title="Fit the current proof position on screen">Fit board</button>
+      <button id="proof-share-btn" onclick="shareForcingCertificate()" title="Save this verified proof and copy its direct URL">Share</button>
+      <button onclick="downloadForcingCertificate()">Download</button>
+      <button id="proof-close-btn" class="proof-close" onclick="closeProofExplorer()" aria-label="Close proof explorer">Close</button>
+    </div>
+  </header>
+  <div class="proof-explorer-body">
+    <section id="proof-board-container" aria-label="Proof position board">
+      <svg id="proof-board" aria-label="HeXO proof board"></svg>
+      <div class="proof-board-tools" aria-label="Board zoom controls">
+        <button onclick="proofZoom(1.25)" aria-label="Zoom in">+</button>
+        <button onclick="proofZoom(0.8)" aria-label="Zoom out">&#8722;</button>
+        <button onclick="proofFitBoard()">Fit</button>
+      </div>
+      <div class="proof-board-legend">
+        <span><i id="proof-attacker-swatch" class="proof-sw"></i><span id="proof-attacker-legend">attacker</span></span>
+        <span><i id="proof-defender-swatch" class="proof-sw"></i><span id="proof-defender-legend">defender</span></span>
+        <span><i class="proof-sw proof-sw-choice"></i>available reply</span>
+      </div>
+    </section>
+    <aside class="proof-explorer-panel">
+      <div class="proof-progress-copy"><span id="proof-progress-label"></span><span id="proof-node-label"></span></div>
+      <div class="proof-progress-track"><div id="proof-progress-bar"></div></div>
+      <div id="proof-step-card"></div>
+      <div id="proof-choices" class="proof-choices"></div>
+      <div class="proof-path-heading"><span>Your path through the proof</span><small>click any step to rewind</small></div>
+      <div id="proof-breadcrumbs" class="proof-breadcrumbs"></div>
+      <div class="proof-explorer-note">Attacker nodes show every winning attack retained by this solve; some positions retain only one. Defender nodes enumerate every exact non-losing defense. “Worst case” means the reply with the largest remaining verified bound—not necessarily the move a human would choose.</div>
+    </aside>
+  </div>
+</div>
 <div id="modal-bg">
   <div id="modal">
     <h2 id="modal-title">New game</h2>
@@ -141,8 +240,17 @@
   </div>
 </div>
 <script>
-window.__HEXO_CFG__ = {urlPrefix: "__URL_PREFIX__", difficultySims: "__DIFFICULTY_SIMS__", defaultDifficulty: "__DEFAULT_DIFFICULTY__"};
+window.__HEXO_CFG__ = {
+  urlPrefix: "__URL_PREFIX__",
+  difficultySims: "__DIFFICULTY_SIMS__",
+  defaultDifficulty: "__DEFAULT_DIFFICULTY__",
+  winLength: __WIN_LENGTH__,
+  placementRadius: __PLACEMENT_RADIUS__,
+  maxMoves: __MAX_MOVES__,
+  assetVersion: "__ASSET_V__"
+};
 </script>
 <script src="__PREFIX_RAW__/static/shared.js?v=__ASSET_V__"></script>
 <script src="__PREFIX_RAW__/static/play.js?v=__ASSET_V__"></script>
-<script src="__PREFIX_RAW__/static/analysis.js?v=__ASSET_V__"></script></body></html>
+<script src="__PREFIX_RAW__/static/analysis.js?v=__ASSET_V__"></script>
+<script src="__PREFIX_RAW__/static/proof-explorer.js?v=__ASSET_V__"></script></body></html>

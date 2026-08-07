@@ -14,11 +14,14 @@
 //!       [--leaf-budget 1000000] [--leaf-budget-max 10000000]
 //!       [--time-limit 1800]                      (seconds, wall clock; 0 = none)
 //!       [--race-set idtt,dfpn,pdspn]
+//!       [--verify-certificate certificate-or-report.json]
 //!       [--out report.json]
+//!   prove --verify-certificate proof-bundle.json [--position position.json]
 //! ```
 
 use hexo_rs::prover::io::{Line, Position, Report};
 use hexo_rs::prover::{DriverKind, ProverConfig, run};
+use hexo_rs::prover::certificate::{ProofCertificate, verify as verify_proof_certificate};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -28,12 +31,14 @@ struct Args {
     driver: Option<DriverKind>,
     cfg: ProverConfig,
     out: Option<PathBuf>,
+    verify_certificate: Option<PathBuf>,
 }
 
 fn usage() -> &'static str {
     "usage: prove --position pos.json [--lines a.json ...] [--driver idtt|dfpn|pdspn|hybrid|race] \
      [--width tight|wide] [--depth-cap N] [--node-budget N] [--tt-mb N] [--pn2-nodes N] \
-     [--leaf-budget N] [--leaf-budget-max N] [--time-limit SECS] [--race-set d,d,...] [--out report.json]"
+     [--leaf-budget N] [--leaf-budget-max N] [--time-limit SECS] [--race-set d,d,...] \
+     [--out report.json]\n       prove --verify-certificate proof-bundle.json [--position position.json]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -43,6 +48,7 @@ fn parse_args() -> Result<Args, String> {
         driver: None,
         cfg: ProverConfig::default(),
         out: None,
+        verify_certificate: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -55,6 +61,9 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--position" => a.position = Some(PathBuf::from(next(&mut i, &argv, "--position")?)),
             "--out" => a.out = Some(PathBuf::from(next(&mut i, &argv, "--out")?)),
+            "--verify-certificate" => {
+                a.verify_certificate = Some(PathBuf::from(next(&mut i, &argv, "--verify-certificate")?))
+            }
             "--lines" => {
                 // Consume following args until the next flag.
                 while i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
@@ -139,6 +148,33 @@ fn print_summary(report: &Report) {
 
 fn run_cli() -> Result<(), String> {
     let args = parse_args()?;
+    if let Some(path) = &args.verify_certificate {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        let pos = if let Some(pos_path) = &args.position {
+            Position::load(pos_path)?
+        } else if let Some(position) = value.get("position") {
+            Position::from_json(&position.to_string())
+                .map_err(|e| format!("parsing embedded position in {}: {e}", path.display()))?
+        } else {
+            return Err(format!(
+                "--position is required when the certificate file has no embedded position\n{}",
+                usage()
+            ));
+        };
+        let certificate_value = value.get("certificate").unwrap_or(&value);
+        let certificate: ProofCertificate = serde_json::from_value(certificate_value.clone())
+            .map_err(|e| format!("parsing certificate in {}: {e}", path.display()))?;
+        let summary = verify_proof_certificate(&pos, &certificate)
+            .map_err(|e| format!("certificate verification failed: {e}"))?;
+        eprintln!(
+            "certificate verified: dag_nodes={} proof_edges={} max_attacker_turns={}",
+            summary.dag_nodes, summary.proof_edges, summary.max_attacker_turns
+        );
+        return Ok(());
+    }
     let pos_path = args.position.ok_or_else(|| format!("--position is required\n{}", usage()))?;
     let pos = Position::load(&pos_path)?;
     let lines: Vec<Line> =
@@ -150,6 +186,14 @@ fn run_cli() -> Result<(), String> {
     });
 
     let report = run(&pos, &lines, &cfg);
+    if let Some(certificate) = &report.certificate {
+        let summary = verify_proof_certificate(&pos, certificate)
+            .map_err(|e| format!("generated certificate failed verification: {e}"))?;
+        eprintln!(
+            "certificate: verified dag_nodes={} proof_edges={} max_attacker_turns={}",
+            summary.dag_nodes, summary.proof_edges, summary.max_attacker_turns
+        );
+    }
     let json = report.to_json();
     if let Some(out) = &args.out {
         std::fs::write(out, &json).map_err(|e| format!("writing {}: {e}", out.display()))?;

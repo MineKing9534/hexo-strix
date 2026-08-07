@@ -10,6 +10,7 @@
 //! This module owns the shared config/verdict types, the `idtt` wrapper, and the
 //! top-level dispatch. No PyO3 surface, no production-path changes.
 
+pub mod certificate;
 pub mod dfpn;
 #[cfg(test)]
 mod fixtures;
@@ -22,6 +23,7 @@ pub mod portfolio;
 
 use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::Coord;
+use certificate::ProofCertificate;
 use io::{Line, Position, Report, Stats, UnverifiedBranch, Verdict};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -143,11 +145,19 @@ pub struct DriverResult {
     pub pv: Vec<Coord>,
     pub stats: Stats,
     pub unverified: Vec<UnverifiedBranch>,
+    pub certificate: Option<ProofCertificate>,
 }
 
 impl DriverResult {
     pub fn new(verdict: Verdict) -> DriverResult {
-        DriverResult { verdict, depth: None, pv: Vec::new(), stats: Stats::default(), unverified: Vec::new() }
+        DriverResult {
+            verdict,
+            depth: None,
+            pv: Vec::new(),
+            stats: Stats::default(),
+            unverified: Vec::new(),
+            certificate: None,
+        }
     }
 }
 
@@ -219,5 +229,6 @@ pub fn run(pos: &Position, lines: &[Line], cfg: &ProverConfig) -> Report {
         stats: res.stats,
         race: Vec::new(),
         unverified: res.unverified,
+        certificate: res.certificate,
     }
 }

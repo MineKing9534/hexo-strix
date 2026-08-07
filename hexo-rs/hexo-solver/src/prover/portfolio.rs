@@ -79,6 +79,7 @@ pub fn race(pos: &Position, lines: &[Line], cfg: &ProverConfig) -> Report {
             stats: res.stats,
             race,
             unverified: res.unverified.clone(),
+            certificate: res.certificate.clone(),
         },
         None => Report {
             verdict: super::io::Verdict::BudgetExceeded,
@@ -89,6 +90,7 @@ pub fn race(pos: &Position, lines: &[Line], cfg: &ProverConfig) -> Report {
             stats: super::io::Stats::default(),
             race,
             unverified: Vec::new(),
+            certificate: None,
         },
     }
 }

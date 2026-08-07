@@ -6,7 +6,7 @@
 use super::io::{Line, PosConfig, Position, Verdict};
 use super::kernel::KernelCtx;
 use super::pn::{INF, ProofTt, one_plus_eps, sat_add};
-use super::{Ctl, DriverKind, ProverConfig, dfpn, hybrid, idtt, pdspn};
+use super::{Ctl, DriverKind, ProverConfig, certificate, dfpn, hybrid, idtt, pdspn};
 use hexo_engine::types::{Coord, Player};
 use std::path::PathBuf;
 use Player::{P1, P2};
@@ -106,6 +106,7 @@ fn parity_dfpn_matches_idtt_fast() {
 fn parity_pdspn_matches_idtt_fast() {
     let cfg = fast_cfg();
     let ctl = Ctl::new(0.0);
+    let mut checked_incomplete_defense = false;
     for &(name, stones, atk, expected) in FAST {
         let p = pos(stones, atk, 2);
         let pd = pdspn::solve(&p, &cfg, &ctl);
@@ -113,10 +114,37 @@ fn parity_pdspn_matches_idtt_fast() {
             Some(_) => {
                 assert_eq!(pd.verdict, Verdict::Win, "{name}: pdspn must WIN");
                 assert_pv_wins(&p, &pd.pv);
+                let cert = pd
+                    .certificate
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{name}: pdspn WIN must carry a certificate"));
+                let summary = certificate::verify(&p, cert)
+                    .unwrap_or_else(|e| panic!("{name}: certificate must verify: {e}"));
+                assert!(summary.dag_nodes > 0, "{name}: non-empty proof DAG");
+                assert!(summary.max_attacker_turns > 0, "{name}: positive proof depth");
+                if !checked_incomplete_defense {
+                    let mut tampered = cert.clone();
+                    if let Some(certificate::ProofNode::DefenderReplies { responses }) = tampered
+                        .nodes
+                        .iter_mut()
+                        .find(|node| matches!(node, certificate::ProofNode::DefenderReplies { responses } if !responses.is_empty()))
+                    {
+                        responses.pop();
+                        assert!(
+                            certificate::verify(&p, &tampered).is_err(),
+                            "{name}: omitting one legal defense must invalidate the DAG"
+                        );
+                        checked_incomplete_defense = true;
+                    }
+                }
             }
             None => assert_ne!(pd.verdict, Verdict::Win, "{name}: pdspn must not fabricate a WIN"),
         }
     }
+    assert!(
+        checked_incomplete_defense,
+        "fast proof corpus must exercise all-defense completeness checking"
+    );
 }
 
 // ---- slow parity fixtures (the big/deep ones) ----

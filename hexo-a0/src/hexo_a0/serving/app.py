@@ -30,6 +30,9 @@ from hexo_a0.serving import hds
 from hexo_a0.serving.game import DEFAULT_DIFFICULTY, DEFAULT_DIFFICULTY_SIMS, DIFFICULTY_ORDER, GameError, GameManager, ServerBusyError, UnknownGameError, make_bot_turn_fn
 from hexo_a0.serving.inference import InferenceGuard, InferenceBusy
 from hexo_a0.serving.model import load_model, load_native_model
+from hexo_a0.serving.proofs import (
+    PROOF_ID_RE, PROOF_MAX_BODY_BYTES, ProofStore, ProofValidationError,
+)
 from hexo_a0.serving.recorder import Recorder
 
 # Static frontend assets (CSS/JS/fonts) live beside this module and are served
@@ -55,6 +58,7 @@ _STATIC_TYPES = {
     ".png": "image/png",
     ".ico": "image/x-icon",
     ".json": "application/json; charset=utf-8",
+    ".wasm": "application/wasm",
 }
 
 
@@ -62,7 +66,8 @@ def _asset_version() -> str:
     """Short cache-busting token from the newest static asset mtime, so a
     redeploy of CSS/JS invalidates browser caches without manual versioning."""
     try:
-        latest = max((p.stat().st_mtime_ns for p in _STATIC_DIR.glob("*.*")), default=0)
+        latest = max((p.stat().st_mtime_ns for p in _STATIC_DIR.rglob("*") if p.is_file()),
+                     default=0)
     except OSError:
         latest = 0
     return format(latest & 0xFFFFFFFF, "x")
@@ -76,6 +81,7 @@ ANALYZE_RATE_PER_MIN = 30  # per-client cap on /analyze + /analyze_trajectory (G
 NEW_GAME_RATE_PER_MIN = 20  # per-client cap on /new_game (bot-turn flood backstop)
 ANALYZE_GAME_RATE_PER_MIN = 6  # per-client cap on /analyze_game (full-game MCTS job is heavy)
 ANALYZE_GAME_MAX_INFLIGHT = 4  # cap concurrent /analyze_game requests (queue-slot exhaustion backstop)
+PROOF_SAVE_RATE_PER_MIN = 6  # per-client cap on persisted proof uploads
 
 logger = logging.getLogger("hexo_a0.serving")
 
@@ -861,7 +867,9 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                        max_concurrent: int = MAX_CONCURRENT,
                        analyze_limiter: RateLimiter | None = None,
                        new_game_limiter: RateLimiter | None = None,
-                       analyze_game_limiter: RateLimiter | None = None):
+                       analyze_game_limiter: RateLimiter | None = None,
+                       proof_store: ProofStore | None = None,
+                       proof_save_limiter: RateLimiter | None = None):
     concurrency = threading.BoundedSemaphore(max_concurrent)
     # Caps concurrently-queued full-game analysis jobs (queue-slot exhaustion).
     analyze_game_semaphore = threading.Semaphore(ANALYZE_GAME_MAX_INFLIGHT)
@@ -901,14 +909,20 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
             # /admin response (keyed on path alone) to a later wrong-token request.
             self.send_header("Cache-Control", "no-store, private")
             # The play UI is inline <script>/<style>, so 'unsafe-inline' is
-            # required; the policy still blocks external-script injection.
+            # required. The analysis worker instantiates the bundled solver,
+            # so browsers also need the narrower WebAssembly compilation token;
+            # this does not permit arbitrary JavaScript eval.
             self.send_header("Content-Security-Policy",
-                             "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                             "default-src 'self'; script-src 'self' 'unsafe-inline' "
+                             "'wasm-unsafe-eval'; "
                              "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-                             "connect-src 'self'")
+                             "connect-src 'self'; worker-src 'self'")
 
         def _send_json(self, status: int, body: dict):
             data = json.dumps(body).encode()
+            self._send_json_bytes(status, data)
+
+        def _send_json_bytes(self, status: int, data: bytes):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -965,7 +979,7 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
             self.end_headers()
             self.wfile.write(data)
 
-        def _read_json(self) -> dict:
+        def _read_json(self, *, limit: int | None = None) -> dict:
             # Force the connection to close after this response. stdlib
             # http.server doesn't decode chunked bodies and we may reject before
             # reading the body; closing the connection flushes any unread bytes
@@ -986,7 +1000,8 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                 # A negative Content-Length would make rfile.read(-1) consume
                 # the whole stream and bypass the body cap — reject outright.
                 raise BadRequestError("negative Content-Length")
-            if length > max_body_bytes:
+            body_limit = max_body_bytes if limit is None else limit
+            if length > body_limit:
                 raise PayloadTooLargeError(f"request body too large: {length} bytes")
             # Require a JSON content type BEFORE the empty-body short-circuit:
             # a cross-origin <form method=POST> with no fields sends Content-Length 0
@@ -1032,9 +1047,10 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
 
         def _do_get(self):
             path, query = self._route_path()
-            # Play ("/") and analysis ("/analysis") are the same SPA shell served
-            # at two paths; the client selects the view from location.pathname.
-            if path in ("/", "", "/analysis"):
+            proof_route = re.fullmatch(r"/proof/([A-Za-z0-9_-]{43})", path)
+            # Play ("/"), analysis ("/analysis"), and a direct saved-proof URL
+            # are the same SPA shell; the client selects from location.pathname.
+            if path in ("/", "", "/analysis") or proof_route:
                 diffs = mgr.difficulty_sims or {}
                 ordered = {k: diffs[k] for k in DIFFICULTY_ORDER if k in diffs}
                 # json.dumps escapes " and \ but not <, and these land inside a
@@ -1053,12 +1069,26 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                             .replace('"__URL_PREFIX__"', _js(url_prefix))
                             .replace('"__DIFFICULTY_SIMS__"', _js(ordered))
                             .replace('"__DEFAULT_DIFFICULTY__"', _js(mgr.default_difficulty))
+                            .replace('__WIN_LENGTH__', str(int(mgr.game_kwargs["win_length"])))
+                            .replace('__PLACEMENT_RADIUS__',
+                                     str(int(mgr.game_kwargs["placement_radius"])))
+                            .replace('__MAX_MOVES__', str(int(mgr.game_kwargs["max_moves"])))
                             # absolute origin for OG tags; bare prefix for attribute contexts
                             .replace('__BASE_URL__', html.escape(base_url, quote=True))
                             .replace('__PREFIX_RAW__', html.escape(url_prefix, quote=True))
                             # cache-bust assets on change (max static mtime)
                             .replace('__ASSET_V__', _asset_version()))
                 self._send_html(html_out)
+            elif path.startswith("/api/proofs/"):
+                proof_id = path[len("/api/proofs/"):]
+                if proof_store is None or not PROOF_ID_RE.fullmatch(proof_id):
+                    self.send_error(404)
+                    return
+                payload = proof_store.get_json_bytes(proof_id)
+                if payload is None:
+                    self.send_error(404)
+                    return
+                self._send_json_bytes(200, payload)
             elif path.startswith("/static/"):
                 self._send_static(path[len("/static/"):])
             elif path == "/stats":
@@ -1095,7 +1125,24 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                 return
             try:
                 path, _ = self._route_path()
-                if path == "/new_game":
+                if path == "/api/proofs":
+                    if proof_store is None:
+                        self._send_json(503, {"error": "saved proofs are disabled"})
+                        return
+                    if proof_save_limiter is not None \
+                            and not proof_save_limiter.allow(self._client_key()):
+                        self._send_json(503, {"error": "rate limit: too many proof saves"})
+                        return
+                    body = self._read_json(limit=PROOF_MAX_BODY_BYTES)
+                    try:
+                        proof_id = proof_store.put(body)
+                    except ProofValidationError as error:
+                        raise BadRequestError(str(error)) from error
+                    self._send_json(200, {
+                        "id": proof_id,
+                        "url": f"{url_prefix}/proof/{proof_id}",
+                    })
+                elif path == "/new_game":
                     if new_game_limiter is not None and not new_game_limiter.allow(self._client_key()):
                         self._send_json(503, {"error": "rate limit: too many new games"})
                         return
@@ -1340,11 +1387,18 @@ def _serve(cfg, analyze_ctx):
     analyze_limiter = RateLimiter(ANALYZE_RATE_PER_MIN)
     new_game_limiter = RateLimiter(NEW_GAME_RATE_PER_MIN)
     analyze_game_limiter = RateLimiter(ANALYZE_GAME_RATE_PER_MIN)
+    proof_save_limiter = RateLimiter(PROOF_SAVE_RATE_PER_MIN)
+    proof_db = ":memory:"
+    if cfg.db and cfg.db != ":memory:":
+        proof_db = str(Path(cfg.db).with_suffix(".proofs.sqlite"))
+    proof_store = ProofStore(proof_db)
     handler_cls = make_handler_class(mgr, admin_token=admin_token, url_prefix=url_prefix,
                                      analyze_ctx=analyze_ctx,
                                      analyze_limiter=analyze_limiter,
                                      new_game_limiter=new_game_limiter,
-                                     analyze_game_limiter=analyze_game_limiter)
+                                     analyze_game_limiter=analyze_game_limiter,
+                                     proof_store=proof_store,
+                                     proof_save_limiter=proof_save_limiter)
     # Per-connection socket timeout comes from Handler.timeout (a class attr),
     # NOT server.timeout (which only governs serve_forever's poll interval).
     # Wire --request-timeout to the one that actually bounds a stuck request.

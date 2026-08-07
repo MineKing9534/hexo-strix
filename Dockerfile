@@ -111,9 +111,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     GRP=""; [ -n "$TORCH_GROUP" ] && GRP="--group $TORCH_GROUP --all-extras"; \
     uv sync --frozen --no-dev --no-editable $GRP
 
-# Fail the build early if the static assets weren't packaged into the venv.
-RUN test -n "$(find /app/.venv -type d -name static -path '*serving*' -print -quit)" \
-    || (echo 'ERROR: serving/static not found in .venv — static assets missing' >&2; exit 1)
+# Fail the build early if the browser solver bundle was not packaged into the
+# venv along with the ordinary frontend assets.
+RUN test -n "$(find /app/.venv -type f -path '*serving/static/solver/hexo_wasm.js' -print -quit)" \
+    && test -n "$(find /app/.venv -type f -path '*serving/static/solver/hexo_wasm_bg.wasm' -print -quit)" \
+    || (echo 'ERROR: serving WASM solver assets missing from installed package' >&2; exit 1)
 
 ########################################
 # Stage 2 — runtime

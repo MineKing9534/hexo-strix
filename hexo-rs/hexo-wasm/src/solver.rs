@@ -2,7 +2,7 @@
 //!
 //! Pure combinatorial search (no model weights) wired to the `hexo-solver`
 //! crate. Exposes [`StrixSolver`] with `solve` / `solve_wide` / `solve_threat`
-//! (Task 5) and a `solve_defense` stub (Task 6 fills it in).
+//! plus tight/wide defensive analysis.
 //!
 //! Timing note: `std::time::Instant::now()` panics at runtime on
 //! `wasm32-unknown-unknown` (no monotonic clock in std for that target). We
@@ -13,8 +13,10 @@
 use hexo_engine::types::{Coord, Player as EnginePlayer};
 use hexo_solver::forcing::{ForcingWin, Outcome};
 use hexo_solver::{
-    is_game_valid_board, solve_defense_verdict_from_position, solve_from_position, DefenseVerdict,
-    solve_wide_from_position, SolverEngine, SolverPosition,
+    is_game_valid_board, solve_defense_verdict_from_position,
+    solve_from_position_with_stats_configured, solve_wide_from_position_with_stats_configured,
+    verify_proof_certificate, DefenseVerdict, ProofCertificate, SolverEngine, SolverPosition,
+    DEFAULT_PN2_NODES,
 };
 use wasm_bindgen::prelude::*;
 
@@ -106,8 +108,14 @@ impl Position {
 
 #[wasm_bindgen]
 pub struct SolverLimits {
+    /// IDTT attacker-turn horizon. For DFPN/PDS-PN this only bounds fallback
+    /// principal-variation recovery; their main proof is node-budget driven.
     pub depth_cap: u8,
+    /// Maximum engine work counter. Node meanings are engine-specific.
     pub node_budget: u64,
+    /// PDS-PN level-2 expansions per newly reached frontier. Ignored by the
+    /// other engines. This is separate from the outer `node_budget`.
+    pub pn2_nodes: u64,
     pub engine: SolverEngineEnum,
 }
 
@@ -115,7 +123,7 @@ pub struct SolverLimits {
 impl SolverLimits {
     #[wasm_bindgen(constructor)]
     pub fn new(depth_cap: u8, node_budget: u64, engine: SolverEngineEnum) -> Self {
-        SolverLimits { depth_cap, node_budget, engine }
+        SolverLimits { depth_cap, node_budget, pn2_nodes: DEFAULT_PN2_NODES, engine }
     }
 }
 
@@ -143,6 +151,21 @@ pub struct SolveOutcome {
     pub nodes: u64,
     pub time_ms: f64,
     pub pv: Vec<Turn>,
+    /// Pretty JSON for a replay-verified PDS-PN all-defense DAG; empty for other
+    /// engines/verdicts or if optional reconstruction failed.
+    pub certificate_json: String,
+    pub certificate_nodes: u64,
+    pub certificate_edges: u64,
+    pub certificate_max_attacker_turns: u32,
+}
+
+/// Measurements recomputed by the independent all-defense certificate verifier.
+#[wasm_bindgen]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CertificateVerification {
+    pub dag_nodes: u64,
+    pub proof_edges: u64,
+    pub max_attacker_turns: u32,
 }
 
 // --- Task 6: defense analysis export ---
@@ -226,6 +249,52 @@ impl StrixSolver {
         limits: &SolverLimits,
     ) -> Result<SolveOutcome, JsError> {
         Self::solve_inner(position, limits, true)
+    }
+
+    /// Replay and verify a serialized PDS-PN all-defense certificate from
+    /// scratch. This does not consult a search tree, proof numbers, or TT: every
+    /// attacker action and the complete set of exact defender replies is
+    /// recomputed by the shared forcing kernel.
+    pub fn verify_certificate(
+        &self,
+        position: &Position,
+        certificate_json: &str,
+    ) -> Result<CertificateVerification, JsError> {
+        let pos = convert_position(position)?;
+        if !is_game_valid_board(&pos.stones) {
+            return Err(JsError::new(
+                "certificate verification requires a game-valid position",
+            ));
+        }
+        if !(1..=2).contains(&pos.moves_remaining) {
+            return Err(JsError::new(
+                "certificate verification requires moves_remaining of 1 or 2",
+            ));
+        }
+        if !(1..=64).contains(&pos.placement_radius) {
+            return Err(JsError::new(
+                "certificate verification requires 1 <= placement_radius <= 64",
+            ));
+        }
+        let certificate: ProofCertificate = serde_json::from_str(certificate_json)
+            .map_err(|error| JsError::new(&format!("invalid certificate JSON: {error}")))?;
+        let proof_position = hexo_solver::prover::io::Position {
+            stones: pos.stones,
+            attacker: pos.to_move,
+            placements_remaining: pos.moves_remaining,
+            config: hexo_solver::prover::io::PosConfig {
+                win_length: pos.win_length,
+                placement_radius: pos.placement_radius,
+                max_moves: pos.max_moves,
+            },
+        };
+        let summary = verify_proof_certificate(&proof_position, &certificate)
+            .map_err(|error| JsError::new(&format!("certificate verification failed: {error}")))?;
+        Ok(CertificateVerification {
+            dag_nodes: summary.dag_nodes,
+            proof_edges: summary.proof_edges,
+            max_attacker_turns: summary.max_attacker_turns,
+        })
     }
 
     /// Opponent's forcing win if left unblocked: flip `to_move` and solve.
@@ -360,6 +429,10 @@ impl StrixSolver {
                     nodes: 0, // solve_defense does not surface sub-solve node counts
                     time_ms: 0.0, // the threat sub-solve's own time is not isolated
                     pv: chunk_pv(&a.threat_pv, 2, threat_attacker),
+                    certificate_json: String::new(),
+                    certificate_nodes: 0,
+                    certificate_edges: 0,
+                    certificate_max_attacker_turns: 0,
                 });
                 Ok(DefenseOutcome {
                     kind: DefenseKind::ThreatFound,
@@ -396,17 +469,38 @@ impl StrixSolver {
             SolverEngineEnum::Dfpn => SolverEngine::Dfpn,
             SolverEngineEnum::Pdspn => SolverEngine::Pdspn,
         };
-        let outcome = if wide {
-            solve_wide_from_position(&pos, engine, limits.depth_cap, limits.node_budget)
+        let result = if wide {
+            solve_wide_from_position_with_stats_configured(
+                &pos,
+                engine,
+                limits.depth_cap,
+                limits.node_budget,
+                limits.pn2_nodes,
+            )
         } else {
-            solve_from_position(&pos, engine, limits.depth_cap, limits.node_budget)
+            solve_from_position_with_stats_configured(
+                &pos,
+                engine,
+                limits.depth_cap,
+                limits.node_budget,
+                limits.pn2_nodes,
+            )
         };
         let time_ms = elapsed_ms(t0);
+        let certificate_json = result
+            .certificate
+            .as_ref()
+            .map(|certificate| certificate.to_json())
+            .unwrap_or_default();
+        let certificate_summary = result.certificate_summary.unwrap_or_default();
         Ok(convert_outcome(
-            &outcome,
+            &result.outcome,
+            result.nodes,
             time_ms,
             position.moves_remaining,
             position.to_move,
+            certificate_json,
+            certificate_summary,
         ))
     }
 }
@@ -516,31 +610,46 @@ fn opponent(p: Player) -> Player {
 
 fn convert_outcome(
     outcome: &Outcome,
+    nodes: u64,
     time_ms: f64,
     moves_remaining: u8,
     attacker: Player,
+    certificate_json: String,
+    certificate_summary: hexo_solver::ProofSummary,
 ) -> SolveOutcome {
     match outcome {
         Outcome::Win(w) => SolveOutcome {
             kind: SolveKind::Win,
             depth: w.depth,
-            nodes: 0, // idtt does not report nodes; deep provers do via stats (future)
+            nodes,
             time_ms,
             pv: chunk_pv(&w.pv, moves_remaining, attacker),
+            certificate_json,
+            certificate_nodes: certificate_summary.dag_nodes,
+            certificate_edges: certificate_summary.proof_edges,
+            certificate_max_attacker_turns: certificate_summary.max_attacker_turns,
         },
         Outcome::No => SolveOutcome {
             kind: SolveKind::No,
             depth: 0,
-            nodes: 0,
+            nodes,
             time_ms,
             pv: Vec::new(),
+            certificate_json: String::new(),
+            certificate_nodes: 0,
+            certificate_edges: 0,
+            certificate_max_attacker_turns: 0,
         },
         Outcome::BudgetExceeded => SolveOutcome {
             kind: SolveKind::BudgetExceeded,
             depth: 0,
-            nodes: 0,
+            nodes,
             time_ms,
             pv: Vec::new(),
+            certificate_json: String::new(),
+            certificate_nodes: 0,
+            certificate_edges: 0,
+            certificate_max_attacker_turns: 0,
         },
     }
 }
@@ -570,6 +679,7 @@ mod tests {
         SolverLimits {
             depth_cap: depth,
             node_budget: budget,
+            pn2_nodes: DEFAULT_PN2_NODES,
             engine: SolverEngineEnum::Idtt,
         }
     }

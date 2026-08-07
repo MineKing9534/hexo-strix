@@ -171,9 +171,43 @@ impl KernelCtx {
         })
     }
 
+    /// Rebuild the current board into an independent context with empty memos.
+    ///
+    /// PDS-PN's level-2 PN tree is intentionally disposable. Running it through
+    /// the level-1 context would nevertheless retain every level-2 position in
+    /// `comps`/`gencache`, making hundreds of nominally bounded leaf searches
+    /// accumulate gigabytes. An isolated context preserves the same board/hash
+    /// and rules while letting all of a leaf search's memoized vectors drop with
+    /// that leaf.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn isolated(&self) -> KernelCtx {
+        KernelCtx::new_wide(
+            &self.board.stones,
+            self.atk,
+            self.wl,
+            self.radius,
+            self.wide,
+        )
+        .expect("an existing kernel position must rebuild with the same rules")
+    }
+
     #[inline]
     pub(crate) fn hash(&self) -> u64 {
         self.board.hash
+    }
+
+    /// Canonical exact board snapshot used only by the proof-certificate
+    /// verifier to ensure a DAG node is never reused for a different position.
+    pub(crate) fn canonical_stones(&self) -> Vec<(Coord, Player)> {
+        let mut stones = self.board.stones.clone();
+        stones.sort_unstable_by_key(|&(coord, player)| {
+            let player = match player {
+                Player::P1 => 1u8,
+                Player::P2 => 2u8,
+            };
+            (coord.0, coord.1, player)
+        });
+        stones
     }
 
     /// (attacker completions, defender completions), memoized by `board.hash`.

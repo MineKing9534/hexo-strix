@@ -584,6 +584,10 @@ def test_analyze_position_reports_movers_forced_win():
     js = r.to_json()
     pv = js["forcing"]["pv"]
     assert pv and all(isinstance(m, list) and len(m) == 2 for m in pv)
+    # With two placements left, P1 can fill both gaps and complete this line
+    # during the current turn: depth 1, even though the PV has two placements.
+    assert js["forcing"]["depth"] == 1
+    assert js["forcing"]["line_placements"] == len(pv)
     assert js["forcing"]["pv_len"] == len(pv)
 
 
@@ -648,6 +652,8 @@ def test_analyze_position_pv_owners_variable_length_first_chunk():
         expected_owners.append(replay.current_player())
         replay.apply_move(q, r_)
     assert owners == expected_owners
+    assert js["depth"] == 2  # current partial turn + the completing full turn
+    assert js["line_placements"] == len(pv) == 5
     # This fixture's PV has a length-1 first chunk (not 2) — the input shape
     # the old pairs-of-2 heuristic mislabelled from index 1 onward.
     assert owners[0] != owners[1]
@@ -941,7 +947,8 @@ def test_analyze_game_full_missed_win_flagged(monkeypatch):
     assert "missed_win" not in traj[2]  # flag lands on the squander, not the win itself
     assert traj[3]["missed_win"] == {
         "by": "P1", "at_prefix": 2, "first_move": [10, 0],
-        "pv": [[10, 0], [10, 1]], "pv_len": 2, "pv_owners": ["P1", "P1"],
+        "depth": None, "pv": [[10, 0], [10, 1]],
+        "line_placements": 2, "pv_len": 2, "pv_owners": ["P1", "P1"],
     }
 
 
@@ -1025,7 +1032,8 @@ def test_analyze_game_full_turn_ending_squandered_win_flagged(monkeypatch):
     out = analyze_game_full(_ZeroLogitModel(), mc, _MISSED_GAME, 6, 8, 400, mcts_sims=0)
     assert out["trajectory"][4]["missed_win"] == {
         "by": "P1", "at_prefix": 3, "first_move": [10, 0],
-        "pv": [[10, 0], [10, 1]], "pv_len": 2, "pv_owners": ["P1", "P1"],
+        "depth": None, "pv": [[10, 0], [10, 1]],
+        "line_placements": 2, "pv_len": 2, "pv_owners": ["P1", "P1"],
     }
 
 

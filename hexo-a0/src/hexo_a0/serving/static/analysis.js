@@ -50,6 +50,7 @@ async function copyHdsHtttx() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  updateForcingSolverUi();
   // The path selects the screen; the hash carries the line/game. Old share links
   // were "/#c=<moves>" (analysis hash on the play path) — upgrade them in place to
   // "/analysis#c=..." so path and content agree.
@@ -62,6 +63,11 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   if (view === "analysis") {
     setView("analysis");
+    const savedProofId = savedProofIdFromPath();
+    if (savedProofId) {
+      await loadSavedProof(savedProofId);
+      return;
+    }
     // Deep link into a specific line: #c=<compact> (or legacy #a=<decimal>).
     let deepMoves = null;
     if (location.hash.startsWith("#c=")) deepMoves = decodeMovesCompact(location.hash.slice(3));
@@ -105,6 +111,32 @@ window.addEventListener("DOMContentLoaded", async () => {
 let analysisMode = false;
 let analysisMoves = [];          // loaded mainline move list incl. [0,0] seed
 let analysisTrajectory = null;   // /analyze_game result (drives the eval bar)
+const DEFAULT_ANALYSIS_FORCING_DEPTH = 12;
+const MAX_ANALYSIS_FORCING_DEPTH = 60;
+const FORCING_ENGINE_INFO = {
+  idtt: {
+    label: "IDTT",
+    help: "IDTT searches for the shortest forced win through the selected attacker-turn depth. The completing turn counts; a mid-turn start still counts as one turn.",
+  },
+  dfpn: {
+    label: "DFPN",
+    help: "DFPN is driven by the work budget and is better suited to deep composition proofs. The depth setting only caps fallback proof-line recovery; it does not limit the main proof search.",
+  },
+  pdspn: {
+    label: "PDS-PN",
+    help: "PDS-PN combines a depth-first outer proof with a separately bounded PN search at each new frontier. The outer budget and reported nodes count only outer expansions; the PN leaf cap controls frontier guidance. The recovery cap does not limit the main proof search.",
+  },
+  pns: {
+    label: "PNS",
+    help: "PNS is an independent, verdict-only cross-check: it can prove Win or No but does not return a line or depth. Its in-memory tree is capped at 1m nodes in the browser UI.",
+  },
+};
+let forcingUiEngine = "idtt";
+let forcingIdttDepth = DEFAULT_ANALYSIS_FORCING_DEPTH;
+let forcingDeepRecoveryDepth = MAX_ANALYSIS_FORCING_DEPTH;
+let forcingWorker = null;
+let forcingRun = null;
+let forcingRequestSerial = 0;
 let analysisView = { x: 0, y: 0, scale: 1 };
 let analysisPanning = false, analysisPanStart = { x: 0, y: 0, vx: 0, vy: 0 };
 function updateAnalysisHash() {
@@ -159,6 +191,375 @@ function playerAtDepth(depth) {
   // Seed (depth 0) is P1; then P2,P2,P1,P1,P2,P2,... (2 placements/turn).
   if (depth === 0) return "P1";
   return ((depth - 1) % 4) < 2 ? "P2" : "P1";
+}
+
+function forcingDepthFromUi() {
+  const input = document.getElementById("analysis-forcing-depth");
+  let depth = Number(input ? input.value : DEFAULT_ANALYSIS_FORCING_DEPTH);
+  if (!Number.isInteger(depth)) depth = DEFAULT_ANALYSIS_FORCING_DEPTH;
+  depth = Math.max(1, Math.min(MAX_ANALYSIS_FORCING_DEPTH, depth));
+  if (input) input.value = String(depth);
+  return depth;
+}
+
+function updateForcingSolverUi() {
+  const engineSelect = document.getElementById("analysis-forcing-engine");
+  const depthInput = document.getElementById("analysis-forcing-depth");
+  if (!engineSelect || !depthInput) return;
+  const next = engineSelect.value;
+  if (next !== forcingUiEngine) {
+    if (forcingUiEngine === "idtt") forcingIdttDepth = forcingDepthFromUi();
+    else if (forcingUiEngine !== "pns") forcingDeepRecoveryDepth = forcingDepthFromUi();
+    depthInput.value = String(next === "idtt" ? forcingIdttDepth : forcingDeepRecoveryDepth);
+    forcingUiEngine = next;
+  }
+  const isPns = next === "pns";
+  const isIdtt = next === "idtt";
+  document.getElementById("analysis-forcing-depth-row").hidden = isPns;
+  document.getElementById("analysis-forcing-leaf-row").hidden = next !== "pdspn";
+  document.getElementById("analysis-forcing-depth-label").textContent = isIdtt
+    ? "Attacker-turn depth cap" : "Proof-line recovery cap";
+  document.getElementById("analysis-forcing-budget-label").textContent = next === "pdspn"
+    ? "Outer node budget" : "Work budget";
+  document.getElementById("analysis-solver-help").textContent = FORCING_ENGINE_INFO[next].help;
+
+  // Best-first PNS retains its whole tree. Very large budgets can exhaust a
+  // browser tab before the counter is reached; DFPN/PDS-PN are the long-run
+  // engines and keep the larger steps available.
+  const budget = document.getElementById("analysis-forcing-budget");
+  for (const option of budget.options) {
+    option.disabled = isPns && Number(option.value) > 1_000_000;
+  }
+  if (isPns && Number(budget.value) > 1_000_000) budget.value = "1000000";
+}
+
+function setForcingStatus(message, state = "") {
+  const status = document.getElementById("analysis-forcing-status");
+  if (!status) return;
+  status.textContent = message;
+  if (state) status.dataset.state = state;
+  else delete status.dataset.state;
+}
+
+function restoreForcingStatusForNode(node) {
+  const search = node && node.result && node.result.forcing_search;
+  const hasCertificate = Boolean(node && node.result && node.result.forcing_certificate);
+  for (const id of ["analysis-explore-certificate-btn", "analysis-share-certificate-btn",
+                    "analysis-download-certificate-btn"]) {
+    const button = document.getElementById(id);
+    if (button) button.hidden = !hasCertificate;
+  }
+  if (!search) {
+    setForcingStatus("Ready. The solver runs in a background worker and does not use server CPU.");
+    return;
+  }
+  const engine = FORCING_ENGINE_INFO[search.engine];
+  const label = engine ? engine.label : search.engine;
+  const width = search.width === "wide" ? "Wide" : "Tight";
+  const elapsed = formatSolverElapsed(search.elapsed_ms);
+  const work = formatSolverNodes(search.nodes, search.engine);
+  if (search.kind === "win") {
+    const proof = search.proof_depth != null
+      ? formatForcingLine(search.engine, search.proof_depth, search.line_placements)
+      : "verdict only";
+    const leaf = search.engine === "pdspn" && search.leaf_node_budget
+      ? ` · ${Number(search.leaf_node_budget).toLocaleString()} PN leaf cap` : "";
+    const certificate = search.certificate_summary;
+    const certified = certificate
+      ? ` · verified all-defense DAG ${certificate.dagNodes.toLocaleString()} nodes, worst-case ${certificate.maxAttackerTurns} attacker turns`
+      : "";
+    setForcingStatus(`Last run: proven forced win (${proof}). ${label} · ${width} · ${work}${leaf}${certified} · ${elapsed}.`, "win");
+  } else if (search.kind === "no") {
+    setForcingStatus(`Last run: proven no forced win in the selected scope. ${label} · ${width} · ${work} · ${elapsed}.`, "no");
+  } else {
+    setForcingStatus(`Last run: work budget exhausted; inconclusive. ${label} · ${width} · ${work} · ${elapsed}.`, "budget");
+  }
+}
+
+function setForcingControlsRunning(running) {
+  const button = document.getElementById("analysis-solve-forcing-btn");
+  const cancel = document.getElementById("analysis-cancel-forcing-btn");
+  button.disabled = running;
+  cancel.hidden = !running;
+  for (const id of ["analysis-explore-certificate-btn", "analysis-share-certificate-btn",
+                    "analysis-download-certificate-btn"]) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = running;
+  }
+  for (const id of ["analysis-forcing-engine", "analysis-forcing-width",
+                    "analysis-forcing-depth", "analysis-forcing-budget",
+                    "analysis-forcing-leaf-budget"]) {
+    document.getElementById(id).disabled = running;
+  }
+}
+
+function forcingPosition(node) {
+  const result = node && node.result;
+  if (!result) throw new Error("Load a position first.");
+  if (result.terminal) throw new Error("The selected position is already terminal.");
+  if (!result.current_player || !Array.isArray(result.stones)) {
+    throw new Error("This position has not finished loading yet.");
+  }
+  const stonesFlat = [];
+  for (const stone of result.stones) {
+    if (!Array.isArray(stone) || !Array.isArray(stone[0])) continue;
+    stonesFlat.push(Number(stone[0][0]), Number(stone[0][1]), stone[1] === "P1" ? 1 : 2);
+  }
+  const placementsAfterOrigin = Math.max(0, lineOf(node).length - 1);
+  const rules = window.__HEXO_CFG__ || {};
+  return {
+    winLength: Number(rules.winLength || 6),
+    placementRadius: Number(rules.placementRadius || 8),
+    maxMoves: Number(rules.maxMoves || 400),
+    toMove: result.current_player,
+    movesRemaining: placementsAfterOrigin % 2 === 0 ? 2 : 1,
+    stonesFlat,
+  };
+}
+
+function portableProofPosition(position) {
+  const stones = [];
+  for (let i = 0; i < position.stonesFlat.length; i += 3) {
+    stones.push([
+      position.stonesFlat[i],
+      position.stonesFlat[i + 1],
+      position.stonesFlat[i + 2] === 1 ? "P1" : "P2",
+    ]);
+  }
+  return {
+    stones,
+    attacker: position.toMove,
+    placements_remaining: position.movesRemaining,
+    config: {
+      win_length: position.winLength,
+      placement_radius: position.placementRadius,
+      max_moves: position.maxMoves,
+    },
+  };
+}
+
+function forcingWorkerUrl() {
+  const version = encodeURIComponent((window.__HEXO_CFG__ || {}).assetVersion || "");
+  return `${URL_PREFIX}/static/solver-worker.js?v=${version}`;
+}
+
+function ensureForcingWorker() {
+  if (forcingWorker) return forcingWorker;
+  forcingWorker = new Worker(forcingWorkerUrl(), {type: "module", name: "strix-forced-win"});
+  forcingWorker.onmessage = (event) => {
+    const message = event.data || {};
+    if (!forcingRun || message.requestId !== forcingRun.id) return;
+    if (message.type === "result") finishForcingSolve(message.result);
+    else if (message.type === "error") failForcingSolve(message.error);
+  };
+  forcingWorker.onerror = (event) => {
+    if (forcingRun) failForcingSolve(event.message || "The solver worker crashed.");
+  };
+  return forcingWorker;
+}
+
+function formatSolverElapsed(ms) {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10_000 ? 0 : 1)}s` : `${ms.toFixed(0)}ms`;
+}
+
+function formatSolverNodes(nodes, engine = "") {
+  if (!nodes || nodes === "0") return "node count unavailable";
+  const suffix = engine === "pdspn" ? " outer nodes" : " nodes";
+  try { return `${BigInt(nodes).toLocaleString()}${suffix}`; }
+  catch (_error) { return `${nodes}${suffix}`; }
+}
+
+function formatSolverBudget(engine, budget) {
+  return engine === "pdspn"
+    ? `${budget.toLocaleString()}-outer-node budget`
+    : `${budget.toLocaleString()}-node work budget`;
+}
+
+function formatForcingLine(engine, attackerTurns, placements) {
+  const turns = Number(attackerTurns);
+  const placementText = `${placements} placement${placements === 1 ? "" : "s"}`;
+  if (engine && engine !== "idtt") {
+    return `sample line ${turns} attacker turn${turns === 1 ? "" : "s"}, ${placementText}`;
+  }
+  return `depth ${turns} attacker turn${turns === 1 ? "" : "s"}, ${placementText}`;
+}
+
+function settleForcingUi() {
+  if (forcingRun && forcingRun.ticker) clearInterval(forcingRun.ticker);
+  setForcingControlsRunning(false);
+}
+
+function releaseForcingWorker() {
+  if (forcingWorker) forcingWorker.terminate();
+  forcingWorker = null;
+}
+
+function finishForcingSolve(result) {
+  if (!forcingRun) return;
+  const run = forcingRun;
+  settleForcingUi();
+  forcingRun = null;
+  // Rust allocations are freed by the worker, but WebAssembly linear memory
+  // cannot shrink. End the one-shot worker so a deep proof's arena/TT is
+  // actually returned to the browser after its serialized result arrives.
+  releaseForcingWorker();
+  const engineInfo = FORCING_ENGINE_INFO[run.engine];
+  const widthLabel = run.width === "wide" ? "Wide" : "Tight";
+  const elapsed = formatSolverElapsed(result.elapsedMs);
+  const work = formatSolverNodes(result.nodes, run.engine);
+  run.node.result.forcing_search = {
+    kind: result.kind,
+    engine: run.engine,
+    width: run.width,
+    depth_cap: run.depth,
+    node_budget: run.budget,
+    leaf_node_budget: run.engine === "pdspn" ? run.leafBudget : null,
+    nodes: result.nodes,
+    elapsed_ms: result.elapsedMs,
+    proof_depth: result.depth,
+    line_placements: result.pv.length,
+    certificate_summary: result.certificateSummary,
+  };
+
+  if (result.certificate && result.certificateSummary) {
+    run.node.result.forcing_certificate = {
+      format: "hexo-pdspn-proof-bundle-v1",
+      position: portableProofPosition(run.position),
+      engine: run.engine,
+      width: run.width,
+      verification: result.certificateSummary,
+      certificate: result.certificate,
+    };
+  } else {
+    delete run.node.result.forcing_certificate;
+  }
+  for (const id of ["analysis-explore-certificate-btn", "analysis-share-certificate-btn",
+                    "analysis-download-certificate-btn"]) {
+    const button = document.getElementById(id);
+    if (button) button.hidden = !run.node.result.forcing_certificate;
+  }
+
+  if (result.kind === "win") {
+    const hasLine = result.pv.length > 0;
+    run.node.result.forcing = {
+      winner: run.position.toMove,
+      attacker_is_mover: true,
+      first_move: hasLine ? result.pv[0] : null,
+      depth: result.depth,
+      pv: result.pv,
+      line_placements: result.pv.length,
+      pv_len: result.pv.length,
+      pv_owners: hasLine ? result.pvOwners : null,
+      wide: run.width === "wide",
+      engine: run.engine,
+      certificate_summary: result.certificateSummary,
+      verdict_only: !hasLine,
+      defense: null,
+    };
+    const proof = hasLine
+      ? formatForcingLine(run.engine, result.depth, result.pv.length)
+      : "verdict only; no proof line";
+    const leaf = run.engine === "pdspn"
+      ? ` · ${run.leafBudget.toLocaleString()} PN leaf cap` : "";
+    const certificate = result.certificateSummary;
+    const certified = certificate
+      ? ` · verified all-defense DAG ${certificate.dagNodes.toLocaleString()} nodes / ${certificate.proofEdges.toLocaleString()} edges · worst-case ${certificate.maxAttackerTurns} attacker turns`
+      : "";
+    setForcingStatus(
+      `Proven forced win for ${run.position.toMove} (${proof}). ${engineInfo.label} · ${widthLabel} · ${work}${leaf}${certified} · ${elapsed}.`,
+      "win",
+    );
+  } else if (result.kind === "no") {
+    const scope = run.engine === "idtt"
+      ? `through depth ${run.depth} attacker turns`
+      : `in the ${widthLabel.toLowerCase()} forcing search`;
+    setForcingStatus(
+      `Proven no forced win for ${run.position.toMove} ${scope}. ${engineInfo.label} · ${work} · ${elapsed}.`,
+      "no",
+    );
+  } else {
+    setForcingStatus(
+      `Inconclusive: ${engineInfo.label} exhausted the ${formatSolverBudget(run.engine, run.budget)}. ${widthLabel} · ${work} · ${elapsed}. Raise the budget or try another engine.`,
+      "budget",
+    );
+  }
+  if (analysisCurrent === run.node) {
+    renderNode(run.node);
+    renderMoveTree();
+  }
+}
+
+function downloadForcingCertificate() {
+  const bundle = typeof currentProofBundle === "function" ? currentProofBundle()
+    : (analysisCurrent && analysisCurrent.result
+      ? analysisCurrent.result.forcing_certificate : null);
+  if (!bundle) return;
+  const blob = new Blob([JSON.stringify(bundle, null, 2) + "\n"], {type: "application/json"});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `hexo-pdspn-proof-${Date.now()}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function failForcingSolve(error) {
+  settleForcingUi();
+  forcingRun = null;
+  releaseForcingWorker();
+  setForcingStatus(`Solver error: ${error}`, "error");
+}
+
+function cancelForcingSolve(message = "Search cancelled. No result was recorded.") {
+  if (!forcingRun) return;
+  settleForcingUi();
+  forcingRun = null;
+  forcingRequestSerial += 1;
+  releaseForcingWorker();
+  setForcingStatus(message, "budget");
+}
+
+function solveCurrentForcing() {
+  if (!analysisCurrent || !analysisCurrent.result) {
+    setForcingStatus("Load a position first.", "error");
+    return;
+  }
+  if (forcingRun) return;
+  const engine = document.getElementById("analysis-forcing-engine").value;
+  const width = document.getElementById("analysis-forcing-width").value;
+  const depth = engine === "pns" ? MAX_ANALYSIS_FORCING_DEPTH : forcingDepthFromUi();
+  const budget = Number(document.getElementById("analysis-forcing-budget").value);
+  const leafBudget = Number(document.getElementById("analysis-forcing-leaf-budget").value);
+  const node = analysisCurrent;
+  let position;
+  try {
+    position = forcingPosition(node);
+    const worker = ensureForcingWorker();
+    const id = ++forcingRequestSerial;
+    forcingRun = {id, node, position, engine, width, depth, budget, leafBudget, started: performance.now()};
+    forcingRun.ticker = setInterval(() => {
+      if (!forcingRun || forcingRun.id !== id) return;
+      const seconds = Math.floor((performance.now() - forcingRun.started) / 1000);
+      const depthText = engine === "idtt" ? ` to depth ${depth}` : "";
+      setForcingStatus(
+        `${FORCING_ENGINE_INFO[engine].label} ${width} search${depthText}… ${seconds}s elapsed. It is using one CPU core on this device.`,
+      );
+    }, 1000);
+    setForcingControlsRunning(true);
+    const depthText = engine === "idtt" ? ` to depth ${depth} attacker turns` : "";
+    const leafText = engine === "pdspn" ? ` and ${leafBudget.toLocaleString()} PN expansions per frontier` : "";
+    setForcingStatus(
+      `Loading ${FORCING_ENGINE_INFO[engine].label}, then searching ${width}${depthText} with a ${formatSolverBudget(engine, budget)}${leafText}…`,
+    );
+    worker.postMessage({
+      type: "solve", requestId: id, position, engine, width,
+      depthCap: depth, nodeBudget: String(budget), leafNodeBudget: String(leafBudget),
+    });
+  } catch (error) {
+    failForcingSolve(error.message || error);
+  }
 }
 
 // Read an SSE stream, invoking onEvent(event, data) per frame. Resolves when
@@ -260,6 +661,9 @@ function buildTreeFromTrajectory(result) {
 }
 
 function setCurrent(node) {
+  if (forcingRun && node !== forcingRun.node) {
+    cancelForcingSolve("Search cancelled because the selected position changed.");
+  }
   analysisCurrent = node;
   // Any ordinary navigation (slider, undo, board click, a plain move link)
   // dismisses a selected missed-win callout; showMissedWin re-selects it
@@ -272,6 +676,7 @@ function setCurrent(node) {
   renderEvalBar();
   renderMoveTree();
   renderMissedWinCallout();
+  if (!forcingRun) restoreForcingStatusForNode(node);
   updateAnalysisHash();
 }
 
@@ -934,9 +1339,30 @@ function updateForcingBanner(forcing) {
   // first and may break it, so it is a threat to answer, NOT a lost
   // position. Don't overstate it.
   const defender = forcing.winner === "P1" ? "P2" : "P1";
+  const placements = forcing.line_placements != null
+    ? forcing.line_placements : forcing.pv_len;
+  const hasLine = forcing.pv && forcing.pv.length > 0;
+  const depthText = forcing.depth != null
+    ? (forcing.engine && forcing.engine !== "idtt"
+      ? `sample line ${forcing.depth} attacker turn${forcing.depth === 1 ? "" : "s"}`
+      : `depth ${forcing.depth} attacker turn${forcing.depth === 1 ? "" : "s"}`)
+    : "forced-win depth unavailable";
+  const proofText = forcing.verdict_only || !hasLine
+    ? "verdict only · proof line unavailable"
+    : `${depthText} · ${placements} placement${placements === 1 ? "" : "s"}`;
+  const certified = forcing.certificate_summary
+    ? ` · certified worst-case ${forcing.certificate_summary.maxAttackerTurns} attacker turns`
+    : "";
   banner.textContent = forcing.attacker_is_mover
-    ? `${forcing.winner} has a forced win (${forcing.pv_len}-move line)`
-    : `${forcing.winner} threatens a forced win — ${defender} must answer`;
+    ? `${forcing.winner} has a forced win (${proofText}${certified})`
+    : `${forcing.winner} threatens a forced win (${proofText}) — ${defender} must answer`;
+  if (forcing.engine) {
+    const tag = document.createElement("span");
+    tag.className = "forcing-engine-tag";
+    tag.textContent = FORCING_ENGINE_INFO[forcing.engine]
+      ? FORCING_ENGINE_INFO[forcing.engine].label : forcing.engine;
+    banner.appendChild(tag);
+  }
   if (forcing.wide) {
     // Verdict came from the wide generator (threat + quiet-builder turns) —
     // lines the tight live-play solver cannot see. Absent on results from an
@@ -1081,8 +1507,8 @@ function showMissedWin(nodeId) {
   renderMissedWinCallout();
 }
 
-// Compact callout panel for the selected missed-win badge: "P1 had a forced
-// win in N" + the squandered PV as numbered coordinate chips, attacker
+// Compact callout panel for the selected missed-win badge: proof depth in
+// attacker turns plus the squandered PV as numbered coordinate chips, attacker
 // placements emphasized and defender replies muted per `pv_owners` (falling
 // back to "every cell is attacker" if the server's replay couldn't determine
 // ownership — mirrors drawAnalysisBoard's forcing-pv overlay fallback).
@@ -1110,7 +1536,11 @@ function renderMissedWinCallout() {
     const style = isAttacker ? "" : ` style="color:${mwDefColor}"`;
     return `<span class="${cls}"${style}>${i + 1}. [${c[0]},${c[1]}]</span>`;
   }).join("");
-  panel.innerHTML = `<div class="mwc-head">${mw.by} had a forced win in ${mw.pv_len}</div>`
+  const placements = mw.line_placements != null ? mw.line_placements : mw.pv_len;
+  const depth = mw.depth != null
+    ? `depth ${mw.depth} attacker turn${mw.depth === 1 ? "" : "s"}`
+    : "forced-win depth unavailable";
+  panel.innerHTML = `<div class="mwc-head">${mw.by} had a forced win (${depth} · ${placements} placement${placements === 1 ? "" : "s"})</div>`
                    + `<div class="mwc-pv">${chips}</div>`;
 }
 

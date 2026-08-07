@@ -56,7 +56,13 @@ console.log(`  quiet: kind=No`);
 // 5. Deep prover (Dfpn) on a game-valid position (has origin) — should agree Win.
 const dfpn = solver.solve(winPos, new SolverLimits(6, 20000n, SolverEngineEnum.Dfpn));
 ok("dfpn agrees Win", dfpn.kind === 0);
-console.log(`  dfpn: kind=Win depth=${dfpn.depth}`);
+ok("dfpn reports nodes", dfpn.nodes > 0n && dfpn.nodes <= 20000n);
+console.log(`  dfpn: kind=Win depth=${dfpn.depth} nodes=${dfpn.nodes}`);
+
+// 5b. Standalone PNS honors the caller's work budget (it formerly used a fixed 50k).
+const pns = solver.solve(winPos, new SolverLimits(6, 1n, SolverEngineEnum.Pns));
+ok("pns respects one-node budget", pns.nodes === 1n);
+console.log(`  pns: kind=${pns.kind} nodes=${pns.nodes}`);
 
 // 6. Arbitrary board WITHOUT the (0,0,P1) origin: idtt must still solve (no panic).
 const noOrigin = new Position(4, 8, 300, Player.P1, 2, [10,0,1, 11,0,1, 12,0,1, 20,5,2]);

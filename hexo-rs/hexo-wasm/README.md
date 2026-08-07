@@ -90,8 +90,9 @@ Rules enforced by validation (clean errors, never a wasm abort):
 threat-space solver from `hexo-solver`, exposed via typed `wasm-bindgen`
 structs/enums (no JSON, no model weights). Use it to answer "does the side to
 move have a forced win, and what's the line?" in a web UI. `idtt` (the
-production iterative-deepening solver) is the default and the only engine
-that returns a principal variation.
+production iterative-deepening solver) is the default; DFPN/PDS-PN also return
+a verified principal variation when reconstruction succeeds. PNS is deliberately
+verdict-only.
 
 ```js
 import init, { StrixSolver, Position, SolverLimits, Player, SolverEngineEnum } from "./pkg/hexo_wasm.js";
@@ -103,33 +104,44 @@ const pos = new Position(
   300,       // max_moves
   Player.P1, // to_move (the attacker / side to move)
   2,         // moves_remaining (1 or 2)
-  [ /* stones: {coord: {q,r}, player: Player} ... */ ],
+  new Int32Array([ /* q, r, player, q, r, player, ... */ ]),
 );
 const limits = new SolverLimits(10, 20000n, SolverEngineEnum.Idtt); // depth_cap, node_budget, engine
 const outcome = solver.solve(pos, limits);
 ```
 
-Methods: `solve`, `solve_wide` (experimental wide-partner generator — a
-superset, so a `solve` win is never lost), `solve_threat` (flips `to_move`:
+Methods: `solve`, `solve_wide` (experimental wide-partner generator, including
+quiet builder placements), `solve_threat` (flips `to_move`:
 the *opponent's* forcing win if left unblocked — a threat, not a proven loss),
-`solve_defense` (the opponent threat plus the placements that refute it).
+`solve_defense` / `solve_defense_wide` (the opponent threat plus the placements
+that refute it; defense always uses IDTT internally).
 
 ### Return types
 
 `SolveOutcome` has `kind` (`SolveKind::Win` / `No` / `BudgetExceeded`),
-`depth` ("winning move in N"), `nodes`, `time_ms`, and `pv` — a
+`depth` (attacker turns including the completing turn), `nodes`, `time_ms`, and `pv` — a
 turn-grouped `Vec<Turn>` where each `Turn` is `{turn, player, cells: Vec<Coord>}`.
 The first turn is the attacker with `moves_remaining` cells; subsequent turns
 are 2 cells each, alternating players. `Coord` is `{q, r}`. `DefenseOutcome`
 adds `threat: Option<SolveOutcome>`, `killers: Vec<Coord>`,
 `pair_anchors: Vec<PairAnchor>` (`{first, second}`), and `best_delay`.
 
+PDS-PN wins additionally carry an independently replay-verified certificate.
+At each attacker node it includes every winning action that the ordinary search
+already proved and retained, ranked by verified worst-case attacker turns. The
+first action is the recommended shortest bound among those retained choices;
+this is not an exhaustive move search or a claim of globally shortest mate.
+Older version-1 certificates with only the primary `action` and `child` remain
+valid; newer ones add an optional `alternatives` array with the same shape.
+
 ### Engines
 
-`SolverEngineEnum`: `Idtt` (default), `Pns`, `Dfpn`, `Pdspn`. `idtt` takes a
-board-level path and is the only engine that returns a PV; `Pns` returns a
-verdict only (empty `pv`, `depth` 0). `Dfpn`/`Pdspn`/`Pns` are deep
-proof-search drivers.
+`SolverEngineEnum`: `Idtt` (default), `Pns`, `Dfpn`, `Pdspn`. IDTT takes a
+board-level path and proves the shortest win within `depth_cap`. DFPN and
+PDS-PN are work-budget-driven deep proof searches; `depth_cap` does not bound
+their main search and is used only by fallback PV recovery. Both try to return
+a verified PV/depth. PNS is a work-budget-driven, verdict-only cross-check
+(empty `pv`, `depth` 0).
 
 ### Arbitrary boards
 
@@ -145,14 +157,16 @@ an error otherwise). Pathological coordinate spreads return `BudgetExceeded`.
 ### Caveats
 
 - `time_ms` is **0.0 on wasm** — `std::time::Instant` has no monotonic clock
-  on `wasm32-unknown-unknown`, so timing is reported only on native. `node_budget`
-  bounds the search on all targets.
+  on `wasm32-unknown-unknown`, so a browser worker should time calls with
+  `performance.now()`. `node_budget` bounds the search on all targets.
 - `nodes` is 0 for `idtt` (the production solver does not expose a node count);
-  the deep provers report search stats internally.
-- `solve_defense` returns `NoThreat` for both "no opponent threat" and
-  "budget exceeded during the threat check" (`BudgetExceeded` variant is
-  reserved for when the two are distinguished). `limits.engine` is inert for
-  defense (always uses the forcing solver internally).
+  DFPN/PDS-PN report MID expansions and PNS reports tree expansions. These are
+  engine-specific work counters, not directly comparable performance units.
+- Browser DFPN/PDS-PN builds reserve a 128 MiB transposition table instead of
+  the native command-line default of 512 MiB. Standalone PNS retains its tree
+  in memory, so browser UIs should keep its selectable budgets conservative.
+- Defense distinguishes `NoThreat` from `BudgetExceeded`. `limits.engine` is
+  inert for defense (always uses the forcing solver internally).
 
 
 ## WebWorker demo
@@ -183,6 +197,15 @@ server doesn't send `application/wasm`, wasm-bindgen falls back from
   → axial `(q,r)` identity, with the htttx.io-mirror codec handled there).
 - Run the bot in a worker (as in `demo/worker.js`) so search never blocks the
   UI thread; at sims=64 a move is ~2 s on desktop.
+
+## Observatory integration
+
+`just wasm-build` refreshes `hexo-rs/hexo-wasm/pkg/` and copies the deployable
+JS/WASM pair into `hexo-a0`'s packaged static assets. Observatory loads those
+assets from `solver-worker.js`; cancelling a synchronous solve terminates the
+worker, immediately reclaiming its proof tree and transposition table. The
+generated static pair is committed so Python wheels and the serving container
+do not need `wasm-pack` at install time.
 
 ## Maintenance coupling
 

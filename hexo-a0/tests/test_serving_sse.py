@@ -94,6 +94,16 @@ def _get(port, path, headers=None, timeout=5):
     return out
 
 
+def _response_header(port, path, name):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    resp.read()
+    value = resp.getheader(name)
+    conn.close()
+    return value
+
+
 def test_static_serves_css_and_js():
     with _server(analyze_ctx=None) as port:
         s, ctype, etag, cache, body = _get(port, "/static/observatory.css")
@@ -101,6 +111,37 @@ def test_static_serves_css_and_js():
         assert etag and "max-age" in (cache or "") and len(body) > 0
         s2, ctype2, _, _, _ = _get(port, "/static/play.js")
         assert s2 == 200 and ctype2 == "text/javascript; charset=utf-8"
+        s3, _, _, _, analysis_js = _get(port, "/static/analysis.js")
+        assert s3 == 200
+        assert b"new Worker" in analysis_js
+        assert b"/solve_forcing" not in analysis_js
+        sw, sw_type, _, _, worker_js = _get(port, "/static/solver-worker.js")
+        assert sw == 200 and sw_type == "text/javascript; charset=utf-8"
+        assert b"StrixSolver" in worker_js and b"solve_wide" in worker_js
+        pe, pe_type, _, _, proof_js = _get(port, "/static/proof-explorer.js")
+        assert pe == 200 and pe_type == "text/javascript; charset=utf-8"
+        assert b"buildProofModel" in proof_js and b"proofExplorerWorstCase" in proof_js
+        wasm, wasm_type, _, _, wasm_body = _get(
+            port, "/static/solver/hexo_wasm_bg.wasm")
+        assert wasm == 200 and wasm_type == "application/wasm"
+        assert wasm_body[:4] == b"\x00asm"
+
+
+def test_html_exposes_authoritative_rules_to_worker_client():
+    with _server(analyze_ctx=None) as port:
+        status, _, _, _, body = _get(port, "/analysis")
+        assert status == 200
+        assert b"winLength: 6" in body
+        assert b"placementRadius: 8" in body
+        assert b"maxMoves: 400" in body
+        assert b"DFPN" in body and b"PDS-PN" in body and b"PNS" in body
+        assert b"analysis-download-certificate-btn" in body
+        assert b"analysis-explore-certificate-btn" in body
+        assert b'id="proof-explorer"' in body
+        assert b"PN leaf cap" in body
+        csp = _response_header(port, "/analysis", "Content-Security-Policy")
+        assert "worker-src 'self'" in csp
+        assert "'wasm-unsafe-eval'" in csp
 
 
 def test_static_etag_304():

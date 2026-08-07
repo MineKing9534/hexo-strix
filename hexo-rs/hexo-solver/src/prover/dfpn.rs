@@ -108,6 +108,18 @@ impl<'a> Dfpn<'a> {
         {
             return; // already resolved
         }
+        // WASM has a 4 GiB linear-address ceiling. PN²'s disposable level-2 tree
+        // must therefore include its kernel memos: otherwise hundreds of leaves
+        // retain gigabytes even after their PN arenas are cleared. Native keeps
+        // the shared memo cache for speed (and has a much larger address space).
+        // The isolated board has identical Zobrist/node keys, so its result is
+        // directly reusable by level 1.
+        #[cfg(target_arch = "wasm32")]
+        let (pn, dn) = {
+            let mut leaf_k = self.k.isolated();
+            self.pn.search(&mut leaf_k, node)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
         let (pn, dn) = self.pn.search(&mut self.k, node);
         self.leaf_solves += 1;
         if pn == 0 {
@@ -500,6 +512,17 @@ pub(crate) fn solve_mode(
 
     let mut res = DriverResult::new(verdict);
     if verdict == Verdict::Win {
+        // PDS-PN retains every node key that reached `pn == 0`, including nodes
+        // proved inside its disposable level-2 PN searches. Rewalk that proof
+        // set into a compact OR-retained / AND-all certificate, then independently
+        // replay it before exposing it. A certificate failure never changes the
+        // already-proved verdict; it is reported by absence and covered by tests.
+        if pds_mode
+            && let Ok(certificate) = super::certificate::reconstruct(pos, cfg.wide, &d.proven)
+            && super::certificate::verify(pos, &certificate).is_ok()
+        {
+            res.certificate = Some(certificate);
+        }
         // First try reconstructing the PV by descending proven children (the
         // spec's approach; exact for df-pn). In PDS-PN mode some winning nodes were
         // proven inside a *discarded* level-2 PN tree, so their children aren't in

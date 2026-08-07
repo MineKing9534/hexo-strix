@@ -116,13 +116,17 @@ test-all:
 check-wasm:
     cd hexo-rs && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target cargo check --lib -p hexo-engine -p hexo-mcts -p hexo-infer -p hexo-wasm --target wasm32-unknown-unknown
 
-# Build the browser (WebWorker) wasm package
+# Build the browser (WebWorker) wasm package and refresh the two deployable
+# Observatory assets. These outputs are committed so the pure-Python package and
+# serving image do not need wasm-pack or a second Rust toolchain at install time.
 wasm-build:
     cd hexo-rs && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target wasm-pack build hexo-wasm --target web --out-dir pkg
+    install -D -m 0644 hexo-rs/hexo-wasm/pkg/hexo_wasm.js hexo-a0/src/hexo_a0/serving/static/solver/hexo_wasm.js
+    install -D -m 0644 hexo-rs/hexo-wasm/pkg/hexo_wasm_bg.wasm hexo-a0/src/hexo_a0/serving/static/solver/hexo_wasm_bg.wasm
 
 # Build the nodejs wasm package and run the smoke test (tiny fixtures; committed, runs anywhere)
-wasm-test:
-    cd hexo-rs && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target wasm-pack build hexo-wasm --target nodejs --out-dir pkg-node --dev && node hexo-wasm/tests/node_smoke.mjs
+wasm-test: wasm-build
+    cd hexo-rs && CARGO_TARGET_DIR=$HOME/.cache/hexo-wasm-target wasm-pack build hexo-wasm --target nodejs --out-dir pkg-node --dev && node hexo-wasm/tests/node_smoke.mjs && node hexo-wasm/tests/solver_smoke.mjs && node ../hexo-a0/tests/solver_worker_smoke.mjs
 
 # Real-weights smoke: same test against the ACTUAL shipped weights (release build).
 # Hard-fails if exports/strixbot-rel2.safetensors is absent — that's the real-load gate.

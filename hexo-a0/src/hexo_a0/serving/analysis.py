@@ -44,7 +44,7 @@ ANALYSIS_DEFENSE_TIME_MS = 5_000
 #   2 = wide-by-default forcing/threat solve + defense read-out (2026-07-11);
 #       v1 (implicit) entries predate the wide generator and can carry
 #       forcing=None for positions the wide solver proves won.
-ANALYSIS_PIPELINE_VERSION = 2
+ANALYSIS_PIPELINE_VERSION = 3
 # Per-prefix budget for analyze_game_full's forcing solves (run twice per
 # placement inside the SSE loop) — the depth=10/20k row above caps the
 # per-solve worst case at ~0.4s, keeping a whole-game analysis bounded.
@@ -84,8 +84,12 @@ class AnalysisResult:
     winner: str | None = None
     current_player: str | None = None  # side to move (for P1-perspective flip)
     # Both-side VCF solve for display: {"winner", "attacker_is_mover",
-    # "first_move", "pv", "pv_len", "pv_owners"} or None (no forced win found
-    # either way). attacker_is_mover=True is a PROVEN win for the side to
+    # "first_move", "depth", "pv", "line_placements", "pv_owners"} or None
+    # (no forced win found either way). "depth" always means attacker turns,
+    # including the completing turn; "line_placements" counts the individual
+    # cells in the displayed PV for both sides. ``pv_len`` remains as a
+    # compatibility alias for older clients. attacker_is_mover=True is a
+    # PROVEN win for the side to
     # move; False is a perspective-flipped THREAT (often defensible — the
     # client renders those behind a default-off toggle).
     # "pv_owners" is a parallel array of "P1"/"P2" (or None if the replay that
@@ -427,11 +431,24 @@ def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
             pv_owners = owners
         except Exception:
             pv_owners = None
+        # The legacy PyO3 result is (first_move, flat_pv), so recover the
+        # solver's proof-depth convention from the authoritative replay:
+        # count the winner's turns, not individual placements or alternating
+        # attacker/defender plies. A mid-turn root still counts as one attacker
+        # turn, and the completing turn is included.
+        proof_depth = None
+        if pv_owners is not None:
+            proof_depth = sum(
+                owner == winner and (i == 0 or pv_owners[i - 1] != winner)
+                for i, owner in enumerate(pv_owners)
+            )
         return {
             "winner": winner,
             "attacker_is_mover": attacker_is_mover,
             "first_move": [int(first_move[0]), int(first_move[1])],
+            "depth": proof_depth,
             "pv": pv,
+            "line_placements": len(pv),
             "pv_len": len(pv),
             "pv_owners": pv_owners,
             "wide": wide,
@@ -1229,7 +1246,9 @@ def analyze_game_full(model, model_config, moves, win_length, placement_radius,
             "by": mover,
             "at_prefix": i,
             "first_move": forcing["first_move"],
+            "depth": forcing.get("depth"),
             "pv": forcing["pv"],
+            "line_placements": forcing.get("line_placements", forcing["pv_len"]),
             "pv_len": forcing["pv_len"],
             "pv_owners": forcing.get("pv_owners"),
         }
