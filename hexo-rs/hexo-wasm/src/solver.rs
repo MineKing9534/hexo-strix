@@ -159,6 +159,27 @@ pub struct SolveOutcome {
     pub certificate_max_attacker_turns: u32,
 }
 
+/// Result of certificate-guided, depth-bounded PDS-PN optimization. `Win`
+/// means the adjacent lower/upper bounds certify the exact shortest attacker
+/// depth; `BudgetExceeded` can still carry useful verified bounds and a best PV.
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Clone, Debug)]
+pub struct ShortestOutcome {
+    pub kind: SolveKind,
+    pub depth: u8,
+    pub nodes: u64,
+    pub time_ms: f64,
+    pub pv: Vec<Turn>,
+    pub best_upper_depth: u8,
+    pub excluded_through_depth: u8,
+    pub threshold_probes: u64,
+    pub shortest_certified: bool,
+    pub certificate_json: String,
+    pub certificate_nodes: u64,
+    pub certificate_edges: u64,
+    pub certificate_max_attacker_turns: u32,
+}
+
 /// Measurements recomputed by the independent all-defense certificate verifier.
 #[wasm_bindgen]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,6 +315,84 @@ impl StrixSolver {
             dag_nodes: summary.dag_nodes,
             proof_edges: summary.proof_edges,
             max_attacker_turns: summary.max_attacker_turns,
+        })
+    }
+
+    /// Tighten a verified PDS-PN proof to the shortest attacker-turn bound by
+    /// binary-searching horizons with depth-bounded PDS-PN. Runs synchronously;
+    /// browser callers invoke it inside the cancellable solver Web Worker.
+    pub fn optimize_certificate(
+        &self,
+        position: &Position,
+        limits: &SolverLimits,
+        certificate_json: &str,
+        wide: bool,
+    ) -> Result<ShortestOutcome, JsError> {
+        let t0 = instant_now();
+        let pos = convert_position(position)?;
+        if !is_game_valid_board(&pos.stones) {
+            return Err(JsError::new(
+                "shortest optimization requires a game-valid position",
+            ));
+        }
+        if !(1..=2).contains(&pos.moves_remaining) {
+            return Err(JsError::new(
+                "shortest optimization requires moves_remaining of 1 or 2",
+            ));
+        }
+        if !(1..=64).contains(&pos.placement_radius) {
+            return Err(JsError::new(
+                "shortest optimization requires 1 <= placement_radius <= 64",
+            ));
+        }
+        let certificate: ProofCertificate = serde_json::from_str(certificate_json)
+            .map_err(|error| JsError::new(&format!("invalid certificate JSON: {error}")))?;
+        let proof_position = prover_position(&pos);
+        let summary = verify_proof_certificate(&proof_position, &certificate)
+            .map_err(|error| JsError::new(&format!("certificate verification failed: {error}")))?;
+        let cfg = hexo_solver::prover::ProverConfig {
+            driver: hexo_solver::prover::DriverKind::PdspnShortest,
+            wide,
+            depth_cap: limits.depth_cap,
+            node_budget: limits.node_budget,
+            // Keep the browser comfortably below the wasm32 4 GiB ceiling.
+            tt_mb: 128,
+            pn2_nodes: limits.pn2_nodes.max(1),
+            leaf_budget: 1_000_000,
+            leaf_budget_max: 10_000_000,
+            root_screen_budget: 0,
+            root_screen_per_attack: 5_000,
+            time_limit_s: 0.0,
+            race_set: Vec::new(),
+        };
+        let ctl = hexo_solver::prover::Ctl::new(0.0);
+        let result = hexo_solver::prover::guided_pdspn_shortest(
+            &proof_position,
+            &certificate,
+            &cfg,
+            &ctl,
+        )
+        .map_err(|error| JsError::new(&format!("shortest optimization failed: {error}")))?;
+        let shortest_certified = result.verdict == hexo_solver::prover::io::Verdict::Win;
+        let kind = if shortest_certified {
+            SolveKind::Win
+        } else {
+            SolveKind::BudgetExceeded
+        };
+        Ok(ShortestOutcome {
+            kind,
+            depth: result.depth.unwrap_or(0),
+            nodes: result.stats.nodes,
+            time_ms: elapsed_ms(t0),
+            pv: chunk_pv(&result.pv, position.moves_remaining, position.to_move),
+            best_upper_depth: result.stats.best_upper_depth,
+            excluded_through_depth: result.stats.excluded_through_depth,
+            threshold_probes: result.stats.line_steps,
+            shortest_certified,
+            certificate_json: certificate.to_json(),
+            certificate_nodes: summary.dag_nodes,
+            certificate_edges: summary.proof_edges,
+            certificate_max_attacker_turns: summary.max_attacker_turns,
         })
     }
 
@@ -553,6 +652,19 @@ fn convert_position(pos: &Position) -> Result<SolverPosition, JsError> {
         moves_remaining: pos.moves_remaining,
         stones,
     })
+}
+
+fn prover_position(pos: &SolverPosition) -> hexo_solver::prover::io::Position {
+    hexo_solver::prover::io::Position {
+        stones: pos.stones.clone(),
+        attacker: pos.to_move,
+        placements_remaining: pos.moves_remaining,
+        config: hexo_solver::prover::io::PosConfig {
+            win_length: pos.win_length,
+            placement_radius: pos.placement_radius,
+            max_moves: pos.max_moves,
+        },
+    }
 }
 
 /// Chunk the flat pv into turn-grouped `Turn` objects.

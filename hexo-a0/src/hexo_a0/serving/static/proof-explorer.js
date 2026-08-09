@@ -137,6 +137,57 @@ function buildProofModel(bundle) {
   };
 }
 
+function proofOptimizationDescription(bundle) {
+  const optimization = bundle && bundle.optimization;
+  if (!optimization || optimization.method !== "pdspn-shortest-v1"
+      || !optimization.bestUpperDepth) return null;
+  const upper = Number(optimization.bestUpperDepth);
+  const lower = Number(optimization.excludedThroughDepth || 0);
+  if (optimization.shortestCertified && lower + 1 === upper) {
+    const dagDepth = Number(bundle.verification.maxAttackerTurns);
+    return {
+      short: `shortest search: ${upper} turns`,
+      full: dagDepth === upper
+        ? `The bounded PDS-PN search certified a shortest win in ${upper} attacker turns and excluded every win through ${lower}. This explorer independently replays its optimal ≤${upper}-turn strategy DAG. The lower-bound exclusion is a separate exhaustive search result, not an edge in the DAG.`
+        : `The originating bounded PDS-PN search certified a shortest win in ${upper} attacker turns and excluded every win through ${lower}. This explorer independently replays the separate ≤${dagDepth}-turn strategy DAG used as its upper bound; the lower-bound exclusion is not encoded in this DAG.`,
+    };
+  }
+  return {
+    short: lower > 0 ? `shortest range: ${lower + 1}–${upper}` : `verified win ≤${upper}`,
+    full: lower > 0
+      ? `The originating bounded PDS-PN search narrowed the shortest win to ${lower + 1}–${upper} attacker turns. This explorer independently replays the ≤${bundle.verification.maxAttackerTurns}-turn strategy DAG; the lower-bound search is not encoded in it.`
+      : `The originating shortest search retained a verified win within ${upper} attacker turns but did not establish a lower bound. This explorer independently replays that strategy DAG.`,
+  };
+}
+
+function buildProofSampleLine(bundle, rootStones, attacker) {
+  const turns = bundle && bundle.optimization && bundle.optimization.sampleLine;
+  if (!Array.isArray(turns) || !turns.length) return null;
+  const entries = [{
+    nodeId: Number(bundle.certificate.root), stones: new Map(rootStones),
+    attackerTurnsPlayed: 0, label: "Start", lastAction: null, shownWin: false,
+  }];
+  let stones = new Map(rootStones);
+  let attackerTurnsPlayed = 0;
+  for (let index = 0; index < turns.length; index++) {
+    const turn = turns[index];
+    const expected = index % 2 === 0 ? attacker : (attacker === "P1" ? "P2" : "P1");
+    if (!turn || turn.player !== expected || !Array.isArray(turn.cells)) {
+      throw new Error(`Shortest sample turn ${index + 1} is malformed.`);
+    }
+    stones = applyProofAction(stones, turn.cells, turn.player);
+    if (turn.player === attacker) attackerTurnsPlayed++;
+    entries.push({
+      nodeId: Number(bundle.certificate.root), stones,
+      attackerTurnsPlayed,
+      label: turn.player === attacker ? `A${attackerTurnsPlayed}` : `D${index / 2 + 0.5}`,
+      lastAction: {action: turn.cells, player: turn.player},
+      shownWin: index === turns.length - 1,
+    });
+  }
+  return {turns, entries};
+}
+
 function applyProofAction(stones, action, player) {
   if (!Array.isArray(action) || action.length < 1 || action.length > 2) {
     throw new Error("A proof action must contain one or two placements.");
@@ -208,10 +259,11 @@ function openProofExplorerBundle(bundle, {savedUrl = null} = {}) {
       lastAction: null,
       shownWin: false,
     };
+    const sampleLine = buildProofSampleLine(bundle, stones, attacker);
     proofExplorerState = {
       bundle, model, position, attacker,
       defender: attacker === "P1" ? "P2" : "P1",
-      history: [rootEntry],
+      history: [rootEntry], sampleLine, lineIndex: 0, mode: "proof",
     };
     if (savedUrl) proofSavedUrls.set(bundle, savedUrl);
     proofPreviousFocus = document.activeElement;
@@ -299,9 +351,11 @@ async function loadSavedProof(proofId) {
     const bundle = await response.json();
     setForcingStatus("Verifying every branch of the saved proof in your browser…");
     const summary = await verifySavedProof(bundle);
+    const optimization = proofOptimizationDescription(bundle);
     setForcingStatus(
       `Verified saved proof: ${summary.dagNodes.toLocaleString()} nodes, `
-      + `worst-case ${summary.maxAttackerTurns} attacker turns.`,
+      + `worst-case ${summary.maxAttackerTurns} attacker turns.`
+      + (optimization ? ` Originating ${optimization.short}.` : ""),
       "win",
     );
     openProofExplorerBundle(bundle, {savedUrl: location.href.split("#")[0]});
@@ -382,6 +436,9 @@ function closeProofExplorer() {
 }
 
 function currentProofEntry() {
+  if (proofExplorerState && proofExplorerState.mode === "shortest") {
+    return proofExplorerState.sampleLine.entries[proofExplorerState.lineIndex];
+  }
   return proofExplorerState.history[proofExplorerState.history.length - 1];
 }
 
@@ -422,15 +479,24 @@ function proofStepTags(entry, node, remaining) {
 
 function renderProofExplorer() {
   if (!proofExplorerState) return;
+  if (proofExplorerState.mode === "shortest") {
+    renderShortestSampleLine();
+    return;
+  }
   const {model, attacker, defender, history} = proofExplorerState;
   const entry = currentProofEntry();
   const node = model.nodes[entry.nodeId];
   const remaining = entry.shownWin ? 0 : model.remaining(entry.nodeId);
   const summary = document.getElementById("proof-explorer-summary");
-  summary.textContent = `${model.nodes.length.toLocaleString()} nodes · `
+  const optimization = proofOptimizationDescription(proofExplorerState.bundle);
+  summary.textContent = (optimization ? `${optimization.short} · ` : "")
+    + `${model.nodes.length.toLocaleString()} nodes · `
     + `${model.attackerAlternatives.toLocaleString()} alternatives at `
     + `${model.alternativeAttackerNodes.toLocaleString()} attack nodes · `
     + `≤${model.maxAttackerTurns} attacker turns`;
+  const optimizationNote = document.getElementById("proof-optimization-note");
+  optimizationNote.hidden = !optimization;
+  optimizationNote.textContent = optimization ? optimization.full : "";
   document.getElementById("proof-attacker-swatch").style.background = attacker === "P1" ? "#f08a3c" : "#3fb6d9";
   document.getElementById("proof-defender-swatch").style.background = defender === "P1" ? "#f08a3c" : "#3fb6d9";
   document.getElementById("proof-attacker-legend").textContent = `${attacker} attacker`;
@@ -449,6 +515,12 @@ function renderProofExplorer() {
   const choices = document.getElementById("proof-choices");
   const worstButton = document.getElementById("proof-worst-btn");
   const alternativesButton = document.getElementById("proof-alternatives-btn");
+  const shortestButton = document.getElementById("proof-shortest-line-btn");
+  shortestButton.hidden = !proofExplorerState.sampleLine;
+  const sampleAttainsBound = proofExplorerState.sampleLine
+    && proofExplorerState.sampleLine.entries.at(-1).attackerTurnsPlayed
+      === Number(proofExplorerState.bundle.optimization.bestUpperDepth);
+  shortestButton.textContent = sampleAttainsBound ? "Max-delay line" : "Shortest-search sample";
   let cardHtml = "";
   let choicesHtml = "";
   let accent = "var(--brass)";
@@ -554,6 +626,79 @@ function renderProofExplorer() {
   drawProofBoard();
 }
 
+function renderShortestSampleLine() {
+  const state = proofExplorerState;
+  const {model, attacker, defender, sampleLine, lineIndex} = state;
+  const entry = currentProofEntry();
+  const total = sampleLine.turns.length;
+  const next = lineIndex < total ? sampleLine.turns[lineIndex] : null;
+  const optimization = state.bundle.optimization;
+  const sampleAttackerTurns = sampleLine.entries[total].attackerTurnsPlayed;
+  const attainsBound = sampleAttackerTurns === Number(optimization.bestUpperDepth);
+  document.getElementById("proof-explorer-summary").textContent =
+    `shortest bound ${optimization.bestUpperDepth} · ${attainsBound ? "max-delay" : "sample"} ${sampleAttackerTurns} attacker turns · ${total} played turns`;
+  const note = document.getElementById("proof-optimization-note");
+  note.hidden = false;
+  note.textContent = attainsBound
+    ? `This is the concrete minimax principal variation: the attacker follows a depth-optimal certified attack and the defender chooses a certified maximum-delay reply at every branch. It attains the ${optimization.bestUpperDepth}-attacker-turn bound.`
+    : `This is one legal principal variation recovered by the depth-${optimization.bestUpperDepth} search. It ends after ${sampleAttackerTurns} attacker turns because this particular defense does not postpone as long as possible; ${optimization.bestUpperDepth} is the optimal worst-case guarantee across every defense.`;
+  document.getElementById("proof-attacker-swatch").style.background = attacker === "P1" ? "#f08a3c" : "#3fb6d9";
+  document.getElementById("proof-defender-swatch").style.background = defender === "P1" ? "#f08a3c" : "#3fb6d9";
+  document.getElementById("proof-attacker-legend").textContent = `${attacker} attacker`;
+  document.getElementById("proof-defender-legend").textContent = `${defender} defender`;
+  document.getElementById("proof-back-btn").disabled = lineIndex === 0;
+  document.getElementById("proof-node-label").textContent = `sample turn ${lineIndex} / ${total}`;
+  document.getElementById("proof-progress-label").textContent = next
+    ? `${entry.attackerTurnsPlayed} attacker turns played`
+    : `${sampleAttackerTurns} attacker turns · line complete`;
+  document.getElementById("proof-progress-bar").style.width = `${total ? lineIndex / total * 100 : 0}%`;
+
+  const shortestButton = document.getElementById("proof-shortest-line-btn");
+  shortestButton.hidden = false;
+  shortestButton.textContent = "Return to proof DAG";
+  const alternativesButton = document.getElementById("proof-alternatives-btn");
+  alternativesButton.hidden = true;
+  const worstButton = document.getElementById("proof-worst-btn");
+  worstButton.disabled = !next;
+  worstButton.textContent = next ? "Next sample turn →" : "Sample complete";
+  const card = document.getElementById("proof-step-card");
+  const choices = document.getElementById("proof-choices");
+  if (next) {
+    const role = next.player === attacker ? "Attacker" : "Defender";
+    card.style.setProperty("--proof-accent", next.player === "P1" ? "var(--p1)" : "var(--p2)");
+    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Maximum-delay line" : "Shortest-search sample"} · ${role}</div>`
+      + `<div class="proof-step-title">Play turn ${lineIndex + 1}</div>`
+      + `<div class="proof-step-copy">${attainsBound ? "The attacker minimizes the certified mate depth; the defender maximizes it." : "This is the solver's recovered principal variation, not a claim that this defense is the longest one."}</div>`;
+    choices.innerHTML = `<button class="proof-choice" style="--choice-color:${next.player === "P1" ? "#f08a3c" : "#3fb6d9"}" onclick="proofExplorerShortestNext()">`
+      + `<span class="proof-choice-letter">${lineIndex + 1}</span>`
+      + `<span class="proof-choice-main"><b>${formatProofAction(next.cells)}</b><small>${next.player} · ${role.toLowerCase()}</small></span>`
+      + `<span class="proof-choice-bound">sample turn ${lineIndex + 1}/${total}</span></button>`;
+  } else {
+    card.style.setProperty("--proof-accent", "var(--good)");
+    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Maximum-delay line complete" : "Shortest-search sample complete"}</div>`
+      + `<div class="proof-step-title">${attainsBound ? "Mate bound attained" : "Winning sample line"}</div>`
+      + `<div class="proof-step-copy">The final highlighted move completes the win. Return to the proof DAG to explore every certified defense branch.</div>`;
+    choices.innerHTML = "";
+  }
+  renderProofBreadcrumbs();
+  drawProofBoard();
+}
+
+function proofExplorerToggleShortestLine() {
+  if (!proofExplorerState || !proofExplorerState.sampleLine) return;
+  proofExplorerState.mode = proofExplorerState.mode === "shortest" ? "proof" : "shortest";
+  renderProofExplorer();
+  requestAnimationFrame(proofFitBoard);
+}
+
+function proofExplorerShortestNext() {
+  const state = proofExplorerState;
+  if (!state || state.mode !== "shortest" || state.lineIndex >= state.sampleLine.turns.length) return;
+  state.lineIndex++;
+  renderProofExplorer();
+  requestAnimationFrame(proofKeepHighlightVisible);
+}
+
 function proofAdvance(child, action, player, label, shownWin = false) {
   const state = proofExplorerState;
   const entry = currentProofEntry();
@@ -603,6 +748,10 @@ function proofExplorerChooseDefense(index) {
 
 function proofExplorerWorstCase() {
   if (!proofExplorerState) return;
+  if (proofExplorerState.mode === "shortest") {
+    proofExplorerShortestNext();
+    return;
+  }
   const entry = currentProofEntry();
   if (entry.shownWin) return;
   const node = proofExplorerState.model.nodes[entry.nodeId];
@@ -646,25 +795,53 @@ function proofExplorerFindAlternatives() {
 }
 
 function proofExplorerBack() {
-  if (!proofExplorerState || proofExplorerState.history.length <= 1) return;
+  if (!proofExplorerState) return;
+  if (proofExplorerState.mode === "shortest") {
+    if (proofExplorerState.lineIndex > 0) proofExplorerState.lineIndex--;
+    renderProofExplorer();
+    return;
+  }
+  if (proofExplorerState.history.length <= 1) return;
   proofExplorerState.history.pop();
   renderProofExplorer();
 }
 
 function proofExplorerReset() {
   if (!proofExplorerState) return;
+  if (proofExplorerState.mode === "shortest") {
+    proofExplorerState.lineIndex = 0;
+    renderProofExplorer();
+    requestAnimationFrame(proofFitBoard);
+    return;
+  }
   proofExplorerState.history.splice(1);
   renderProofExplorer();
   requestAnimationFrame(proofFitBoard);
 }
 
 function proofExplorerJump(index) {
+  if (proofExplorerState && proofExplorerState.mode === "shortest") {
+    if (index < 0 || index >= proofExplorerState.lineIndex) return;
+    proofExplorerState.lineIndex = index;
+    renderProofExplorer();
+    return;
+  }
   if (!proofExplorerState || index < 0 || index >= proofExplorerState.history.length - 1) return;
   proofExplorerState.history.splice(index + 1);
   renderProofExplorer();
 }
 
 function renderProofBreadcrumbs() {
+  if (proofExplorerState.mode === "shortest") {
+    const entries = proofExplorerState.sampleLine.entries.slice(0, proofExplorerState.lineIndex + 1);
+    document.getElementById("proof-breadcrumbs").innerHTML = entries.map((entry, index) => {
+      const current = index === proofExplorerState.lineIndex;
+      return `<button class="proof-crumb${current ? " current" : ""}"`
+        + (current ? " disabled" : ` onclick="proofExplorerJump(${index})"`)
+        + `>${entry.label}</button>`;
+    }).join("");
+    return;
+  }
   const history = proofExplorerState.history;
   document.getElementById("proof-breadcrumbs").innerHTML = history.map((entry, index) => {
     const current = index === history.length - 1;
@@ -726,7 +903,11 @@ function drawProofBoard() {
   if (!proofExplorerState) return;
   const entry = currentProofEntry();
   const node = proofExplorerState.model.nodes[entry.nodeId];
-  const highlights = proofPendingHighlights(node, entry);
+  const lineTurn = proofExplorerState.mode === "shortest"
+    ? proofExplorerState.sampleLine.turns[proofExplorerState.lineIndex] : null;
+  const highlights = lineTurn
+    ? [{action: lineTurn.cells, color: lineTurn.player === "P1" ? "#f08a3c" : "#3fb6d9", label: ""}]
+    : proofExplorerState.mode === "shortest" ? [] : proofPendingHighlights(node, entry);
   const cellSet = new Set();
   const seeds = [];
   for (const key of entry.stones.keys()) {

@@ -408,6 +408,8 @@ svg.disabled { pointer-events: none; opacity: 0.7; }
 .proof-progress-track{height:5px; margin:7px 0 16px; overflow:hidden; border-radius:3px; background:#090b0a;}
 #proof-progress-bar{height:100%; width:0; background:linear-gradient(90deg,var(--p1),var(--good));
   transition:width .25s ease;}
+.proof-optimization-note{margin:-5px 0 14px; padding:9px 11px; border:1px solid #345747;
+  border-radius:6px; background:rgba(52,87,71,.15); color:#bcd8c7; font-size:11px; line-height:1.45;}
 #proof-step-card{position:relative; padding:15px 15px 14px 18px; margin-bottom:12px;
   border:1px solid var(--line-bright); border-radius:7px; background:var(--panel-2); overflow:hidden;}
 #proof-step-card::before{content:""; position:absolute; left:0; top:0; bottom:0; width:4px;

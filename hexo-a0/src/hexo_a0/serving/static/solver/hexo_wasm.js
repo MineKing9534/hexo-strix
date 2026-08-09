@@ -500,6 +500,215 @@ export class Position {
 if (Symbol.dispose) Position.prototype[Symbol.dispose] = Position.prototype.free;
 
 /**
+ * Result of certificate-guided, depth-bounded PDS-PN optimization. `Win`
+ * means the adjacent lower/upper bounds certify the exact shortest attacker
+ * depth; `BudgetExceeded` can still carry useful verified bounds and a best PV.
+ */
+export class ShortestOutcome {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(ShortestOutcome.prototype);
+        obj.__wbg_ptr = ptr;
+        ShortestOutcomeFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ShortestOutcomeFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_shortestoutcome_free(ptr, 0);
+    }
+    /**
+     * @returns {number}
+     */
+    get best_upper_depth() {
+        const ret = wasm.__wbg_get_shortestoutcome_best_upper_depth(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get certificate_edges() {
+        const ret = wasm.__wbg_get_shortestoutcome_certificate_edges(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {string}
+     */
+    get certificate_json() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.__wbg_get_shortestoutcome_certificate_json(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {number}
+     */
+    get certificate_max_attacker_turns() {
+        const ret = wasm.__wbg_get_shortestoutcome_certificate_max_attacker_turns(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get certificate_nodes() {
+        const ret = wasm.__wbg_get_shortestoutcome_certificate_nodes(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {number}
+     */
+    get depth() {
+        const ret = wasm.__wbg_get_shortestoutcome_depth(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {number}
+     */
+    get excluded_through_depth() {
+        const ret = wasm.__wbg_get_shortestoutcome_excluded_through_depth(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {SolveKind}
+     */
+    get kind() {
+        const ret = wasm.__wbg_get_shortestoutcome_kind(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get nodes() {
+        const ret = wasm.__wbg_get_shortestoutcome_nodes(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {Turn[]}
+     */
+    get pv() {
+        const ret = wasm.__wbg_get_shortestoutcome_pv(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * @returns {boolean}
+     */
+    get shortest_certified() {
+        const ret = wasm.__wbg_get_shortestoutcome_shortest_certified(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get threshold_probes() {
+        const ret = wasm.__wbg_get_shortestoutcome_threshold_probes(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {number}
+     */
+    get time_ms() {
+        const ret = wasm.__wbg_get_shortestoutcome_time_ms(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @param {number} arg0
+     */
+    set best_upper_depth(arg0) {
+        wasm.__wbg_set_shortestoutcome_best_upper_depth(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {bigint} arg0
+     */
+    set certificate_edges(arg0) {
+        wasm.__wbg_set_shortestoutcome_certificate_edges(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {string} arg0
+     */
+    set certificate_json(arg0) {
+        const ptr0 = passStringToWasm0(arg0, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_shortestoutcome_certificate_json(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {number} arg0
+     */
+    set certificate_max_attacker_turns(arg0) {
+        wasm.__wbg_set_shortestoutcome_certificate_max_attacker_turns(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {bigint} arg0
+     */
+    set certificate_nodes(arg0) {
+        wasm.__wbg_set_shortestoutcome_certificate_nodes(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {number} arg0
+     */
+    set depth(arg0) {
+        wasm.__wbg_set_shortestoutcome_depth(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {number} arg0
+     */
+    set excluded_through_depth(arg0) {
+        wasm.__wbg_set_shortestoutcome_excluded_through_depth(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {SolveKind} arg0
+     */
+    set kind(arg0) {
+        wasm.__wbg_set_shortestoutcome_kind(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {bigint} arg0
+     */
+    set nodes(arg0) {
+        wasm.__wbg_set_shortestoutcome_nodes(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {Turn[]} arg0
+     */
+    set pv(arg0) {
+        const ptr0 = passArrayJsValueToWasm0(arg0, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_shortestoutcome_pv(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {boolean} arg0
+     */
+    set shortest_certified(arg0) {
+        wasm.__wbg_set_shortestoutcome_shortest_certified(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {bigint} arg0
+     */
+    set threshold_probes(arg0) {
+        wasm.__wbg_set_shortestoutcome_threshold_probes(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {number} arg0
+     */
+    set time_ms(arg0) {
+        wasm.__wbg_set_shortestoutcome_time_ms(this.__wbg_ptr, arg0);
+    }
+}
+if (Symbol.dispose) ShortestOutcome.prototype[Symbol.dispose] = ShortestOutcome.prototype.free;
+
+/**
  * @enum {0 | 1 | 2}
  */
 export const SolveKind = Object.freeze({
@@ -950,6 +1159,27 @@ export class StrixSolver {
         return this;
     }
     /**
+     * Tighten a verified PDS-PN proof to the shortest attacker-turn bound by
+     * binary-searching horizons with depth-bounded PDS-PN. Runs synchronously;
+     * browser callers invoke it inside the cancellable solver Web Worker.
+     * @param {Position} position
+     * @param {SolverLimits} limits
+     * @param {string} certificate_json
+     * @param {boolean} wide
+     * @returns {ShortestOutcome}
+     */
+    optimize_certificate(position, limits, certificate_json, wide) {
+        _assertClass(position, Position);
+        _assertClass(limits, SolverLimits);
+        const ptr0 = passStringToWasm0(certificate_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.strixsolver_optimize_certificate(this.__wbg_ptr, position.__wbg_ptr, limits.__wbg_ptr, ptr0, len0, wide);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ShortestOutcome.__wrap(ret[0]);
+    }
+    /**
      * @param {Position} position
      * @param {SolverLimits} limits
      * @returns {SolveOutcome}
@@ -1213,6 +1443,9 @@ const PairAnchorFinalization = (typeof FinalizationRegistry === 'undefined')
 const PositionFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_position_free(ptr >>> 0, 1));
+const ShortestOutcomeFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_shortestoutcome_free(ptr >>> 0, 1));
 const SolveOutcomeFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_solveoutcome_free(ptr >>> 0, 1));

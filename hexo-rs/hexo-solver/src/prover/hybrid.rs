@@ -266,6 +266,7 @@ pub fn verify(pos: &Position, lines: &[Line], cfg: &ProverConfig, ctl: &Ctl) -> 
         elapsed_s: elapsed,
         leaf_solves: h.leaf_proven,
         line_steps: h.line_proven,
+        ..Stats::default()
     };
     res
 }

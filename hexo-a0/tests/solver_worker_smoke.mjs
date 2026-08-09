@@ -77,6 +77,10 @@ if (fixturePath) {
   const depthCap = Number(process.argv[5] || 60);
   const nodeBudget = process.argv[6] || "100000000";
   const leafNodeBudget = process.argv[7] || "5000";
+  const certificatePath = process.argv[8];
+  const certificateReport = certificatePath
+    ? JSON.parse(await readFile(resolve(process.cwd(), certificatePath), "utf8"))
+    : null;
   const fixturePosition = {
     winLength: 6,
     placementRadius: 8,
@@ -98,6 +102,7 @@ if (fixturePath) {
     depthCap,
     nodeBudget,
     leafNodeBudget,
+    certificate: certificateReport ? certificateReport.certificate : null,
   }});
   assert.equal(posted.length, 1, "fixture should post exactly one response");
   const message = posted[0];
@@ -115,6 +120,7 @@ if (fixturePath) {
   process.exit(message.result.kind === "win" ? 0 : 2);
 }
 
+let pdspnCertificate = null;
 for (const [requestId, engine] of ["idtt", "dfpn", "pdspn", "pns"].entries()) {
   posted.length = 0;
   await self.onmessage({data: {
@@ -152,6 +158,7 @@ for (const [requestId, engine] of ["idtt", "dfpn", "pdspn", "pns"].entries()) {
     assert.ok(message.result.certificateSummary.maxAttackerTurns > 0);
     const expectedSummary = message.result.certificateSummary;
     const certificate = message.result.certificate;
+    pdspnCertificate = certificate;
     posted.length = 0;
     await self.onmessage({data: {
       type: "verify",
@@ -180,4 +187,25 @@ for (const [requestId, engine] of ["idtt", "dfpn", "pdspn", "pns"].entries()) {
   }
 }
 
-console.log("OK Observatory solver worker: IDTT, DFPN, PDS-PN, PNS, certificate verifier");
+posted.length = 0;
+await self.onmessage({data: {
+  type: "solve",
+  requestId: "pdspn-shortest",
+  position,
+  engine: "pdspn-shortest",
+  width: "wide",
+  depthCap: 6,
+  nodeBudget: "20000",
+  leafNodeBudget: "2000",
+  certificate: pdspnCertificate,
+}});
+assert.equal(posted.length, 1, "PDS-PN shortest should post exactly one response");
+assert.equal(posted[0].type, "result", posted[0].error || "PDS-PN shortest error");
+assert.equal(posted[0].result.kind, "win");
+assert.equal(posted[0].result.shortestCertified, true);
+assert.equal(posted[0].result.bestUpperDepth, 1);
+assert.equal(posted[0].result.excludedThroughDepth, 0);
+assert.ok(posted[0].result.certificate);
+assert.ok(Array.isArray(posted[0].result.turns));
+
+console.log("OK Observatory solver worker: IDTT, DFPN, PDS-PN, shortest PDS-PN, PNS, certificate verifier");

@@ -7,20 +7,23 @@
 //! ```text
 //! prove --position pos.json
 //!       [--lines a.json b.json ...]
-//!       [--driver idtt|dfpn|pdspn|hybrid|race]   (default: hybrid if --lines, else dfpn)
+//!       [--driver idtt|dfpn|pdspn|pdspn-depth|pdspn-shortest|hybrid|race]
+//!                                                   (default: hybrid if --lines, else dfpn)
 //!       [--width tight|wide]                     (default tight)
 //!       [--depth-cap 40] [--node-budget 20000000]
 //!       [--tt-mb 512] [--pn2-nodes 50000]
 //!       [--leaf-budget 1000000] [--leaf-budget-max 10000000]
+//!       [--root-screen-budget 0] [--root-screen-per-attack 5000]
 //!       [--time-limit 1800]                      (seconds, wall clock; 0 = none)
 //!       [--race-set idtt,dfpn,pdspn]
+//!       [--guide-certificate pdspn-report-or-certificate.json]
 //!       [--verify-certificate certificate-or-report.json]
 //!       [--out report.json]
 //!   prove --verify-certificate proof-bundle.json [--position position.json]
 //! ```
 
 use hexo_rs::prover::io::{Line, Position, Report};
-use hexo_rs::prover::{DriverKind, ProverConfig, run};
+use hexo_rs::prover::{DriverKind, ProverConfig, run, run_guided};
 use hexo_rs::prover::certificate::{ProofCertificate, verify as verify_proof_certificate};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,12 +35,15 @@ struct Args {
     cfg: ProverConfig,
     out: Option<PathBuf>,
     verify_certificate: Option<PathBuf>,
+    guide_certificate: Option<PathBuf>,
 }
 
 fn usage() -> &'static str {
-    "usage: prove --position pos.json [--lines a.json ...] [--driver idtt|dfpn|pdspn|hybrid|race] \
+    "usage: prove --position pos.json [--lines a.json ...] [--driver idtt|dfpn|pdspn|pdspn-depth|pdspn-shortest|hybrid|race] \
      [--width tight|wide] [--depth-cap N] [--node-budget N] [--tt-mb N] [--pn2-nodes N] \
-     [--leaf-budget N] [--leaf-budget-max N] [--time-limit SECS] [--race-set d,d,...] \
+     [--leaf-budget N] [--leaf-budget-max N] [--root-screen-budget N] \
+     [--root-screen-per-attack N] [--time-limit SECS] [--race-set d,d,...] \
+     [--guide-certificate pdspn-report-or-certificate.json] \
      [--out report.json]\n       prove --verify-certificate proof-bundle.json [--position position.json]"
 }
 
@@ -49,6 +55,7 @@ fn parse_args() -> Result<Args, String> {
         cfg: ProverConfig::default(),
         out: None,
         verify_certificate: None,
+        guide_certificate: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -63,6 +70,9 @@ fn parse_args() -> Result<Args, String> {
             "--out" => a.out = Some(PathBuf::from(next(&mut i, &argv, "--out")?)),
             "--verify-certificate" => {
                 a.verify_certificate = Some(PathBuf::from(next(&mut i, &argv, "--verify-certificate")?))
+            }
+            "--guide-certificate" => {
+                a.guide_certificate = Some(PathBuf::from(next(&mut i, &argv, "--guide-certificate")?))
             }
             "--lines" => {
                 // Consume following args until the next flag.
@@ -90,6 +100,14 @@ fn parse_args() -> Result<Args, String> {
             "--leaf-budget" => a.cfg.leaf_budget = parse_num(&next(&mut i, &argv, "--leaf-budget")?)?,
             "--leaf-budget-max" => {
                 a.cfg.leaf_budget_max = parse_num(&next(&mut i, &argv, "--leaf-budget-max")?)?
+            }
+            "--root-screen-budget" => {
+                a.cfg.root_screen_budget =
+                    parse_num(&next(&mut i, &argv, "--root-screen-budget")?)?
+            }
+            "--root-screen-per-attack" => {
+                a.cfg.root_screen_per_attack =
+                    parse_num(&next(&mut i, &argv, "--root-screen-per-attack")?)?
             }
             "--time-limit" => {
                 a.cfg.time_limit_s = next(&mut i, &argv, "--time-limit")?
@@ -135,6 +153,21 @@ fn print_summary(report: &Report) {
         "stats:   nodes={} tt_hits={} tt_bytes={} leaf_solves={} line_steps={} elapsed={:.2}s",
         s.nodes, s.tt_hits, s.tt_bytes, s.leaf_solves, s.line_steps, s.elapsed_s
     );
+    if s.best_upper_depth > 0 || s.excluded_through_depth > 0 {
+        eprintln!(
+            "bounds:  best_win<={}  no_win<={}",
+            s.best_upper_depth, s.excluded_through_depth,
+        );
+    }
+    if s.screened_attacks > 0 {
+        eprintln!(
+            "screen:  attacks={} refuted={} winning={} unresolved={}",
+            s.screened_attacks,
+            s.screen_refuted_attacks,
+            s.screen_winning_attacks,
+            s.screen_unresolved_attacks,
+        );
+    }
     if !report.pv.is_empty() {
         eprintln!("pv:      {} cells", report.pv.len());
     }
@@ -144,6 +177,16 @@ fn print_summary(report: &Report) {
     for u in &report.unverified {
         eprintln!("  unverified ({}): {} cells", u.note, u.path.len());
     }
+}
+
+fn load_certificate(path: &PathBuf) -> Result<ProofCertificate, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("parsing {}: {e}", path.display()))?;
+    let certificate_value = value.get("certificate").unwrap_or(&value);
+    serde_json::from_value(certificate_value.clone())
+        .map_err(|e| format!("parsing certificate in {}: {e}", path.display()))
 }
 
 fn run_cli() -> Result<(), String> {
@@ -185,7 +228,12 @@ fn run_cli() -> Result<(), String> {
         if lines.is_empty() { DriverKind::Dfpn } else { DriverKind::Hybrid }
     });
 
-    let report = run(&pos, &lines, &cfg);
+    let report = if let Some(path) = &args.guide_certificate {
+        let certificate = load_certificate(path)?;
+        run_guided(&pos, &certificate, &cfg)?
+    } else {
+        run(&pos, &lines, &cfg)
+    };
     if let Some(certificate) = &report.certificate {
         let summary = verify_proof_certificate(&pos, certificate)
             .map_err(|e| format!("generated certificate failed verification: {e}"))?;

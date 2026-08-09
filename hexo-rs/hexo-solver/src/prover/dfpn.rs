@@ -23,7 +23,10 @@
 
 use super::io::{Stats, Verdict};
 use super::kernel::{AndEval, KernelCtx, Node, OrEval};
-use super::pn::{INF, PnSearch, ProofTt, node_key, one_plus_eps, sat_add};
+use super::pn::{
+    INF, PnSearch, ProofTt, after_attacker, eval_child_at, node_key_at,
+    one_plus_eps, sat_add,
+};
 use super::{Ctl, DriverResult, ProverConfig};
 use crate::forcing::CellSet2;
 use hexo_engine::types::Coord;
@@ -95,11 +98,11 @@ impl<'a> Dfpn<'a> {
     /// `(pn, dn)` in the TT. The PN tree itself is discarded (PN²-style memory
     /// discipline — only the node's numbers survive). No-op in df-pn mode or on a
     /// node already seeded/resolved.
-    fn pn_seed(&mut self, node: Node) {
+    fn pn_seed(&mut self, node: Node, remaining: Option<u8>) {
         if !self.pds_mode {
             return;
         }
-        let key = node_key(self.k.hash(), node);
+        let key = node_key_at(self.k.hash(), node, remaining);
         if !self.pn_seeded.insert(key) {
             return;
         }
@@ -117,10 +120,10 @@ impl<'a> Dfpn<'a> {
         #[cfg(target_arch = "wasm32")]
         let (pn, dn) = {
             let mut leaf_k = self.k.isolated();
-            self.pn.search(&mut leaf_k, node)
+            self.pn.search_at(&mut leaf_k, node, remaining)
         };
         #[cfg(not(target_arch = "wasm32"))]
-        let (pn, dn) = self.pn.search(&mut self.k, node);
+        let (pn, dn) = self.pn.search_at(&mut self.k, node, remaining);
         self.leaf_solves += 1;
         if pn == 0 {
             self.proven.insert(key);
@@ -142,12 +145,12 @@ impl<'a> Dfpn<'a> {
     /// between diving into deep non-winning forcing lines and going straight at
     /// the shallow proof. The estimate is cached in the TT (work = 1) so it is
     /// computed once per position; a later `mid` on the node refines it.
-    fn child_val(&mut self, node: Node) -> (u32, u32) {
-        let key = node_key(self.k.hash(), node);
+    fn child_val(&mut self, node: Node, remaining: Option<u8>) -> (u32, u32) {
+        let key = node_key_at(self.k.hash(), node, remaining);
         if let Some(v) = self.tt.probe(key) {
             return v;
         }
-        let (pn, dn, _terminal) = super::pn::eval_child(&mut self.k, node);
+        let (pn, dn, _terminal) = eval_child_at(&mut self.k, node, remaining);
         if pn == 0 {
             self.proven.insert(key);
         }
@@ -172,12 +175,19 @@ impl<'a> Dfpn<'a> {
     /// The df-pn MID routine: expand the node whose position the board currently
     /// reflects, refining its `(pn, dn)` until one reaches its threshold, and
     /// return the node's numbers. Stores results in the TT.
-    fn mid(&mut self, node: Node, thpn: u32, thdn: u32, depth: u32) -> (u32, u32) {
+    fn mid(
+        &mut self,
+        node: Node,
+        thpn: u32,
+        thdn: u32,
+        depth: u32,
+        remaining: Option<u8>,
+    ) -> (u32, u32) {
         if self.tick(depth) {
             return (1, 1); // bail; caller ignores the value once `exceeded`
         }
         let entry_nodes = self.nodes;
-        let key = node_key(self.k.hash(), node);
+        let key = node_key_at(self.k.hash(), node, remaining);
 
         // Early TT cutoff (the paper's `lookUpTT` at the top of MID): if the stored
         // numbers already resolve the node or meet the caller's thresholds, return
@@ -193,17 +203,31 @@ impl<'a> Dfpn<'a> {
         // Delayed evaluation: classify (terminal or child list) on expansion.
         match node {
             Node::Or { placements } => match self.k.or_eval(placements) {
-                OrEval::WinNow => {
+                OrEval::WinNow if remaining != Some(0) => {
                     self.proven.insert(key);
                     self.tt.store(key, 0, INF, 1);
                     (0, INF)
+                }
+                OrEval::WinNow => {
+                    self.tt.store(key, INF, 0, 1);
+                    (INF, 0)
                 }
                 OrEval::Loss => {
                     self.tt.store(key, INF, 0, 1);
                     (INF, 0)
                 }
-                OrEval::Moves(mvs) => self.expand_or(key, &mvs, thpn, thdn, depth, entry_nodes),
+                OrEval::Moves(_) if remaining.is_some_and(|turns| turns < 2) => {
+                    self.tt.store(key, INF, 0, 1);
+                    (INF, 0)
+                }
+                OrEval::Moves(mvs) => {
+                    self.expand_or(key, &mvs, thpn, thdn, depth, entry_nodes, remaining)
+                }
             },
+            Node::And if remaining == Some(0) => {
+                self.tt.store(key, INF, 0, 1);
+                (INF, 0)
+            }
             Node::And => match self.k.and_eval() {
                 AndEval::AttackerWin => {
                     self.proven.insert(key);
@@ -215,7 +239,7 @@ impl<'a> Dfpn<'a> {
                     (INF, 0)
                 }
                 AndEval::Covers(covers) => {
-                    self.expand_and(key, &covers, thpn, thdn, depth, entry_nodes)
+                    self.expand_and(key, &covers, thpn, thdn, depth, entry_nodes, remaining)
                 }
             },
         }
@@ -231,7 +255,9 @@ impl<'a> Dfpn<'a> {
         thdn: u32,
         depth: u32,
         entry_nodes: u64,
+        remaining: Option<u8>,
     ) -> (u32, u32) {
+        let child_remaining = after_attacker(remaining);
         loop {
             if self.exceeded {
                 break;
@@ -243,7 +269,7 @@ impl<'a> Dfpn<'a> {
             let mut dn = 0u32;
             for mv in mvs.iter() {
                 self.k.place_attacker(mv);
-                let (cpn, cdn) = self.child_val(Node::And);
+                let (cpn, cdn) = self.child_val(Node::And, child_remaining);
                 self.k.unplace(mv);
                 pn = pn.min(cpn);
                 dn = sat_add(dn, cdn);
@@ -297,8 +323,8 @@ impl<'a> Dfpn<'a> {
             let child_thdn = thdn.saturating_sub(dn.saturating_sub(best_child_dn));
             let mv = mvs[best];
             self.k.place_attacker(&mv);
-            self.pn_seed(Node::And);
-            self.mid(Node::And, child_thpn, child_thdn, depth + 1);
+            self.pn_seed(Node::And, child_remaining);
+            self.mid(Node::And, child_thpn, child_thdn, depth + 1, child_remaining);
             self.k.unplace(&mv);
         }
         self.tt.probe(key).unwrap_or((1, 1))
@@ -314,6 +340,7 @@ impl<'a> Dfpn<'a> {
         thdn: u32,
         depth: u32,
         entry_nodes: u64,
+        remaining: Option<u8>,
     ) -> (u32, u32) {
         loop {
             if self.exceeded {
@@ -327,7 +354,7 @@ impl<'a> Dfpn<'a> {
             let mut best_child_pn = 0u32;
             for (i, cov) in covers.iter().enumerate() {
                 self.k.place_defender(cov);
-                let (cpn, cdn) = self.child_val(Node::Or { placements: 2 });
+                let (cpn, cdn) = self.child_val(Node::Or { placements: 2 }, remaining);
                 self.k.unplace(cov);
                 pn = sat_add(pn, cpn);
                 dn = dn.min(cdn);
@@ -355,8 +382,14 @@ impl<'a> Dfpn<'a> {
             let child_thpn = thpn.saturating_sub(pn.saturating_sub(best_child_pn));
             let cov = covers[best];
             self.k.place_defender(&cov);
-            self.pn_seed(Node::Or { placements: 2 });
-            self.mid(Node::Or { placements: 2 }, child_thpn, child_thdn, depth + 1);
+            self.pn_seed(Node::Or { placements: 2 }, remaining);
+            self.mid(
+                Node::Or { placements: 2 },
+                child_thpn,
+                child_thdn,
+                depth + 1,
+                remaining,
+            );
             self.k.unplace(&cov);
         }
         self.tt.probe(key).unwrap_or((1, 1))
@@ -366,13 +399,16 @@ impl<'a> Dfpn<'a> {
     /// kernel's `extract_pv`: attacker turns interleaved with the prolonging /
     /// futile defender replies, ending in six-in-a-row. Board is mutated (the PV
     /// is applied); callers rebuild a fresh context afterwards if needed.
-    fn build_pv(&mut self, root: Node) -> (Vec<Coord>, u8) {
+    fn build_pv(&mut self, root: Node, mut remaining: Option<u8>) -> (Vec<Coord>, u8) {
         let mut pv: Vec<Coord> = Vec::new();
         let mut turns: u8 = 0;
         let mut node = root;
         loop {
             match node {
                 Node::Or { placements } => {
+                    if remaining == Some(0) {
+                        break;
+                    }
                     if let Some(cells) = self.k.win_now_cells(placements) {
                         self.k.place_attacker(&cells);
                         for &c in cells.cells() {
@@ -386,9 +422,10 @@ impl<'a> Dfpn<'a> {
                         _ => break,
                     };
                     let mut chosen: Option<CellSet2> = None;
+                    let child_remaining = after_attacker(remaining);
                     for mv in moves.iter() {
                         self.k.place_attacker(mv);
-                        let ck = node_key(self.k.hash(), Node::And);
+                        let ck = node_key_at(self.k.hash(), Node::And, child_remaining);
                         if self.proven.contains(&ck) {
                             chosen = Some(*mv);
                             break; // leave placed
@@ -403,8 +440,10 @@ impl<'a> Dfpn<'a> {
                         pv.push(c);
                     }
                     turns = turns.saturating_add(1);
+                    remaining = child_remaining;
                     node = Node::And;
                 }
+                Node::And if remaining == Some(0) => break,
                 Node::And => match self.k.and_eval() {
                     AndEval::AttackerWin => {
                         let pair = self.k.futile_pair();
@@ -418,7 +457,11 @@ impl<'a> Dfpn<'a> {
                         let mut chosen: Option<CellSet2> = None;
                         for cov in covers.iter() {
                             self.k.place_defender(cov);
-                            let ck = node_key(self.k.hash(), Node::Or { placements: 2 });
+                            let ck = node_key_at(
+                                self.k.hash(),
+                                Node::Or { placements: 2 },
+                                remaining,
+                            );
                             if self.proven.contains(&ck) {
                                 chosen = Some(*cov);
                                 break;
@@ -449,7 +492,117 @@ impl<'a> Dfpn<'a> {
             elapsed_s: elapsed,
             leaf_solves: self.leaf_solves,
             line_steps: 0,
+            ..Stats::default()
         }
+    }
+}
+
+/// Result of probing every forcing root attack independently at its post-attack
+/// AND node. Only `refuted_and_hashes` affects a later IDTT search: each entry
+/// reached a definitive PDS-PN disproof, so it is safe to prune at every finite
+/// depth. Winning and unresolved probes remain ordinary IDTT candidates.
+pub(crate) struct RootAttackScreen {
+    pub(crate) refuted_and_hashes: Vec<u64>,
+    pub(crate) attacks_total: u64,
+    pub(crate) refuted: u64,
+    pub(crate) winning: u64,
+    pub(crate) unresolved: u64,
+    pub(crate) stats: Stats,
+}
+
+/// Use one shared PDS-PN context/TT to classify the root's forcing attacks.
+///
+/// This is deliberately a *global* refutation screen, not a depth-bounded
+/// search. Starting at the post-attack AND node lets proof-number search choose
+/// the easiest defender cover. A `dn == 0` result proves that some defence kills
+/// the attack outright; a `pn == 0` result merely records a globally winning
+/// attack and leaves its shortest depth to IDTT. Per-attack limits keep one hard
+/// winning candidate from consuming the whole screening budget.
+pub(crate) fn screen_root_attacks(
+    pos: &super::io::Position,
+    cfg: &ProverConfig,
+    ctl: &Ctl,
+    known_wins: &[CellSet2],
+    per_attack_budget: u64,
+) -> RootAttackScreen {
+    let empty = || RootAttackScreen {
+        refuted_and_hashes: Vec::new(),
+        attacks_total: 0,
+        refuted: 0,
+        winning: 0,
+        unresolved: 0,
+        stats: Stats::default(),
+    };
+    let wl = pos.config.win_length;
+    if !KernelCtx::supported(wl) || cfg.node_budget == 0 {
+        return empty();
+    }
+    let Some(ctx) = KernelCtx::new_wide(
+        &pos.stones,
+        pos.attacker,
+        wl,
+        pos.config.placement_radius,
+        cfg.wide,
+    ) else {
+        return empty();
+    };
+    let mut d = Dfpn::new(ctx, cfg, ctl, true);
+    let moves = match d.k.or_eval(pos.placements_remaining) {
+        OrEval::Moves(moves) => moves,
+        OrEval::WinNow | OrEval::Loss => return empty(),
+    };
+    let attacks_total = moves.len() as u64;
+    let mut refuted_and_hashes = Vec::new();
+    let mut refuted = 0u64;
+    let mut winning = 0u64;
+    let mut unresolved = 0u64;
+    let global_budget = cfg.node_budget;
+    let per_attack_budget = per_attack_budget.max(1);
+    #[cfg(not(target_arch = "wasm32"))]
+    let started = Instant::now();
+
+    for mv in moves.iter() {
+        if known_wins.contains(mv) {
+            winning += 1;
+            continue;
+        }
+        if d.nodes >= global_budget || ctl.expired() {
+            unresolved += 1;
+            continue;
+        }
+
+        d.k.place_attacker(mv);
+        let and_hash = d.k.hash();
+        d.budget = global_budget.min(d.nodes.saturating_add(per_attack_budget));
+        d.exceeded = false;
+        d.pn_seed(Node::And, None);
+        let (pn, dn) = d.mid(Node::And, INF, INF, 1, None);
+        d.k.unplace(mv);
+
+        if dn == 0 {
+            refuted += 1;
+            refuted_and_hashes.push(and_hash);
+        } else if pn == 0 {
+            winning += 1;
+        } else {
+            unresolved += 1;
+        }
+        // A local node cap is not a global failure: MID has fully unwound the
+        // board, and its partial TT progress is safe to retain for later probes.
+        d.exceeded = false;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let elapsed = started.elapsed().as_secs_f64();
+    #[cfg(target_arch = "wasm32")]
+    let elapsed = 0.0;
+    RootAttackScreen {
+        refuted_and_hashes,
+        attacks_total,
+        refuted,
+        winning,
+        unresolved,
+        stats: d.stats(elapsed),
     }
 }
 
@@ -464,6 +617,28 @@ pub(crate) fn solve_mode(
     cfg: &ProverConfig,
     ctl: &Ctl,
     pds_mode: bool,
+) -> DriverResult {
+    solve_mode_at(pos, cfg, ctl, pds_mode, None)
+}
+
+/// Depth-bounded PDS/df-pn. A returned `Verdict::No` means specifically that no
+/// forcing win exists within `cfg.depth_cap` attacker turns; callers must expose
+/// that as a lower-bound fact rather than an unqualified global refutation.
+pub(crate) fn solve_mode_bounded(
+    pos: &super::io::Position,
+    cfg: &ProverConfig,
+    ctl: &Ctl,
+    pds_mode: bool,
+) -> DriverResult {
+    solve_mode_at(pos, cfg, ctl, pds_mode, Some(cfg.depth_cap))
+}
+
+fn solve_mode_at(
+    pos: &super::io::Position,
+    cfg: &ProverConfig,
+    ctl: &Ctl,
+    pds_mode: bool,
+    remaining: Option<u8>,
 ) -> DriverResult {
     let wl = pos.config.win_length;
     if !KernelCtx::supported(wl) {
@@ -487,7 +662,7 @@ pub(crate) fn solve_mode(
     // This covers both Dfpn and Pdspn (Pdspn delegates to `solve_mode`).
     #[cfg(not(target_arch = "wasm32"))]
     let t = Instant::now();
-    let (pn, dn) = d.mid(root, INF, INF, 0);
+    let (pn, dn) = d.mid(root, INF, INF, 0, remaining);
     #[cfg(not(target_arch = "wasm32"))]
     let elapsed = t.elapsed().as_secs_f64();
     #[cfg(target_arch = "wasm32")]
@@ -517,18 +692,33 @@ pub(crate) fn solve_mode(
         // set into a compact OR-retained / AND-all certificate, then independently
         // replay it before exposing it. A certificate failure never changes the
         // already-proved verdict; it is reported by absence and covered by tests.
-        if pds_mode
-            && let Ok(certificate) = super::certificate::reconstruct(pos, cfg.wide, &d.proven)
-            && super::certificate::verify(pos, &certificate).is_ok()
-        {
-            res.certificate = Some(certificate);
+        if pds_mode {
+            let rebuilt = match remaining {
+                Some(turns) => {
+                    super::certificate::reconstruct_bounded(pos, cfg.wide, &d.proven, turns)
+                }
+                None => super::certificate::reconstruct(pos, cfg.wide, &d.proven),
+            };
+            if let Ok(certificate) = rebuilt
+                && let Ok(summary) = super::certificate::verify(pos, &certificate)
+            {
+                if remaining.is_some()
+                    && let Ok(pv) = super::certificate::worst_case_pv(pos, &certificate)
+                    && pv_replays_win(pos, &pv)
+                {
+                    res.pv = pv;
+                    res.depth = u8::try_from(summary.max_attacker_turns).ok();
+                }
+                res.certificate = Some(certificate);
+            }
         }
         // First try reconstructing the PV by descending proven children (the
         // spec's approach; exact for df-pn). In PDS-PN mode some winning nodes were
         // proven inside a *discarded* level-2 PN tree, so their children aren't in
         // the proven set and this walk can come up short — fall back to the kernel
         // solver's own PV, which is guaranteed valid for a genuinely forced win.
-        if let Some(pv_ctx) = KernelCtx::new_wide(
+        if res.pv.is_empty()
+            && let Some(pv_ctx) = KernelCtx::new_wide(
             &pos.stones,
             pos.attacker,
             wl,
@@ -538,7 +728,7 @@ pub(crate) fn solve_mode(
             let proven = std::mem::take(&mut d.proven);
             d.k = pv_ctx;
             d.proven = proven;
-            let (pv, turns) = d.build_pv(root);
+            let (pv, turns) = d.build_pv(root, remaining);
             if pv_replays_win(pos, &pv) {
                 res.pv = pv;
                 res.depth = Some(turns);
@@ -557,7 +747,7 @@ pub(crate) fn solve_mode(
 
 /// Replay a candidate PV through the engine; true iff it legally ends in the
 /// attacker's win. Guards the proof-search PV reconstruction.
-fn pv_replays_win(pos: &super::io::Position, pv: &[Coord]) -> bool {
+pub(super) fn pv_replays_win(pos: &super::io::Position, pv: &[Coord]) -> bool {
     if pv.is_empty() {
         return false;
     }

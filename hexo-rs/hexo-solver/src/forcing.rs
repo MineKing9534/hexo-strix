@@ -36,6 +36,83 @@ pub struct Limits {
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
+/// Independently verified winning-depth upper bounds supplied by a proof DAG.
+///
+/// These are deliberately positive facts only: a hit may close an IDTT node when
+/// the remaining depth budget is at least the certified bound, while a miss has
+/// no meaning and the normal exhaustive forcing search continues. Keeping the
+/// map in the forcing layer also prevents the search from depending on PDS-PN's
+/// proof numbers or retained-child policy.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WinDepthHints {
+    wins: FxHashMap<(u64, bool, u8), u8>,
+    no_win_within: FxHashMap<(u64, bool, u8), u8>,
+    attacker_order: FxHashMap<(u64, u8), Vec<CellSet2>>,
+    defender_order: FxHashMap<u64, Vec<CellSet2>>,
+}
+
+impl WinDepthHints {
+    pub(crate) fn insert(&mut self, hash: u64, is_or: bool, placements: u8, depth: u32) {
+        let Ok(depth) = u8::try_from(depth) else { return };
+        self.wins
+            .entry((hash, is_or, placements))
+            .and_modify(|old| *old = (*old).min(depth))
+            .or_insert(depth);
+    }
+
+    pub(crate) fn insert_no_win_within(
+        &mut self,
+        hash: u64,
+        is_or: bool,
+        placements: u8,
+        depth: u8,
+    ) {
+        self.no_win_within
+            .entry((hash, is_or, placements))
+            .and_modify(|old| *old = (*old).max(depth))
+            .or_insert(depth);
+    }
+
+    #[inline]
+    fn proves_within(&self, hash: u64, is_or: bool, placements: u8, budget: u8) -> bool {
+        self.wins
+            .get(&(hash, is_or, placements))
+            .is_some_and(|&depth| depth <= budget)
+    }
+
+    fn depth(&self, hash: u64, is_or: bool, placements: u8) -> Option<u8> {
+        self.wins.get(&(hash, is_or, placements)).copied()
+    }
+
+    #[inline]
+    fn disproves_within(&self, hash: u64, is_or: bool, placements: u8, budget: u8) -> bool {
+        self.no_win_within
+            .get(&(hash, is_or, placements))
+            .is_some_and(|&depth| depth >= budget)
+    }
+
+    pub(crate) fn set_attacker_order(
+        &mut self,
+        hash: u64,
+        placements: u8,
+        actions: Vec<CellSet2>,
+    ) {
+        self.attacker_order.insert((hash, placements), actions);
+    }
+
+    pub(crate) fn set_defender_order(&mut self, hash: u64, actions: Vec<CellSet2>) {
+        self.defender_order.insert(hash, actions);
+    }
+
+    pub(crate) fn attacker_order(&self, hash: u64, placements: u8) -> Option<&[CellSet2]> {
+        self.attacker_order.get(&(hash, placements)).map(Vec::as_slice)
+    }
+
+    fn defender_order(&self, hash: u64) -> Option<&[CellSet2]> {
+        self.defender_order.get(&hash).map(Vec::as_slice)
+    }
+}
+
 const WIN_AXES: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
 /// Max supported win_length: strip-scan buffers are stack arrays of 2*MAX_WL-1.
 pub const MAX_WL: usize = 16;
@@ -1330,6 +1407,15 @@ struct SearchState {
     /// their absence) — the caller must pair the support test with that check.
     /// See `vct_probe` for the consumer and the full soundness argument.
     support: Option<FxHashMap<(u64, bool, u8), Rc<Vec<Coord>>>>,
+    /// Optional positive-only facts from an independently replayed proof DAG.
+    /// `None` on every production solver path.
+    depth_hints: Option<Rc<WinDepthHints>>,
+    hint_hits: u64,
+    guided_lower: u8,
+    guided_upper: Option<u8>,
+    /// Winning attacker action discovered for an exact threshold. Guided PV
+    /// recovery consumes this instead of repeating the threshold search.
+    winning_moves: FxHashMap<(u64, u8, u8), CellSet2>,
 }
 
 impl SearchState {
@@ -1349,6 +1435,11 @@ impl SearchState {
             proof_ordering: false,
             limits: Limits::default(),
             support: None,
+            depth_hints: None,
+            hint_hits: 0,
+            guided_lower: 0,
+            guided_upper: None,
+            winning_moves: FxHashMap::default(),
         }
     }
 
@@ -1381,6 +1472,11 @@ impl SearchState {
         self.proof_ordering = false;
         self.limits = Limits::default();
         self.support = None;
+        self.depth_hints = None;
+        self.hint_hits = 0;
+        self.guided_lower = 0;
+        self.guided_upper = None;
+        self.winning_moves.clear();
     }
 
     /// Fresh node budget for a follow-up run (PV probes) that KEEPS the warm
@@ -1449,7 +1545,7 @@ fn attacker_turns_memo(
 ) -> Rc<Vec<CellSet2>> {
     let key = (board.hash, placements);
     if let Some(v) = s.gencache.get(&key) { return Rc::clone(v); }
-    let moves = Rc::new(attacker_turns_with_ordering(
+    let mut moves = attacker_turns_with_ordering(
         board,
         s.atk,
         placements,
@@ -1458,7 +1554,17 @@ fn attacker_turns_memo(
         dfn_comps,
         s.wide,
         s.proof_ordering,
-    ));
+    );
+    if let Some(preferred) = s
+        .depth_hints
+        .as_ref()
+        .and_then(|h| h.attacker_order(board.hash, placements))
+    {
+        moves.sort_by_key(|mv| {
+            preferred.iter().position(|hinted| hinted == mv).unwrap_or(usize::MAX)
+        });
+    }
+    let moves = Rc::new(moves);
     s.gencache.insert(key, Rc::clone(&moves));
     moves
 }
@@ -1473,6 +1579,20 @@ fn atk_within(board: &mut SolverBoard, placements: u8, budget: u8, s: &mut Searc
         // (its stones are the attacker's own — the opponent cannot remove them).
         s.record_support((board.hash, true, placements), win.cells().to_vec());
         return (true, false);
+    }
+    if s.depth_hints
+        .as_ref()
+        .is_some_and(|h| h.proves_within(board.hash, true, placements, budget))
+    {
+        s.hint_hits += 1;
+        return (true, false);
+    }
+    if s.depth_hints
+        .as_ref()
+        .is_some_and(|h| h.disproves_within(board.hash, true, placements, budget))
+    {
+        s.hint_hits += 1;
+        return (false, true);
     }
     if budget < 2 { return (false, true); }
     let key = (board.hash, true, placements, budget);
@@ -1497,7 +1617,11 @@ fn atk_within(board: &mut SolverBoard, placements: u8, budget: u8, s: &mut Searc
         }
         for &c in mv.cells() { board.remove(c); }
         cut |= subcut;
-        if w { won = true; break; }
+        if w {
+            s.winning_moves.insert((board.hash, placements, budget), mv);
+            won = true;
+            break;
+        }
     }
     if won && let Some(cells) = won_support {
         s.record_support((board.hash, true, placements), cells);
@@ -1512,7 +1636,7 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
     let comps = node_comps(board, s);
     let (atk_comps, dfn_comps) = (&comps.0, &comps.1);
     if dfn_comps.iter().any(|c| c.len() as u8 <= 2) { return (false, false); } // defender wins first
-    let (bnum, covers) = min_covers2(atk_comps);
+    let (bnum, mut covers) = min_covers2(atk_comps);
     if bnum < 2 { return (false, false); }
     if bnum >= 3 {
         return if budget >= 1 {
@@ -1528,6 +1652,25 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
         } else {
             (false, true)
         };
+    }
+    if s.depth_hints
+        .as_ref()
+        .is_some_and(|h| h.proves_within(board.hash, false, 0, budget))
+    {
+        s.hint_hits += 1;
+        return (true, false);
+    }
+    if s.depth_hints
+        .as_ref()
+        .is_some_and(|h| h.disproves_within(board.hash, false, 0, budget))
+    {
+        s.hint_hits += 1;
+        return (false, true);
+    }
+    if let Some(preferred) = s.depth_hints.as_ref().and_then(|h| h.defender_order(board.hash)) {
+        covers.sort_by_key(|cover| {
+            preferred.iter().position(|hinted| hinted == cover).unwrap_or(usize::MAX)
+        });
     }
     let key = (board.hash, false, 0, budget);
     if let Some(&v) = s.tt.get(&key) { return v; }
@@ -1651,6 +1794,73 @@ fn solve_from_state(
     SolveResult::BudgetExceeded
 }
 
+/// Threshold search for a root with a certified winning upper bound.
+///
+/// First test the caller's requested cap when it is below the certificate bound,
+/// so a useful shorter witness can surface before the expensive minimality pass.
+/// Once a winning upper bound is in range, descend one turn at a time. PDS-PN's
+/// bound is normally close, winning probes are cheaper than the final exhaustive
+/// miss, and testing `upper - 1` immediately spends the budget on the threshold
+/// that can certify optimality. Every failed threshold is exhaustive unless the
+/// shared node/deadline budget is hit.
+fn solve_from_state_guided(
+    board: &mut SolverBoard,
+    placements_remaining: u8,
+    depth_cap: u8,
+    s: &mut SearchState,
+) -> SolveResult {
+    let (wl, radius) = (s.wl, s.radius);
+    if !(1..=MAX_WL).contains(&(wl as usize)) || depth_cap == 0 {
+        return SolveResult::BudgetExceeded;
+    }
+    let blind_no = if (wl as usize) < 5 { SolveResult::BudgetExceeded } else { SolveResult::No };
+    if radius < wl as i32 - 1 {
+        board.enable_reach(radius);
+    }
+    if !any_four_gate(board, s.atk, wl, radius)
+        && !has_completion(board, s.atk, wl, placements_remaining, radius)
+    {
+        return blind_no;
+    }
+    let Some(mut high) = s
+        .depth_hints
+        .as_ref()
+        .and_then(|h| h.depth(board.hash, true, placements_remaining))
+    else {
+        return solve_from_state(board, placements_remaining, depth_cap, s);
+    };
+    s.guided_upper = Some(high);
+
+    if high > depth_cap {
+        let (won, _) = atk_within(board, placements_remaining, depth_cap, s);
+        if s.exceeded {
+            return SolveResult::BudgetExceeded;
+        }
+        if !won {
+            s.guided_lower = depth_cap;
+            return SolveResult::BudgetExceeded;
+        }
+        high = depth_cap;
+        s.guided_upper = Some(high);
+    }
+
+    while high > 1 {
+        let threshold = high - 1;
+        let (won, _) = atk_within(board, placements_remaining, threshold, s);
+        if s.exceeded {
+            return SolveResult::BudgetExceeded;
+        }
+        if won {
+            high = threshold;
+            s.guided_upper = Some(high);
+        } else {
+            s.guided_lower = s.guided_lower.max(threshold);
+            return SolveResult::Win { depth: high };
+        }
+    }
+    SolveResult::Win { depth: high }
+}
+
 use hexo_engine::game::GameState;
 
 #[derive(Debug)]
@@ -1717,6 +1927,104 @@ pub fn solve_limited(
     limits: Limits,
 ) -> Outcome {
     solve_ex(game, depth_cap, node_budget, wide, limits)
+}
+
+/// Search measurements for the proof-guided research path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GuidedSearchStats {
+    pub nodes: u64,
+    pub hint_hits: u64,
+    /// Largest exhaustively refuted root threshold in attacker turns.
+    pub excluded_through: u8,
+    /// Smallest verified root winning upper bound seen (0 means unavailable).
+    pub best_upper: u8,
+}
+
+/// IDTT with positive-only depth facts from an independently verified proof DAG.
+///
+/// The ordinary forcing generator remains exhaustive. In particular, attacker
+/// actions absent from the certificate are still generated and searched, which
+/// is what permits this path to discover a shorter proof than PDS-PN retained.
+pub(crate) fn solve_limited_guided(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    limits: Limits,
+    hints: Rc<WinDepthHints>,
+) -> (Outcome, GuidedSearchStats, Option<ForcingWin>) {
+    let (mut board, mut s, placements) = match prepare_search(
+        game, node_budget, wide, limits, false,
+    ) {
+        Ok(prepared) => prepared,
+        Err(SolveResult::No) => return (Outcome::No, GuidedSearchStats::default(), None),
+        Err(SolveResult::BudgetExceeded) | Err(SolveResult::Win { .. }) => {
+            return (Outcome::BudgetExceeded, GuidedSearchStats::default(), None);
+        }
+    };
+    s.depth_hints = Some(hints);
+    let result = solve_from_state_guided(&mut board, placements, depth_cap, &mut s);
+    let stats = GuidedSearchStats {
+        nodes: s.nodes,
+        hint_hits: s.hint_hits,
+        excluded_through: s.guided_lower,
+        best_upper: s.guided_upper.unwrap_or(0),
+    };
+    let mut best_win = None;
+    let outcome = match result {
+        SolveResult::No => Outcome::No,
+        SolveResult::BudgetExceeded => {
+            if let Some(depth) = s.guided_upper.filter(|&depth| depth <= depth_cap) {
+                s.limits = Limits::default();
+                let fm = first_winning_move(&mut board, placements, depth, &mut s);
+                let pv = extract_pv(&mut board, placements, depth, &mut s);
+                if let Some(first_move) = fm.or_else(|| pv.first().copied()) {
+                    best_win = Some(ForcingWin { depth, first_move, pv });
+                }
+            }
+            Outcome::BudgetExceeded
+        }
+        SolveResult::Win { depth } => {
+            s.limits = Limits::default();
+            let fm = first_winning_move(&mut board, placements, depth, &mut s);
+            let pv = extract_pv(&mut board, placements, depth, &mut s);
+            match fm.or_else(|| pv.first().copied()) {
+                Some(first) => Outcome::Win(ForcingWin { depth, first_move: first, pv }),
+                None => Outcome::BudgetExceeded,
+            }
+        }
+    };
+    (outcome, stats, best_win)
+}
+
+/// Verdict-only counterpart used by the bottom-up certificate prepass. It avoids
+/// PV reconstruction (and its fresh per-probe budgets) for hundreds of local
+/// bound-tightening queries.
+pub(crate) fn solve_limited_guided_verdict(
+    game: &GameState,
+    depth_cap: u8,
+    node_budget: u64,
+    wide: bool,
+    limits: Limits,
+    hints: Rc<WinDepthHints>,
+) -> (ForcingVerdict, GuidedSearchStats) {
+    let (mut board, mut s, placements) = match prepare_search(
+        game, node_budget, wide, limits, false,
+    ) {
+        Ok(prepared) => prepared,
+        Err(result) => return (forcing_verdict(result), GuidedSearchStats::default()),
+    };
+    s.depth_hints = Some(hints);
+    let result = solve_from_state_guided(&mut board, placements, depth_cap, &mut s);
+    (
+        forcing_verdict(result),
+        GuidedSearchStats {
+            nodes: s.nodes,
+            hint_hits: s.hint_hits,
+            excluded_through: s.guided_lower,
+            best_upper: s.guided_upper.unwrap_or(0),
+        },
+    )
 }
 
 /// `solve` with the wide-partner-width knob (see `wide_partner_cells`) turned
@@ -2079,7 +2387,11 @@ fn first_winning_move(board: &mut SolverBoard, placements: u8, depth: u8,
             return c.first();
         }
     }
-    for mv in attacker_turns(board, s.atk, s.dfn, placements, s.wl, s.radius, s.wide) {
+    if let Some(mv) = s.winning_moves.get(&(board.hash, placements, depth)) {
+        return mv.first();
+    }
+    let moves = pv_attacker_turns(board, placements, s);
+    for &mv in moves.iter() {
         for &c in mv.cells() { board.place(c, s.atk); }
         s.reset_run();
         let (w, _) = def_within(board, depth.saturating_sub(1), s);
@@ -2087,6 +2399,26 @@ fn first_winning_move(board: &mut SolverBoard, placements: u8, depth: u8,
         if w { return mv.first(); }
     }
     None
+}
+
+/// Preserve the production solver's historical PV ordering, but let the guided
+/// research path reuse its certificate-ordered generation memo. This is crucial
+/// after an optimality timeout: probing arbitrary losing root moves can otherwise
+/// cost as much as the solve whose already-proven upper-bound PV we are trying to
+/// display.
+fn pv_attacker_turns(
+    board: &SolverBoard,
+    placements: u8,
+    s: &mut SearchState,
+) -> Rc<Vec<CellSet2>> {
+    if s.depth_hints.is_some() {
+        let comps = node_comps(board, s);
+        attacker_turns_memo(board, placements, &comps.1, s)
+    } else {
+        Rc::new(attacker_turns(
+            board, s.atk, s.dfn, placements, s.wl, s.radius, s.wide,
+        ))
+    }
 }
 
 /// The defender's cosmetic 2-cell reply for a `B >= 3` (futile, unstoppable) position:
@@ -2124,7 +2456,7 @@ pub fn futile_defender_pair(comps: &[CellSet2]) -> CellSet2 {
 /// full search.
 fn extract_pv(board: &mut SolverBoard, mut placements: u8, depth: u8,
               s: &mut SearchState) -> Vec<Coord> {
-    let (attacker, defender, wl, radius, wide) = (s.atk, s.dfn, s.wl, s.radius, s.wide);
+    let (attacker, defender, wl, radius) = (s.atk, s.dfn, s.wl, s.radius);
     let mut pv: Vec<Coord> = Vec::new();
     let mut remaining = depth;
     loop {
@@ -2138,24 +2470,44 @@ fn extract_pv(board: &mut SolverBoard, mut placements: u8, depth: u8,
             break;
         }
         // find a winning forcing move
-        let mut chosen: Option<CellSet2> = None;
-        for mv in attacker_turns(board, attacker, defender, placements, wl, radius, wide) {
-            for &c in mv.cells() { board.place(c, attacker); }
-            s.reset_run();
-            let (w, _) = def_within(board, remaining.saturating_sub(1), s);
-            for &c in mv.cells() { board.remove(c); }
-            if w { chosen = Some(mv); break; }
+        let mut chosen = s
+            .winning_moves
+            .get(&(board.hash, placements, remaining))
+            .copied();
+        if chosen.is_none() {
+            let moves = pv_attacker_turns(board, placements, s);
+            for &mv in moves.iter() {
+                for &c in mv.cells() { board.place(c, attacker); }
+                s.reset_run();
+                let (w, _) = def_within(board, remaining.saturating_sub(1), s);
+                for &c in mv.cells() { board.remove(c); }
+                if w { chosen = Some(mv); break; }
+            }
         }
         let mv = match chosen { Some(m) => m, None => break };
         for &c in mv.cells() { board.place(c, attacker); pv.push(c); }
         placements = 2;
         // defender: B>=3 terminal, or prolonging cover
         let comps = completions(board, attacker, wl, radius);
-        let (bnum, covers) = min_covers2(&comps);
+        let (bnum, mut covers) = min_covers2(&comps);
         if bnum >= 3 {
             // defender blocks two threat cells (futile), attacker completes next loop
             let pair = futile_defender_pair(&comps);
             for &c in pair.cells() { board.place(c, defender); pv.push(c); }
+            remaining = remaining.saturating_sub(1);
+            continue;
+        }
+        if let Some(hints) = &s.depth_hints {
+            if let Some(preferred) = hints.defender_order(board.hash) {
+                covers.sort_by_key(|cover| {
+                    preferred
+                        .iter()
+                        .position(|hinted| hinted == cover)
+                        .unwrap_or(usize::MAX)
+                });
+            }
+            let Some(cover) = covers.first().copied() else { break };
+            for &c in cover.cells() { board.place(c, defender); pv.push(c); }
             remaining = remaining.saturating_sub(1);
             continue;
         }
@@ -2994,7 +3346,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// The old wrapping-multiply pre-mix collided IN RANGE (e.g. (-2, 63) vs
     /// (2, -63); ~2.7k dupes within |q|,|r| <= 64), poisoning every
     /// hash-keyed table. Per-player injectivity of the new construction is

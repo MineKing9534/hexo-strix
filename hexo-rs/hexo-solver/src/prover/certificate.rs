@@ -11,8 +11,8 @@
 
 use super::io::Position;
 use super::kernel::{AndEval, KernelCtx, Node, OrEval};
-use super::pn::node_key;
-use crate::forcing::CellSet2;
+use super::pn::{after_attacker, node_key_at};
+use crate::forcing::{CellSet2, WinDepthHints};
 use hexo_engine::types::{Coord, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -76,11 +76,45 @@ pub struct ProofSummary {
     pub max_attacker_turns: u32,
 }
 
+/// An attacker-to-move state replayed from a verified certificate. The guided
+/// optimizer may independently tighten `certified_depth`; the certificate itself
+/// remains unchanged.
+pub(crate) struct GuidedOrNode {
+    pub id: u32,
+    pub hash: u64,
+    pub stones: Vec<(Coord, Player)>,
+    pub placements: u8,
+    pub certified_depth: u32,
+    pub primary: bool,
+}
+
 /// Reconstruct an all-defense DAG from PDS-PN's monotone set of proved node keys.
 pub(crate) fn reconstruct(
     pos: &Position,
     wide: bool,
     proven: &FxHashSet<u64>,
+) -> Result<ProofCertificate, String> {
+    reconstruct_at(pos, wide, proven, None)
+}
+
+/// Reconstruct the strategy proved at one exact attacker-turn horizon. Unlike
+/// an ordinary certificate, every lookup includes the remaining-turn salt, so
+/// the resulting DAG contains the depth-bounded strategy rather than whichever
+/// unbounded proof happened to establish the initial upper bound.
+pub(crate) fn reconstruct_bounded(
+    pos: &Position,
+    wide: bool,
+    proven: &FxHashSet<u64>,
+    remaining: u8,
+) -> Result<ProofCertificate, String> {
+    reconstruct_at(pos, wide, proven, Some(remaining))
+}
+
+fn reconstruct_at(
+    pos: &Position,
+    wide: bool,
+    proven: &FxHashSet<u64>,
+    remaining: Option<u8>,
 ) -> Result<ProofCertificate, String> {
     let k = KernelCtx::new_wide(
         &pos.stones,
@@ -93,7 +127,7 @@ pub(crate) fn reconstruct(
     let root_node = Node::Or {
         placements: pos.placements_remaining,
     };
-    let root_key = node_key(k.hash(), root_node);
+    let root_key = node_key_at(k.hash(), root_node, remaining);
     if !proven.contains(&root_key) {
         return Err("PDS-PN proved the root but did not retain its proof key".to_string());
     }
@@ -104,7 +138,7 @@ pub(crate) fn reconstruct(
         nodes: Vec::new(),
         depths: Vec::new(),
     };
-    let root = builder.emit(root_node)?;
+    let root = builder.emit(root_node, remaining)?;
     Ok(ProofCertificate {
         version: CERTIFICATE_VERSION,
         width: if wide { "wide" } else { "tight" }.to_string(),
@@ -122,8 +156,8 @@ struct ProofBuilder<'a> {
 }
 
 impl ProofBuilder<'_> {
-    fn emit(&mut self, node: Node) -> Result<u32, String> {
-        let key = node_key(self.k.hash(), node);
+    fn emit(&mut self, node: Node, remaining: Option<u8>) -> Result<u32, String> {
+        let key = node_key_at(self.k.hash(), node, remaining);
         if let Some(&id) = self.memo.get(&key) {
             return Ok(id);
         }
@@ -133,7 +167,7 @@ impl ProofBuilder<'_> {
 
         let (proof_node, depth) = match node {
             Node::Or { placements } => match self.k.or_eval(placements) {
-                OrEval::WinNow => {
+                OrEval::WinNow if remaining != Some(0) => {
                     let action = self
                         .k
                         .win_now_cells(placements)
@@ -145,17 +179,23 @@ impl ProofBuilder<'_> {
                         1,
                     )
                 }
-                OrEval::Loss => return Err("proved OR node re-evaluated as a loss".to_string()),
+                OrEval::WinNow | OrEval::Loss => {
+                    return Err("proved OR node re-evaluated beyond its horizon".to_string());
+                }
+                OrEval::Moves(_) if remaining.is_some_and(|turns| turns < 2) => {
+                    return Err("proved OR node has no non-terminal turn left".to_string());
+                }
                 OrEval::Moves(moves) => {
                     let mut choices = Vec::new();
+                    let child_remaining = after_attacker(remaining);
                     for (move_index, action) in moves.iter().enumerate() {
                         self.k.place_attacker(action);
                         let child_node = Node::And;
-                        let child_key = node_key(self.k.hash(), child_node);
+                        let child_key = node_key_at(self.k.hash(), child_node, child_remaining);
                         let built = self
                             .proven
                             .contains(&child_key)
-                            .then(|| self.emit(child_node));
+                            .then(|| self.emit(child_node, child_remaining));
                         self.k.unplace(action);
                         if let Some(built) = built {
                             let child = built?;
@@ -189,6 +229,9 @@ impl ProofBuilder<'_> {
                     )
                 }
             },
+            Node::And if remaining == Some(0) => {
+                return Err("proved AND node has no future attacker turn".to_string());
+            }
             Node::And => match self.k.and_eval() {
                 AndEval::AttackerWin => (ProofNode::Unstoppable, 1),
                 AndEval::Loss => return Err("proved AND node re-evaluated as a loss".to_string()),
@@ -198,9 +241,9 @@ impl ProofBuilder<'_> {
                     for cover in covers {
                         self.k.place_defender(&cover);
                         let child_node = Node::Or { placements: 2 };
-                        let child_key = node_key(self.k.hash(), child_node);
+                        let child_key = node_key_at(self.k.hash(), child_node, remaining);
                         let built = if self.proven.contains(&child_key) {
-                            self.emit(child_node)
+                            self.emit(child_node, remaining)
                         } else {
                             Err(format!("missing proved defense child {child_key:016x}"))
                         };
@@ -226,6 +269,102 @@ impl ProofBuilder<'_> {
     }
 }
 
+/// Replay the certificate's minimax principal variation: the shortest retained
+/// attack at every OR node and a maximum-delay reply at every AND node. Because
+/// `verify` recomputes the complete defense sets and node depths first, a line
+/// returned here is a concrete witness attaining the certificate's worst-case
+/// attacker-turn bound (ties retain deterministic certificate order).
+pub(crate) fn worst_case_pv(
+    pos: &Position,
+    certificate: &ProofCertificate,
+) -> Result<Vec<Coord>, String> {
+    verify(pos, certificate)?;
+
+    fn depth(
+        certificate: &ProofCertificate,
+        id: u32,
+        memo: &mut FxHashMap<u32, u32>,
+    ) -> Result<u32, String> {
+        if let Some(&known) = memo.get(&id) {
+            return Ok(known);
+        }
+        let node = certificate
+            .nodes
+            .get(id as usize)
+            .ok_or_else(|| format!("proof node {id} is out of range"))?;
+        let value = match node {
+            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable => 1,
+            ProofNode::AttackerMove { child, .. } => {
+                1u32.saturating_add(depth(certificate, *child, memo)?)
+            }
+            ProofNode::DefenderReplies { responses } => responses
+                .iter()
+                .map(|response| depth(certificate, response.child, memo))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max()
+                .ok_or("verified defender node had no responses")?,
+        };
+        memo.insert(id, value);
+        Ok(value)
+    }
+
+    let mut depths = FxHashMap::default();
+    depth(certificate, certificate.root, &mut depths)?;
+    let mut k = KernelCtx::new_wide(
+        &pos.stones,
+        pos.attacker,
+        pos.config.win_length,
+        pos.config.placement_radius,
+        certificate.width == "wide",
+    )
+    .ok_or("could not build the worst-case replay kernel")?;
+    let mut id = certificate.root;
+    let mut pv = Vec::new();
+    loop {
+        let node = certificate
+            .nodes
+            .get(id as usize)
+            .ok_or_else(|| format!("proof node {id} is out of range"))?;
+        match node {
+            ProofNode::ImmediateWin { action } => {
+                let cells = CellSet2::from_cells(action);
+                k.place_attacker(&cells);
+                pv.extend_from_slice(cells.cells());
+                break;
+            }
+            ProofNode::AttackerMove { action, child, .. } => {
+                let cells = CellSet2::from_cells(action);
+                k.place_attacker(&cells);
+                pv.extend_from_slice(cells.cells());
+                id = *child;
+            }
+            ProofNode::DefenderReplies { responses } => {
+                let response = responses
+                    .iter()
+                    .max_by_key(|response| depths.get(&response.child).copied().unwrap_or(0))
+                    .ok_or("verified defender node had no responses")?;
+                let cells = CellSet2::from_cells(&response.action);
+                k.place_defender(&cells);
+                pv.extend_from_slice(cells.cells());
+                id = response.child;
+            }
+            ProofNode::Unstoppable => {
+                let defense = k.futile_pair();
+                k.place_defender(&defense);
+                pv.extend_from_slice(defense.cells());
+                let completion = k
+                    .win_now_cells(2)
+                    .ok_or("unstoppable node had no replayable completion")?;
+                k.place_attacker(&completion);
+                pv.extend_from_slice(completion.cells());
+                break;
+            }
+        }
+    }
+    Ok(pv)
+}
+
 /// Verify a certificate from scratch against the supplied root position.
 pub fn verify(pos: &Position, certificate: &ProofCertificate) -> Result<ProofSummary, String> {
     verify_with_limit(pos, certificate, DEFAULT_VERIFY_NODE_LIMIT)
@@ -236,6 +375,25 @@ pub fn verify_with_limit(
     certificate: &ProofCertificate,
     node_limit: usize,
 ) -> Result<ProofSummary, String> {
+    verify_with_limit_and_hints(pos, certificate, node_limit, false)
+        .map(|(summary, _, _)| summary)
+}
+
+/// Verify a certificate and retain its positive winning-depth facts for IDTT.
+/// Invalid certificates return no hints at all.
+pub(crate) fn verify_with_hints(
+    pos: &Position,
+    certificate: &ProofCertificate,
+) -> Result<(ProofSummary, WinDepthHints, Vec<GuidedOrNode>), String> {
+    verify_with_limit_and_hints(pos, certificate, DEFAULT_VERIFY_NODE_LIMIT, true)
+}
+
+fn verify_with_limit_and_hints(
+    pos: &Position,
+    certificate: &ProofCertificate,
+    node_limit: usize,
+    collect_guidance: bool,
+) -> Result<(ProofSummary, WinDepthHints, Vec<GuidedOrNode>), String> {
     if certificate.version != CERTIFICATE_VERSION {
         return Err(format!(
             "unsupported proof certificate version {}",
@@ -272,6 +430,9 @@ pub fn verify_with_limit(
         visiting: FxHashSet::default(),
         reached: FxHashSet::default(),
         edges: 0,
+        hints: WinDepthHints::default(),
+        or_nodes: Vec::new(),
+        collect_guidance,
     };
     let root_node = Node::Or {
         placements: pos.placements_remaining,
@@ -283,11 +444,18 @@ pub fn verify_with_limit(
             certificate.nodes.len() - verifier.reached.len()
         ));
     }
-    Ok(ProofSummary {
+    if collect_guidance {
+        let primary = primary_reachable(certificate);
+        for node in &mut verifier.or_nodes {
+            node.primary = primary.contains(&node.id);
+        }
+    }
+    let summary = ProofSummary {
         dag_nodes: certificate.nodes.len() as u64,
         proof_edges: verifier.edges,
         max_attacker_turns: depth,
-    })
+    };
+    Ok((summary, verifier.hints, verifier.or_nodes))
 }
 
 struct ProofVerifier<'a> {
@@ -298,6 +466,9 @@ struct ProofVerifier<'a> {
     visiting: FxHashSet<u32>,
     reached: FxHashSet<u32>,
     edges: u64,
+    hints: WinDepthHints,
+    or_nodes: Vec<GuidedOrNode>,
+    collect_guidance: bool,
 }
 
 impl ProofVerifier<'_> {
@@ -309,6 +480,8 @@ impl ProofVerifier<'_> {
             .ok_or_else(|| format!("proof node {id} is out of range"))?
             .clone();
         let state = self.k.canonical_stones();
+        let hash = self.k.hash();
+        let (is_or, placements) = expected.tag();
         if let Some((prior_node, prior_state)) = self.seen_states.get(&id) {
             if *prior_node != expected || *prior_state != state {
                 return Err(format!(
@@ -324,6 +497,7 @@ impl ProofVerifier<'_> {
         if !self.visiting.insert(id) {
             return Err(format!("proof DAG contains a cycle through node {id}"));
         }
+        let guide_state = self.collect_guidance.then(|| state.clone());
         self.seen_states.insert(id, (expected, state));
         self.reached.insert(id);
 
@@ -366,6 +540,7 @@ impl ProofVerifier<'_> {
                 let mut supplied = FxHashSet::default();
                 let mut previous_depth = None;
                 let mut primary_depth = None;
+                let mut ranked_actions = Vec::with_capacity(choices.len());
                 for response in choices {
                     let action = parse_action(&response.action)?;
                     if !supplied.insert(action) {
@@ -381,6 +556,7 @@ impl ProofVerifier<'_> {
                     let child_depth = self.walk(response.child, Node::And);
                     self.k.unplace(&action);
                     let choice_depth = 1u32.saturating_add(child_depth?);
+                    ranked_actions.push(action);
                     if previous_depth.is_some_and(|prior| prior > choice_depth) {
                         return Err(format!(
                             "node {id}: attacker alternatives are not ranked by worst-case depth"
@@ -388,6 +564,9 @@ impl ProofVerifier<'_> {
                     }
                     previous_depth = Some(choice_depth);
                     primary_depth.get_or_insert(choice_depth);
+                }
+                if self.collect_guidance {
+                    self.hints.set_attacker_order(hash, placements, ranked_actions);
                 }
                 primary_depth.ok_or_else(|| format!("node {id}: attacker node has no choice"))?
             }
@@ -418,13 +597,23 @@ impl ProofVerifier<'_> {
                     ));
                 }
                 let mut max_depth = 0;
+                let mut ranked_covers = Vec::with_capacity(covers.len());
                 for cover in covers {
                     let child = supplied[&cover];
                     self.k.place_defender(&cover);
                     self.edges += 1;
                     let child_depth = self.walk(child, Node::Or { placements: 2 });
                     self.k.unplace(&cover);
-                    max_depth = max_depth.max(child_depth?);
+                    let child_depth = child_depth?;
+                    max_depth = max_depth.max(child_depth);
+                    ranked_covers.push((child_depth, cover));
+                }
+                ranked_covers.sort_by_key(|(depth, cover)| (std::cmp::Reverse(*depth), *cover));
+                if self.collect_guidance {
+                    self.hints.set_defender_order(
+                        hash,
+                        ranked_covers.into_iter().map(|(_, cover)| cover).collect(),
+                    );
                 }
                 max_depth
             }
@@ -442,8 +631,42 @@ impl ProofVerifier<'_> {
 
         self.visiting.remove(&id);
         self.verified_depths.insert(id, depth);
+        if self.collect_guidance {
+            self.hints.insert(hash, is_or, placements, depth);
+        }
+        if is_or && self.collect_guidance {
+            self.or_nodes.push(GuidedOrNode {
+                id,
+                hash,
+                stones: guide_state.expect("guided OR node retains its exact state"),
+                placements,
+                certified_depth: depth,
+                primary: false,
+            });
+        }
         Ok(depth)
     }
+}
+
+/// Nodes in the certificate's recommended all-defense strategy: primary attack
+/// at OR nodes, every response at AND nodes.
+fn primary_reachable(certificate: &ProofCertificate) -> FxHashSet<u32> {
+    let mut reached = FxHashSet::default();
+    let mut pending = vec![certificate.root];
+    while let Some(id) = pending.pop() {
+        if !reached.insert(id) {
+            continue;
+        }
+        let Some(node) = certificate.nodes.get(id as usize) else { continue };
+        match node {
+            ProofNode::AttackerMove { child, .. } => pending.push(*child),
+            ProofNode::DefenderReplies { responses } => {
+                pending.extend(responses.iter().map(|response| response.child));
+            }
+            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable => {}
+        }
+    }
+    reached
 }
 
 fn parse_action(cells: &[Coord]) -> Result<CellSet2, String> {

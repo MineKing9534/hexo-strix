@@ -126,6 +126,10 @@ const FORCING_ENGINE_INFO = {
     label: "PDS-PN",
     help: "PDS-PN combines a depth-first outer proof with a separately bounded PN search at each new frontier. The outer budget and reported nodes count only outer expansions; the PN leaf cap controls frontier guidance. The recovery cap does not limit the main proof search.",
   },
+  "pdspn-shortest": {
+    label: "PDS-PN shortest",
+    help: "First proves a forced win (or reuses this position's PDS-PN proof), then binary-searches attacker-turn horizons with depth-bounded PDS-PN. A shortest result is reported only after every win through the preceding depth is exhaustively excluded.",
+  },
   pns: {
     label: "PNS",
     help: "PNS is an independent, verdict-only cross-check: it can prove Win or No but does not return a line or depth. Its in-memory tree is capped at 1m nodes in the browser UI.",
@@ -134,6 +138,7 @@ const FORCING_ENGINE_INFO = {
 let forcingUiEngine = "idtt";
 let forcingIdttDepth = DEFAULT_ANALYSIS_FORCING_DEPTH;
 let forcingDeepRecoveryDepth = MAX_ANALYSIS_FORCING_DEPTH;
+let forcingShortestDepth = 25;
 let forcingWorker = null;
 let forcingRun = null;
 let forcingRequestSerial = 0;
@@ -209,17 +214,22 @@ function updateForcingSolverUi() {
   const next = engineSelect.value;
   if (next !== forcingUiEngine) {
     if (forcingUiEngine === "idtt") forcingIdttDepth = forcingDepthFromUi();
+    else if (forcingUiEngine === "pdspn-shortest") forcingShortestDepth = forcingDepthFromUi();
     else if (forcingUiEngine !== "pns") forcingDeepRecoveryDepth = forcingDepthFromUi();
-    depthInput.value = String(next === "idtt" ? forcingIdttDepth : forcingDeepRecoveryDepth);
+    depthInput.value = String(next === "idtt" ? forcingIdttDepth
+      : next === "pdspn-shortest" ? forcingShortestDepth : forcingDeepRecoveryDepth);
     forcingUiEngine = next;
   }
   const isPns = next === "pns";
   const isIdtt = next === "idtt";
+  const isShortest = next === "pdspn-shortest";
+  const isPds = next === "pdspn" || isShortest;
   document.getElementById("analysis-forcing-depth-row").hidden = isPns;
-  document.getElementById("analysis-forcing-leaf-row").hidden = next !== "pdspn";
-  document.getElementById("analysis-forcing-depth-label").textContent = isIdtt
-    ? "Attacker-turn depth cap" : "Proof-line recovery cap";
-  document.getElementById("analysis-forcing-budget-label").textContent = next === "pdspn"
+  document.getElementById("analysis-forcing-leaf-row").hidden = !isPds;
+  document.getElementById("analysis-forcing-depth-label").textContent = isShortest
+    ? "Maximum attacker-turn depth"
+    : isIdtt ? "Attacker-turn depth cap" : "Proof-line recovery cap";
+  document.getElementById("analysis-forcing-budget-label").textContent = isPds
     ? "Outer node budget" : "Work budget";
   document.getElementById("analysis-solver-help").textContent = FORCING_ENGINE_INFO[next].help;
 
@@ -259,10 +269,21 @@ function restoreForcingStatusForNode(node) {
   const elapsed = formatSolverElapsed(search.elapsed_ms);
   const work = formatSolverNodes(search.nodes, search.engine);
   if (search.kind === "win") {
+    if (search.engine === "pdspn-shortest" && search.shortest_certified) {
+      const certificate = search.certificate_summary;
+      const dagNote = certificate && certificate.maxAttackerTurns !== search.best_upper_depth
+        ? ` Explore proof opens the independently replayable ≤${certificate.maxAttackerTurns}-turn strategy DAG used as the upper bound.`
+        : "";
+      setForcingStatus(
+        `Last run: certified shortest forced win in ${search.best_upper_depth} attacker turns; every win through ${search.excluded_through_depth} is excluded. ${width} · ${work} · ${Number(search.leaf_node_budget).toLocaleString()} PN leaf cap · ${Number(search.threshold_probes).toLocaleString()} horizon probes · ${elapsed}.${dagNote}`,
+        "win",
+      );
+      return;
+    }
     const proof = search.proof_depth != null
       ? formatForcingLine(search.engine, search.proof_depth, search.line_placements)
       : "verdict only";
-    const leaf = search.engine === "pdspn" && search.leaf_node_budget
+    const leaf = isPdsEngine(search.engine) && search.leaf_node_budget
       ? ` · ${Number(search.leaf_node_budget).toLocaleString()} PN leaf cap` : "";
     const certificate = search.certificate_summary;
     const certified = certificate
@@ -272,7 +293,15 @@ function restoreForcingStatusForNode(node) {
   } else if (search.kind === "no") {
     setForcingStatus(`Last run: proven no forced win in the selected scope. ${label} · ${width} · ${work} · ${elapsed}.`, "no");
   } else {
-    setForcingStatus(`Last run: work budget exhausted; inconclusive. ${label} · ${width} · ${work} · ${elapsed}.`, "budget");
+    if (search.engine === "pdspn-shortest" && search.best_upper_depth) {
+      const lower = Number(search.excluded_through_depth || 0);
+      const range = lower > 0
+        ? `shortest win lies between ${lower + 1} and ${search.best_upper_depth} attacker turns`
+        : `win within ${search.best_upper_depth} verified; lower bound still open`;
+      setForcingStatus(`Last run: shortest search stopped with certified bounds; ${range}. ${width} · ${work} · ${elapsed}.`, "budget");
+    } else {
+      setForcingStatus(`Last run: work budget exhausted; inconclusive. ${label} · ${width} · ${work} · ${elapsed}.`, "budget");
+    }
   }
 }
 
@@ -362,15 +391,19 @@ function formatSolverElapsed(ms) {
   return ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10_000 ? 0 : 1)}s` : `${ms.toFixed(0)}ms`;
 }
 
+function isPdsEngine(engine) {
+  return engine === "pdspn" || engine === "pdspn-shortest";
+}
+
 function formatSolverNodes(nodes, engine = "") {
   if (!nodes || nodes === "0") return "node count unavailable";
-  const suffix = engine === "pdspn" ? " outer nodes" : " nodes";
+  const suffix = isPdsEngine(engine) ? " outer nodes" : " nodes";
   try { return `${BigInt(nodes).toLocaleString()}${suffix}`; }
   catch (_error) { return `${nodes}${suffix}`; }
 }
 
 function formatSolverBudget(engine, budget) {
-  return engine === "pdspn"
+  return isPdsEngine(engine)
     ? `${budget.toLocaleString()}-outer-node budget`
     : `${budget.toLocaleString()}-node work budget`;
 }
@@ -378,6 +411,9 @@ function formatSolverBudget(engine, budget) {
 function formatForcingLine(engine, attackerTurns, placements) {
   const turns = Number(attackerTurns);
   const placementText = `${placements} placement${placements === 1 ? "" : "s"}`;
+  if (engine === "pdspn-shortest") {
+    return `shortest bound ${turns} attacker turn${turns === 1 ? "" : "s"}, sample line ${placementText}`;
+  }
   if (engine && engine !== "idtt") {
     return `sample line ${turns} attacker turn${turns === 1 ? "" : "s"}, ${placementText}`;
   }
@@ -413,22 +449,37 @@ function finishForcingSolve(result) {
     width: run.width,
     depth_cap: run.depth,
     node_budget: run.budget,
-    leaf_node_budget: run.engine === "pdspn" ? run.leafBudget : null,
+    leaf_node_budget: isPdsEngine(run.engine) ? run.leafBudget : null,
     nodes: result.nodes,
     elapsed_ms: result.elapsedMs,
     proof_depth: result.depth,
     line_placements: result.pv.length,
     certificate_summary: result.certificateSummary,
+    best_upper_depth: result.bestUpperDepth,
+    excluded_through_depth: result.excludedThroughDepth,
+    shortest_certified: result.shortestCertified,
+    threshold_probes: result.thresholdProbes,
   };
 
   if (result.certificate && result.certificateSummary) {
+    const optimization = run.engine === "pdspn-shortest" ? {
+      method: "pdspn-shortest-v1",
+      shortestCertified: Boolean(result.shortestCertified),
+      bestUpperDepth: result.bestUpperDepth,
+      excludedThroughDepth: result.excludedThroughDepth,
+      thresholdProbes: result.thresholdProbes,
+      ...(result.turns && result.turns.length ? {sampleLine: result.turns} : {}),
+    } : null;
     run.node.result.forcing_certificate = {
       format: "hexo-pdspn-proof-bundle-v1",
       position: portableProofPosition(run.position),
-      engine: run.engine,
+      // The retained DAG is always a PDS-PN proof, even when a bounded PDS-PN
+      // optimizer subsequently tightened its depth.
+      engine: "pdspn",
       width: run.width,
       verification: result.certificateSummary,
       certificate: result.certificate,
+      ...(optimization ? {optimization} : {}),
     };
   } else {
     delete run.node.result.forcing_certificate;
@@ -459,16 +510,28 @@ function finishForcingSolve(result) {
     const proof = hasLine
       ? formatForcingLine(run.engine, result.depth, result.pv.length)
       : "verdict only; no proof line";
-    const leaf = run.engine === "pdspn"
+    const leaf = isPdsEngine(run.engine)
       ? ` · ${run.leafBudget.toLocaleString()} PN leaf cap` : "";
     const certificate = result.certificateSummary;
     const certified = certificate
       ? ` · verified all-defense DAG ${certificate.dagNodes.toLocaleString()} nodes / ${certificate.proofEdges.toLocaleString()} edges · worst-case ${certificate.maxAttackerTurns} attacker turns`
       : "";
-    setForcingStatus(
-      `Proven forced win for ${run.position.toMove} (${proof}). ${engineInfo.label} · ${widthLabel} · ${work}${leaf}${certified} · ${elapsed}.`,
-      "win",
-    );
+    if (run.engine === "pdspn-shortest" && result.shortestCertified) {
+      const upper = result.bestUpperDepth;
+      const lower = result.excludedThroughDepth;
+      const dagNote = certificate && certificate.maxAttackerTurns !== upper
+        ? ` The Explore proof DAG is the independently replayable ≤${certificate.maxAttackerTurns}-turn strategy used as the initial upper bound.`
+        : "";
+      setForcingStatus(
+        `Certified shortest forced win for ${run.position.toMove}: ${upper} attacker turns; every win through ${lower} is excluded. ${widthLabel} · ${work}${leaf} · ${result.thresholdProbes.toLocaleString()} horizon probes · ${elapsed}.${dagNote}`,
+        "win",
+      );
+    } else {
+      setForcingStatus(
+        `Proven forced win for ${run.position.toMove} (${proof}). ${engineInfo.label} · ${widthLabel} · ${work}${leaf}${certified} · ${elapsed}.`,
+        "win",
+      );
+    }
   } else if (result.kind === "no") {
     const scope = run.engine === "idtt"
       ? `through depth ${run.depth} attacker turns`
@@ -478,10 +541,21 @@ function finishForcingSolve(result) {
       "no",
     );
   } else {
-    setForcingStatus(
-      `Inconclusive: ${engineInfo.label} exhausted the ${formatSolverBudget(run.engine, run.budget)}. ${widthLabel} · ${work} · ${elapsed}. Raise the budget or try another engine.`,
-      "budget",
-    );
+    if (run.engine === "pdspn-shortest" && result.bestUpperDepth) {
+      const lower = Number(result.excludedThroughDepth || 0);
+      const range = lower > 0
+        ? `The shortest win is between ${lower + 1} and ${result.bestUpperDepth} attacker turns.`
+        : `A win within ${result.bestUpperDepth} attacker turns is verified; the lower bound is still open.`;
+      setForcingStatus(
+        `Shortest search stopped with certified bounds. ${range} ${widthLabel} · ${work} · ${result.thresholdProbes.toLocaleString()} horizon probes · ${elapsed}. Raise the outer budget to continue.`,
+        "budget",
+      );
+    } else {
+      setForcingStatus(
+        `Inconclusive: ${engineInfo.label} exhausted the ${formatSolverBudget(run.engine, run.budget)}. ${widthLabel} · ${work} · ${elapsed}. Raise the budget or try another engine.`,
+        "budget",
+      );
+    }
   }
   if (analysisCurrent === run.node) {
     renderNode(run.node);
@@ -536,26 +610,37 @@ function solveCurrentForcing() {
   let position;
   try {
     position = forcingPosition(node);
+    const existingProof = node.result.forcing_certificate;
+    const reusableCertificate = engine === "pdspn-shortest"
+      && existingProof && existingProof.width === width
+      ? existingProof.certificate : null;
     const worker = ensureForcingWorker();
     const id = ++forcingRequestSerial;
-    forcingRun = {id, node, position, engine, width, depth, budget, leafBudget, started: performance.now()};
+    forcingRun = {
+      id, node, position, engine, width, depth, budget, leafBudget,
+      reusedCertificate: Boolean(reusableCertificate), started: performance.now(),
+    };
     forcingRun.ticker = setInterval(() => {
       if (!forcingRun || forcingRun.id !== id) return;
       const seconds = Math.floor((performance.now() - forcingRun.started) / 1000);
-      const depthText = engine === "idtt" ? ` to depth ${depth}` : "";
+      const depthText = engine === "idtt" ? ` to depth ${depth}`
+        : engine === "pdspn-shortest" ? ` through a maximum depth of ${depth}` : "";
       setForcingStatus(
         `${FORCING_ENGINE_INFO[engine].label} ${width} search${depthText}… ${seconds}s elapsed. It is using one CPU core on this device.`,
       );
     }, 1000);
     setForcingControlsRunning(true);
-    const depthText = engine === "idtt" ? ` to depth ${depth} attacker turns` : "";
-    const leafText = engine === "pdspn" ? ` and ${leafBudget.toLocaleString()} PN expansions per frontier` : "";
+    const depthText = engine === "idtt" ? ` to depth ${depth} attacker turns`
+      : engine === "pdspn-shortest" ? ` up to ${depth} attacker turns` : "";
+    const leafText = isPdsEngine(engine) ? ` and ${leafBudget.toLocaleString()} PN expansions per frontier` : "";
+    const proofText = reusableCertificate ? " Reusing this position's verified proof as the upper bound." : "";
     setForcingStatus(
-      `Loading ${FORCING_ENGINE_INFO[engine].label}, then searching ${width}${depthText} with a ${formatSolverBudget(engine, budget)}${leafText}…`,
+      `Loading ${FORCING_ENGINE_INFO[engine].label}, then searching ${width}${depthText} with a ${formatSolverBudget(engine, budget)}${leafText}…${proofText}`,
     );
     worker.postMessage({
       type: "solve", requestId: id, position, engine, width,
       depthCap: depth, nodeBudget: String(budget), leafNodeBudget: String(leafBudget),
+      certificate: reusableCertificate,
     });
   } catch (error) {
     failForcingSolve(error.message || error);

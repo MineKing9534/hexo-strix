@@ -152,6 +152,9 @@ impl Line {
 /// - **dfpn / pdspn:** `nodes` = MID expansions, `tt_hits` = TT probe hits,
 ///   `tt_bytes` = TT size, `leaf_solves` = level-2 PN searches (pdspn only).
 /// - **idtt:** only `elapsed_s` (the production solver exposes no node count).
+/// - **pds-idtt:** `nodes` = local-prepass + root IDTT visits, `tt_hits` =
+///   verified proof-hint closures, `leaf_solves` = local bound probes, and
+///   `line_steps` = certificate states whose winning bound was tightened.
 /// - **hybrid:** `nodes` = total node visits; `leaf_solves` = nodes CLOSED by a
 ///   kernel leaf solve; `line_steps` = nodes CLOSED by following a spine candidate
 ///   (these two are directly comparable to the Python baseline's "solver-proven
@@ -164,6 +167,23 @@ pub struct Stats {
     pub elapsed_s: f64,
     pub leaf_solves: u64,
     pub line_steps: u64,
+    /// Guided optimizer only: smallest verified root win bound retained even if
+    /// shortestness was not resolved (0 = unavailable).
+    #[serde(default)]
+    pub best_upper_depth: u8,
+    /// Guided optimizer only: every win through this attacker-turn depth was
+    /// exhaustively excluded (0 = none).
+    #[serde(default)]
+    pub excluded_through_depth: u8,
+    /// PDS-PN root-screen accounting for the guided shortest-win path.
+    #[serde(default)]
+    pub screened_attacks: u64,
+    #[serde(default)]
+    pub screen_refuted_attacks: u64,
+    #[serde(default)]
+    pub screen_winning_attacks: u64,
+    #[serde(default)]
+    pub screen_unresolved_attacks: u64,
 }
 
 /// One driver's outcome in a portfolio race.

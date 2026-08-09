@@ -43,3 +43,11 @@ use super::{Ctl, DriverResult, ProverConfig, dfpn};
 pub fn solve(pos: &Position, cfg: &ProverConfig, ctl: &Ctl) -> DriverResult {
     dfpn::solve_mode(pos, cfg, ctl, true)
 }
+
+/// PDS-PN over the forcing tree truncated to `cfg.depth_cap` attacker turns.
+/// `Verdict::No` means the bounded claim was disproved, not that the position is
+/// globally lost; the public driver wrapper translates it into an excluded-depth
+/// fact so it can never be mistaken for an unbounded refutation.
+pub(crate) fn solve_bounded(pos: &Position, cfg: &ProverConfig, ctl: &Ctl) -> DriverResult {
+    dfpn::solve_mode_bounded(pos, cfg, ctl, true)
+}

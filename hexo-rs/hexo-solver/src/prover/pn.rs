@@ -34,16 +34,25 @@ pub(crate) fn one_plus_eps(second_best: u32, eps: f64) -> u32 {
     if inflated >= INF as f64 { INF } else { inflated as u32 }
 }
 
-/// Immediate "1 and n" evaluation of a child node (board at its position):
-/// terminals resolve to `(0, INF)` / `(INF, 0)`; internal nodes seed from their
-/// branching factor. Returns `(pn, dn, is_terminal)`.
-pub(crate) fn eval_child(k: &mut KernelCtx, node: Node) -> (u32, u32, bool) {
+/// Horizon-aware immediate evaluation. `remaining == Some(n)` means at most
+/// `n` attacker turns remain, including an immediate completion at this OR node.
+/// `None` retains the ordinary unbounded PDS-PN semantics.
+pub(crate) fn eval_child_at(
+    k: &mut KernelCtx,
+    node: Node,
+    remaining: Option<u8>,
+) -> (u32, u32, bool) {
     match node {
         Node::Or { placements } => match k.or_eval(placements) {
-            OrEval::WinNow => (0, INF, true),
+            OrEval::WinNow if remaining != Some(0) => (0, INF, true),
+            OrEval::WinNow => (INF, 0, true),
             OrEval::Loss => (INF, 0, true),
+            OrEval::Moves(_) if remaining.is_some_and(|turns| turns < 2) => {
+                (INF, 0, true)
+            }
             OrEval::Moves(m) => (1, (m.len() as u32).clamp(1, INF - 1), false),
         },
+        Node::And if remaining == Some(0) => (INF, 0, true),
         Node::And => match k.and_eval() {
             AndEval::AttackerWin => (0, INF, true),
             AndEval::Loss => (INF, 0, true),
@@ -67,6 +76,25 @@ pub(crate) fn node_key(hash: u64, node: Node) -> u64 {
     let (is_or, placements) = node.tag();
     let tag = ((placements as u64) << 1) | (is_or as u64);
     hash ^ mix(tag ^ 0xD1B5_4A32_D192_ED03)
+}
+
+/// Horizon-aware TT key. Unbounded callers retain the historical key exactly;
+/// bounded callers salt in the remaining attacker turns so facts proved at one
+/// threshold can never close a node at a smaller threshold.
+#[inline]
+pub(crate) fn node_key_at(hash: u64, node: Node, remaining: Option<u8>) -> u64 {
+    let key = node_key(hash, node);
+    match remaining {
+        None => key,
+        Some(turns) => key ^ mix(0xA076_1D64_78BD_642F ^ turns as u64),
+    }
+}
+
+/// Consuming a non-terminal attacker move spends one attacker turn. Unbounded
+/// searches remain unbounded.
+#[inline]
+pub(crate) fn after_attacker(remaining: Option<u8>) -> Option<u8> {
+    remaining.map(|turns| turns.saturating_sub(1))
 }
 
 #[derive(Clone, Copy)]
@@ -194,6 +222,8 @@ impl ProofTt {
 /// expansion; terminals carry `(0, INF)` / `(INF, 0)`.
 struct PnNode {
     node: Node,
+    /// Remaining attacker turns at this exact node (`None` = unbounded).
+    remaining: Option<u8>,
     /// The move (attacker turn or defender cover) that reaches this node from its
     /// parent; `None` at the root. Cells are (un)applied on the shared board as we
     /// walk up/down, so the board always reflects the current node.
@@ -235,10 +265,21 @@ impl PnSearch {
     /// Returns `(pn, dn)` of the root when it is (dis)proved or the node cap is
     /// hit. The board is restored to the root position on return.
     pub(crate) fn search(&mut self, k: &mut KernelCtx, root_node: Node) -> (u32, u32) {
+        self.search_at(k, root_node, None)
+    }
+
+    /// Horizon-aware PN² search used by depth-bounded PDS-PN.
+    pub(crate) fn search_at(
+        &mut self,
+        k: &mut KernelCtx,
+        root_node: Node,
+        remaining: Option<u8>,
+    ) -> (u32, u32) {
         self.arena.clear();
         self.expansions = 0;
         self.arena.push(PnNode {
             node: root_node,
+            remaining,
             mv: None,
             pn: 1,
             dn: 1,
@@ -246,7 +287,7 @@ impl PnSearch {
             children: Vec::new(),
             parent: usize::MAX,
             terminal: false,
-            key: node_key(k.hash(), root_node),
+            key: node_key_at(k.hash(), root_node, remaining),
         });
         loop {
             let root = &self.arena[0];
@@ -321,33 +362,41 @@ impl PnSearch {
     /// bounded PN search useful within `max_nodes`.
     fn expand(&mut self, k: &mut KernelCtx, cur: usize) {
         let node = self.arena[cur].node;
+        let remaining = self.arena[cur].remaining;
         self.arena[cur].expanded = true;
         // (child_node, move) list, and whether children are reached by an attacker
         // move (OR parent) or a defender cover (AND parent).
         let (child_node, moves, parent_is_or): (Node, Vec<CellSet2>, bool) = match node {
             Node::Or { placements } => match k.or_eval(placements) {
-                OrEval::WinNow => return self.set_terminal(cur, 0, INF),
+                OrEval::WinNow if remaining != Some(0) => return self.set_terminal(cur, 0, INF),
+                OrEval::WinNow => return self.set_terminal(cur, INF, 0),
                 OrEval::Loss => return self.set_terminal(cur, INF, 0),
+                OrEval::Moves(_) if remaining.is_some_and(|turns| turns < 2) => {
+                    return self.set_terminal(cur, INF, 0);
+                }
                 OrEval::Moves(mvs) => (Node::And, mvs.to_vec(), true),
             },
+            Node::And if remaining == Some(0) => return self.set_terminal(cur, INF, 0),
             Node::And => match k.and_eval() {
                 AndEval::AttackerWin => return self.set_terminal(cur, 0, INF),
                 AndEval::Loss => return self.set_terminal(cur, INF, 0),
                 AndEval::Covers(covers) => (Node::Or { placements: 2 }, covers, false),
             },
         };
+        let child_remaining = if parent_is_or { after_attacker(remaining) } else { remaining };
         for mv in moves {
             if parent_is_or {
                 k.place_attacker(&mv);
             } else {
                 k.place_defender(&mv);
             }
-            let (pn, dn, terminal) = eval_child(k, child_node);
-            let key = node_key(k.hash(), child_node);
+            let (pn, dn, terminal) = eval_child_at(k, child_node, child_remaining);
+            let key = node_key_at(k.hash(), child_node, child_remaining);
             k.unplace(&mv);
             let idx = self.arena.len();
             self.arena.push(PnNode {
                 node: child_node,
+                remaining: child_remaining,
                 mv: Some(mv),
                 pn,
                 dn,

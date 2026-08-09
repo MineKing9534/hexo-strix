@@ -128,6 +128,39 @@ def test_store_accepts_and_counts_ranked_attacker_alternatives():
         raise AssertionError("duplicate attacker alternative was accepted")
 
 
+def test_store_accepts_consistent_shortest_search_metadata():
+    store = ProofStore(":memory:")
+    bundle = _bundle()
+    bundle["certificate"]["nodes"].append({
+        "kind": "attacker_move", "action": [[1, 0], [2, 0]], "child": 0,
+    })
+    bundle["certificate"]["root"] = 1
+    bundle["verification"] = {
+        "dagNodes": 2, "proofEdges": 1, "maxAttackerTurns": 2,
+    }
+    bundle["optimization"] = {
+        "method": "pdspn-shortest-v1",
+        "shortestCertified": True,
+        "bestUpperDepth": 2,
+        "excludedThroughDepth": 1,
+        "thresholdProbes": 5,
+        "sampleLine": [
+            {"turn": 0, "player": "P1", "cells": [[1, 0], [2, 0]]},
+            {"turn": 1, "player": "P2", "cells": [[1, 1], [2, 1]]},
+        ],
+    }
+    assert store.put(bundle)
+
+    malformed = json.loads(json.dumps(bundle))
+    malformed["optimization"]["excludedThroughDepth"] = 0
+    try:
+        store.put(malformed)
+    except ProofValidationError as error:
+        assert "adjacent" in str(error)
+    else:
+        raise AssertionError("inconsistent shortest metadata was accepted")
+
+
 def test_http_save_direct_page_and_bundle_round_trip_with_prefix():
     bundle = _bundle()
     with _server(prefix="/hexo") as port:

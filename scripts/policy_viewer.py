@@ -4,11 +4,13 @@ Usage:
     uv run python scripts/policy_viewer.py [--config configs/ablations/baseline.toml] [--port 8765]
 
 Opens a browser tab. Click hexes to place stones (alternating P1/P2 per HeXO
-rules). Select a checkpoint, adjust game params, hit Analyze to see the policy
+rules). Add checkpoint files or run/checkpoint directories from the browser,
+select a checkpoint, adjust game params, and hit Analyze to see the policy
 heatmap and value head output overlaid on the board.
 """
 import argparse
 import json
+import os
 import struct
 import sys
 import tomllib
@@ -139,7 +141,14 @@ def _build_state(moves, win_length, placement_radius, max_moves,
     return state, cfg
 
 
-def _run_mcts(model, mc, state, mcts_sims, mcts_m_actions):
+def _run_mcts(
+    model,
+    mc,
+    state,
+    mcts_sims,
+    mcts_m_actions,
+    disable_forcing_solver=False,
+):
     """Run Gumbel MCTS and return (improved_policy, value, legal_coords,
     visit_counts, per_child_q, candidate_indices).
 
@@ -166,6 +175,7 @@ def _run_mcts(model, mc, state, mcts_sims, mcts_m_actions):
         # Deterministic, paper-style eval: no Gumbel noise, so the displayed
         # search (action + improved policy) is reproducible across reloads.
         disable_gumbel_noise=True,
+        disable_forcing_solver=disable_forcing_solver,
     )
 
     eval_fn = _make_state_eval_fn(model, mc)
@@ -184,7 +194,7 @@ def _run_mcts(model, mc, state, mcts_sims, mcts_m_actions):
 
 
 def _analyze(moves, checkpoint, win_length, placement_radius, max_moves,
-             mcts_sims=0, mcts_m_actions=16,
+             mcts_sims=0, mcts_m_actions=16, disable_forcing_solver=False,
              setup_stones=None, setup_current_player="P2", setup_moves_remaining=2):
     _ensure_imports()
     model, mc = _load_model(checkpoint)
@@ -225,7 +235,9 @@ def _analyze(moves, checkpoint, win_length, placement_radius, max_moves,
         # halving bracket and the improved policy is near-one-hot by design.
         (improved_policy, mcts_value, _coords, visit_counts, per_child_q,
          _candidate_indices) = _run_mcts(
-            model, mc, state, mcts_sims, mcts_m_actions)
+            model, mc, state, mcts_sims, mcts_m_actions,
+            disable_forcing_solver=disable_forcing_solver,
+        )
         total_visits = sum(visit_counts)
         if total_visits > 0:
             probs = [v / total_visits for v in visit_counts]
@@ -442,7 +454,7 @@ def _analyze_trajectory(moves, checkpoint, win_length, placement_radius, max_mov
 
 
 def _ai_move(moves, checkpoint, win_length, placement_radius, max_moves,
-             mcts_sims=0, mcts_m_actions=16,
+             mcts_sims=0, mcts_m_actions=16, disable_forcing_solver=False,
              setup_stones=None, setup_current_player="P2", setup_moves_remaining=2):
     """Run model forward and return argmax(policy) as the AI's move."""
     _ensure_imports()
@@ -460,7 +472,9 @@ def _ai_move(moves, checkpoint, win_length, placement_radius, max_moves,
 
     if mcts_sims > 0:
         improved_policy, value, legal_coords, _vc, _q, _ci = _run_mcts(
-            model, mc, state, mcts_sims, mcts_m_actions)
+            model, mc, state, mcts_sims, mcts_m_actions,
+            disable_forcing_solver=disable_forcing_solver,
+        )
         best_idx = max(range(len(improved_policy)), key=lambda i: improved_policy[i])
         best_coord = legal_coords[best_idx]
         best_prob = improved_policy[best_idx]
@@ -496,6 +510,116 @@ def _list_checkpoints(ckpt_dir: str):
     if champion.exists():
         out.append(str(champion))
     return out
+
+
+def _resolve_checkpoint_source(source: str) -> tuple[str, list[str]]:
+    """Resolve a runtime source into its canonical path and checkpoints.
+
+    ``source`` may be one checkpoint, a checkpoint directory, or a run/output
+    directory containing ``checkpoints/``. Keeping the run directory as the
+    canonical source means periodic refreshes see newly written checkpoints.
+    """
+
+    raw = source.strip()
+    if not raw:
+        raise ValueError("Enter a checkpoint file, checkpoint directory, or run directory")
+
+    path = Path(raw).expanduser()
+    if not path.exists():
+        raise ValueError(f"Checkpoint source does not exist: {path}")
+    path = path.resolve()
+
+    if path.is_file():
+        if path.suffix.lower() != ".pt":
+            raise ValueError(f"Checkpoint file must end in .pt: {path}")
+        return str(path), [str(path)]
+    if not path.is_dir():
+        raise ValueError(f"Checkpoint source is not a file or directory: {path}")
+
+    checkpoints = _list_checkpoints(str(path))
+    nested = path / "checkpoints"
+    if nested.is_dir():
+        checkpoints.extend(_list_checkpoints(str(nested)))
+
+    # A malformed run can expose the same file through both conventions.
+    checkpoints = list(dict.fromkeys(checkpoints))
+    if not checkpoints:
+        raise ValueError(
+            f"No checkpoint_*.pt, final.pt, or self_play/champion.pt found in {path}"
+            " (or its checkpoints/ directory)"
+        )
+    return str(path), checkpoints
+
+
+def _list_checkpoint_sources(sources: list[str]) -> list[str]:
+    """Return the de-duplicated live checkpoint list for runtime sources."""
+
+    checkpoints: list[str] = []
+    for source in sources:
+        try:
+            _canonical, found = _resolve_checkpoint_source(source)
+        except ValueError:
+            # A training directory can disappear or be moved while the viewer
+            # is open. Keep the remaining sources usable; adding a new source
+            # still reports validation errors directly.
+            continue
+        checkpoints.extend(found)
+    return list(dict.fromkeys(checkpoints))
+
+
+def _directory_checkpoint_count(path: Path) -> int:
+    """Count checkpoints selectable by adding ``path`` as a source."""
+
+    try:
+        checkpoints = _list_checkpoints(str(path))
+        nested = path / "checkpoints"
+        if nested.is_dir():
+            checkpoints.extend(_list_checkpoints(str(nested)))
+    except OSError:
+        return 0
+    return len(dict.fromkeys(checkpoints))
+
+
+def _browse_directories(path: str = "", default_root: str = "runs") -> dict:
+    """List one server-side directory for the browser's folder dialog.
+
+    Paths are made absolute without resolving symlinks so opening the default
+    ``./runs`` keeps that useful logical path visible in the dialog.
+    """
+
+    requested = path.strip() or default_root
+    directory = Path(os.path.abspath(Path(requested).expanduser()))
+    if not directory.exists():
+        raise ValueError(f"Directory does not exist: {directory}")
+    if not directory.is_dir():
+        raise ValueError(f"Not a directory: {directory}")
+
+    try:
+        children = []
+        for child in directory.iterdir():
+            try:
+                if child.is_dir():
+                    children.append(child)
+            except OSError:
+                continue
+        children.sort(key=lambda child: child.name.casefold())
+    except OSError as e:
+        raise ValueError(f"Cannot browse {directory}: {e}") from e
+
+    root = directory.parent == directory
+    return {
+        "path": str(directory),
+        "parent": None if root else str(directory.parent),
+        "checkpoint_count": _directory_checkpoint_count(directory),
+        "directories": [
+            {
+                "name": child.name,
+                "path": str(child),
+                "checkpoint_count": _directory_checkpoint_count(child),
+            }
+            for child in children
+        ],
+    }
 
 
 def _checkpoint_dir_from_config(raw: dict, override: str | None) -> str:
@@ -588,6 +712,9 @@ body { background: #1a1a2e; color: #e0e0e0; font-family: system-ui, sans-serif; 
 #sidebar select, #sidebar input { width: 100%; padding: 6px 8px; margin-top: 4px; background: #0f3460; border: 1px solid #333; color: #fff; border-radius: 4px; font-size: 13px; }
 #sidebar button { margin-top: 14px; width: 100%; padding: 10px; background: #00d4ff; color: #1a1a2e; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 14px; }
 #sidebar button:hover { background: #00b8d9; }
+.checkpoint-source-row { display: flex; gap: 4px; align-items: stretch; }
+.checkpoint-source-row input { flex: 1; min-width: 0; }
+#sidebar .checkpoint-source-row button { width: auto; margin-top: 4px; padding: 6px 10px; font-size: 12px; }
 #info { margin-top: 16px; padding: 10px; background: #0f3460; border-radius: 6px; font-size: 13px; line-height: 1.6; }
 #info .val { color: #00d4ff; font-weight: bold; }
 #moves-list { margin-top: 10px; font-size: 12px; color: #888; max-height: 120px; overflow-y: auto; }
@@ -608,13 +735,40 @@ svg.panning { cursor: grabbing; }
 #undo-btn { background: #e07020; }
 #clear-btn { background: #cc3333; }
 #edge-legend { margin-top: 8px; font-size: 11px; line-height: 1.8; }
+#directory-browser-backdrop { display: none; position: fixed; inset: 0; z-index: 1000; background: rgba(5, 8, 18, 0.78); align-items: center; justify-content: center; padding: 24px; }
+.directory-browser-dialog { width: min(760px, 92vw); max-height: 88vh; display: flex; flex-direction: column; background: #16213e; border: 1px solid #3a4a6a; border-radius: 8px; box-shadow: 0 18px 60px #000a; padding: 14px; }
+.directory-browser-title { color: #00d4ff; font-size: 17px; font-weight: bold; }
+#directory-browser-path { margin-top: 8px; padding: 7px 9px; border-radius: 4px; background: #0a1a30; color: #cce; font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
+.directory-browser-toolbar, .directory-browser-actions { display: flex; gap: 6px; margin-top: 8px; }
+.directory-browser-dialog button { padding: 7px 11px; background: #3a4a6a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+.directory-browser-dialog button:hover { background: #4a5f86; }
+.directory-browser-dialog button:disabled { opacity: 0.4; cursor: default; }
+#directory-browser-list { margin-top: 8px; min-height: 180px; max-height: 56vh; overflow-y: auto; border: 1px solid #2a3550; border-radius: 5px; background: #0d1629; padding: 4px; }
+.directory-entry { width: 100%; display: flex; align-items: center; gap: 8px; padding: 8px 9px; background: transparent; color: #e0e0e0; border: none; border-radius: 3px; cursor: pointer; text-align: left; font-size: 13px; }
+.directory-entry:hover { background: #243554; }
+.directory-entry-name { flex: 1; overflow-wrap: anywhere; }
+.directory-entry-count { color: #6de1ff; font-size: 11px; white-space: nowrap; }
+.directory-browser-actions { justify-content: flex-end; }
+#directory-browser-select { background: #00d4ff; color: #1a1a2e; }
+#directory-browser-error { min-height: 17px; margin-top: 6px; color: #f77; font-size: 12px; }
 </style></head>
 <body>
 <div id="sidebar">
   <h2>HeXO Policy Viewer</h2>
+  <label>Checkpoint source
+    <div class="checkpoint-source-row">
+      <input id="checkpoint-source" type="text" autocomplete="off"
+             placeholder="run dir, checkpoints dir, or .pt file">
+      <button onclick="openDirectoryBrowser()">Browse…</button>
+      <button onclick="addCheckpointSource()">Add</button>
+    </div>
+    <div id="checkpoint-source-status" style="margin-top:4px;font-size:11px;color:#888;line-height:1.4">
+      Add more than one source to compare models from different runs or families.
+    </div>
+  </label>
   <label>Checkpoint
     <input id="ckpt" type="text" list="ckpt-list" autocomplete="off"
-           placeholder="step (e.g. 147600)">
+           placeholder="choose a path or enter a unique step">
     <datalist id="ckpt-list"></datalist>
     <div id="ckpt-champion-row" style="display:none;margin-top:4px;font-size:12px">
       <label style="display:flex;align-items:center;gap:6px;color:#aaa;margin-top:0">
@@ -680,7 +834,7 @@ svg.panning { cursor: grabbing; }
       <div id="p1-ckpt-row" style="display:none;margin-top:4px">
         <label style="font-size:11px;color:#aaa;margin:0">Checkpoint
           <input id="p1-ckpt" type="text" list="p1-ckpt-list" autocomplete="off"
-                 placeholder="step"
+                 placeholder="path or unique step"
                  style="width:100%;padding:3px;font-size:11px;margin-top:2px">
           <datalist id="p1-ckpt-list"></datalist>
         </label>
@@ -719,7 +873,7 @@ svg.panning { cursor: grabbing; }
       <div id="p2-ckpt-row" style="margin-top:4px">
         <label style="font-size:11px;color:#aaa;margin:0">Checkpoint
           <input id="p2-ckpt" type="text" list="p2-ckpt-list" autocomplete="off"
-                 placeholder="step"
+                 placeholder="path or unique step"
                  style="width:100%;padding:3px;font-size:11px;margin-top:2px">
           <datalist id="p2-ckpt-list"></datalist>
         </label>
@@ -743,6 +897,13 @@ svg.panning { cursor: grabbing; }
           <span style="font-size:10px;color:#666">seconds</span>
         </div>
       </div>
+    </div>
+    <div style="margin-bottom:6px;padding:7px;background:#0a1a30;border-radius:4px">
+      <label style="display:flex;align-items:center;gap:6px;margin:0;font-size:11px;color:#ccc">
+        <input id="play-use-forcing" type="checkbox" checked style="width:auto;margin:0">
+        <span>Use VCF forcing solver</span>
+      </label>
+      <div style="margin-top:3px;font-size:10px;color:#777">Applies to MCTS bots; immediate winning moves remain enabled.</div>
     </div>
     <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
       <span style="font-size:11px;color:#aaa;white-space:nowrap">Move delay:</span>
@@ -810,6 +971,22 @@ svg.panning { cursor: grabbing; }
 </div>
 <div id="board-container">
   <svg id="board"></svg>
+</div>
+<div id="directory-browser-backdrop" onclick="directoryBrowserBackdropClick(event)">
+  <div class="directory-browser-dialog" role="dialog" aria-modal="true" aria-labelledby="directory-browser-title">
+    <div id="directory-browser-title" class="directory-browser-title">Add checkpoint directory</div>
+    <div id="directory-browser-path"></div>
+    <div class="directory-browser-toolbar">
+      <button id="directory-browser-up" onclick="browseDirectoryParent()">↑ Parent</button>
+      <button onclick="browseDirectory('')">./runs</button>
+    </div>
+    <div id="directory-browser-list"></div>
+    <div id="directory-browser-error"></div>
+    <div class="directory-browser-actions">
+      <button onclick="closeDirectoryBrowser()">Cancel</button>
+      <button id="directory-browser-select" onclick="selectBrowsedDirectory()">Add this directory</button>
+    </div>
+  </div>
 </div>
 <script>
 const S = 28; // hex size
@@ -1962,42 +2139,46 @@ function updateChampionToggle(prefix) {
 function resolveCheckpointFor(inputId) {
   const cb = document.getElementById(inputId + '-use-champion');
   if (cb && cb.checked) {
-    const champion = _allCheckpoints.find(isChampionPath) || null;
-    if (!champion) return {path: null, error: 'No champion.pt found'};
-    return {path: champion, label: 'champion'};
+    const champions = _allCheckpoints.filter(isChampionPath);
+    if (!champions.length) return {path: null, error: 'No champion.pt found'};
+    if (champions.length > 1) {
+      return {path: null, error: 'Multiple champions are loaded; choose a full checkpoint path'};
+    }
+    return {path: champions[0], label: 'champion'};
   }
   const inp = document.getElementById(inputId);
   return resolveCheckpoint(inp ? inp.value : '');
 }
 
 function populateCheckpointDatalist(datalistId, data) {
-  // Datalist holds training step numbers. Champion is selected via the
-  // separate "Use current champion" checkbox, not through the datalist.
+  // Full paths keep identically numbered checkpoints from different runtime
+  // sources distinguishable. Numeric step entry still works when unambiguous.
   const dl = document.getElementById(datalistId);
   if (!dl) return;
   dl.innerHTML = '';
-  // Latest checkpoints first so the dropdown bias is recent
-  const training = data.filter(p => !isChampionPath(p))
-                       .map(p => ({p, step: checkpointStep(p)}))
-                       .filter(x => x.step !== null)
-                       .sort((a, b) => b.step - a.step);
-  for (const {step} of training) {
+  for (const path of data.slice().reverse()) {
     const opt = document.createElement('option');
-    opt.value = String(step);
-    opt.label = `step ${step}`;
+    opt.value = path;
+    const step = checkpointStep(path);
+    opt.label = step === null ? path : `step ${step} — ${path}`;
     dl.appendChild(opt);
   }
 }
 
 function setChampionRowVisibility(data) {
-  // Show "Use current champion" rows iff a champion.pt exists.
-  const visible = data.some(isChampionPath);
+  // A shortcut is safe only when exactly one loaded source has a champion.
+  // With multiple champions, each remains selectable by its full path.
+  const visible = data.filter(isChampionPath).length === 1;
   for (const id of ['ckpt-champion-row', 'p1-ckpt-champion-row', 'p2-ckpt-champion-row']) {
     const el = document.getElementById(id);
     if (el) el.style.display = visible ? 'block' : 'none';
     if (!visible) {
-      const cb = document.getElementById(id.replace('-row', '') + '-use-champion');
-      if (cb && cb.checked) { cb.checked = false; updateChampionToggle(id.replace('-champion-row','')); }
+      const prefix = id.replace('-champion-row', '');
+      const cb = document.getElementById(prefix + '-use-champion');
+      if (cb && cb.checked) {
+        cb.checked = false;
+        updateChampionToggle(prefix);
+      }
     }
   }
 }
@@ -2009,41 +2190,60 @@ function resolveCheckpoint(typed) {
   //   '147600'      -> closest checkpoint by step (exact preferred)
   //   'checkpoint_147600.pt' / full path -> that path
   // Returns {path, label, error}
-  const data = _allCheckpoints;
-  if (!data.length) return {path: null, error: 'No checkpoints available'};
-  const champion = data.find(isChampionPath) || null;
-  const training = data.filter(p => !isChampionPath(p));
-
   const raw = (typed || '').trim();
+  const data = _allCheckpoints;
+  const champions = data.filter(isChampionPath);
+  const numbered = data.map(p => ({p, step: checkpointStep(p)}))
+                       .filter(x => x.step !== null);
+
+  // A full .pt path can be used immediately even before its containing source
+  // is added. The server reports a clear load error if the path is invalid.
+  const looksLikePath = raw.includes('/') || raw.includes('\\');
+  if (looksLikePath && raw.toLowerCase().endsWith('.pt') && !data.includes(raw)) {
+    return {path: raw, label: raw.split('/').pop()};
+  }
+  if (!data.length) return {path: null, error: 'No checkpoints available; add a source above'};
   if (!raw) {
-    const latest = training[training.length - 1];
-    if (!latest) return {path: champion, label: 'champion'};
-    return {path: latest, label: `step ${checkpointStep(latest)} (latest)`};
+    const latest = numbered.reduce((best, item) =>
+      best === null || item.step > best.step ? item : best, null);
+    if (latest) return {path: latest.p, label: `step ${latest.step} (latest)`};
+    if (data.length === 1) return {path: data[0], label: data[0].split('/').pop()};
+    return {path: null, error: 'Choose a checkpoint path'};
   }
   const t = raw.toLowerCase();
   if (t === 'champion' || t === 'c' || t === '★') {
-    if (!champion) return {path: null, error: 'No champion.pt found'};
-    return {path: champion, label: 'champion'};
+    if (!champions.length) return {path: null, error: 'No champion.pt found'};
+    if (champions.length > 1) {
+      return {path: null, error: 'Multiple champions are loaded; choose a full checkpoint path'};
+    }
+    return {path: champions[0], label: 'champion'};
   }
   // Exact full-path match
   if (data.includes(raw)) {
     return {path: raw, label: raw.split('/').pop()};
   }
   // Filename match (e.g. "checkpoint_147600.pt")
-  const fname = data.find(p => p.split('/').pop() === raw);
-  if (fname) return {path: fname, label: fname.split('/').pop()};
+  const fnames = data.filter(p => p.split('/').pop() === raw);
+  if (fnames.length === 1) return {path: fnames[0], label: fnames[0].split('/').pop()};
+  if (fnames.length > 1) {
+    return {path: null, error: `Multiple loaded checkpoints are named "${raw}"; choose a full path`};
+  }
   // Numeric step → exact, else closest
   const num = parseInt(t, 10);
   if (!isNaN(num) && /^\d+$/.test(t)) {
-    const candidates = training
-      .map(p => ({p, step: checkpointStep(p)}))
-      .filter(x => x.step !== null);
-    if (!candidates.length) return {path: null, error: 'No training checkpoints'};
-    candidates.sort((a, b) => Math.abs(a.step - num) - Math.abs(b.step - num));
-    const c = candidates[0];
-    const exact = c.step === num;
-    return {path: c.p,
-            label: exact ? `step ${c.step}` : `step ${c.step} (closest to ${num})`};
+    if (!numbered.length) return {path: null, error: 'No numbered training checkpoints'};
+    const exact = numbered.filter(x => x.step === num);
+    if (exact.length === 1) return {path: exact[0].p, label: `step ${num}`};
+    if (exact.length > 1) {
+      return {path: null, error: `Step ${num} exists in multiple loaded sources; choose a full path`};
+    }
+    const distance = Math.min(...numbered.map(x => Math.abs(x.step - num)));
+    const closest = numbered.filter(x => Math.abs(x.step - num) === distance);
+    if (closest.length > 1) {
+      return {path: null, error: `Several checkpoints are equally close to step ${num}; choose a full path`};
+    }
+    return {path: closest[0].p,
+            label: `step ${closest[0].step} (closest to ${num})`};
   }
   return {path: null, error: `No checkpoint matches "${raw}"`};
 }
@@ -2051,27 +2251,161 @@ function resolveCheckpoint(typed) {
 function maybeSetInitialCheckpointInput(inputId, data) {
   const inp = document.getElementById(inputId);
   if (!inp || inp.value) return;
-  const training = data.filter(p => !isChampionPath(p))
-                       .map(p => ({p, step: checkpointStep(p)}))
+  const training = data.map(p => ({p, step: checkpointStep(p)}))
                        .filter(x => x.step !== null)
                        .sort((a, b) => a.step - b.step);
-  if (training.length) inp.value = String(training[training.length - 1].step);
-  else if (data.find(isChampionPath)) inp.value = 'champion';
+  if (training.length) inp.value = training[training.length - 1].p;
+  else if (data.length === 1) inp.value = data[0];
+}
+
+function applyCheckpointList(data) {
+  _allCheckpoints = data;
+  populateCheckpointDatalist('ckpt-list', data);
+  populateCheckpointDatalist('p1-ckpt-list', data);
+  populateCheckpointDatalist('p2-ckpt-list', data);
+  maybeSetInitialCheckpointInput('ckpt', data);
+  maybeSetInitialCheckpointInput('p1-ckpt', data);
+  maybeSetInitialCheckpointInput('p2-ckpt', data);
+  setChampionRowVisibility(data);
 }
 
 async function loadCheckpoints() {
   const resp = await fetch('/checkpoints');
-  const data = await resp.json();
-  _allCheckpoints = data;
-  populateCheckpointDatalist('ckpt-list', data);
-  maybeSetInitialCheckpointInput('ckpt', data);
-  setChampionRowVisibility(data);
+  applyCheckpointList(await resp.json());
+}
+
+let directoryBrowserState = null;
+
+async function openDirectoryBrowser() {
+  document.getElementById('directory-browser-backdrop').style.display = 'flex';
+  await browseDirectory('');
+}
+
+function closeDirectoryBrowser() {
+  document.getElementById('directory-browser-backdrop').style.display = 'none';
+}
+
+function directoryBrowserBackdropClick(event) {
+  if (event.target.id === 'directory-browser-backdrop') closeDirectoryBrowser();
+}
+
+async function browseDirectory(path) {
+  const pathEl = document.getElementById('directory-browser-path');
+  const list = document.getElementById('directory-browser-list');
+  const error = document.getElementById('directory-browser-error');
+  const select = document.getElementById('directory-browser-select');
+  const up = document.getElementById('directory-browser-up');
+  pathEl.textContent = path || './runs';
+  list.textContent = 'Loading…';
+  error.textContent = '';
+  select.disabled = true;
+  up.disabled = true;
+  try {
+    const query = path ? `?path=${encodeURIComponent(path)}` : '';
+    const resp = await fetch('/browse_directories' + query);
+    const result = await resp.json();
+    if (result.error) throw new Error(result.error);
+    directoryBrowserState = result;
+    pathEl.textContent = result.path;
+    up.disabled = !result.parent;
+    select.disabled = !(result.checkpoint_count > 0);
+    select.textContent = result.checkpoint_count > 0
+      ? `Add this directory (${result.checkpoint_count})`
+      : 'No checkpoints in this directory';
+    list.textContent = '';
+    const directories = result.directories || [];
+    if (!directories.length) {
+      list.textContent = 'No subdirectories.';
+      return;
+    }
+    for (const directory of directories) {
+      const row = document.createElement('button');
+      row.className = 'directory-entry';
+      row.type = 'button';
+      row.onclick = () => browseDirectory(directory.path);
+
+      const icon = document.createElement('span');
+      icon.textContent = '📁';
+      const name = document.createElement('span');
+      name.className = 'directory-entry-name';
+      name.textContent = directory.name;
+      row.append(icon, name);
+      if (directory.checkpoint_count > 0) {
+        const count = document.createElement('span');
+        count.className = 'directory-entry-count';
+        count.textContent = `${directory.checkpoint_count} checkpoints`;
+        row.appendChild(count);
+      }
+      list.appendChild(row);
+    }
+  } catch (e) {
+    directoryBrowserState = null;
+    list.textContent = '';
+    error.textContent = String(e);
+  }
+}
+
+function browseDirectoryParent() {
+  if (directoryBrowserState && directoryBrowserState.parent) {
+    browseDirectory(directoryBrowserState.parent);
+  }
+}
+
+async function selectBrowsedDirectory() {
+  if (!directoryBrowserState || !(directoryBrowserState.checkpoint_count > 0)) return;
+  document.getElementById('checkpoint-source').value = directoryBrowserState.path;
+  closeDirectoryBrowser();
+  await addCheckpointSource();
+}
+
+async function addCheckpointSource() {
+  const input = document.getElementById('checkpoint-source');
+  const status = document.getElementById('checkpoint-source-status');
+  const path = input.value.trim();
+  if (!path) {
+    status.style.color = '#f55';
+    status.textContent = 'Enter a checkpoint file, checkpoint directory, or run directory.';
+    return;
+  }
+  status.style.color = '#888';
+  status.textContent = 'Loading checkpoint source…';
+  try {
+    const resp = await fetch('/checkpoint_sources', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path}),
+    });
+    const result = await resp.json();
+    if (result.error) {
+      status.style.color = '#f55';
+      status.textContent = result.error;
+      return;
+    }
+    applyCheckpointList(result.checkpoints || []);
+    input.value = '';
+    status.style.color = '#4f4';
+    const addedCount = (result.added_checkpoints || []).length;
+    status.textContent = `Added ${result.source} (${addedCount} checkpoints; ${_allCheckpoints.length} total).`;
+  } catch (e) {
+    status.style.color = '#f55';
+    status.textContent = `Could not add source: ${e}`;
+  }
 }
 
 document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' &&
+      document.getElementById('directory-browser-backdrop').style.display === 'flex') {
+    closeDirectoryBrowser();
+    return;
+  }
   // Don't hijack keys while the user is typing in a text field.
   const tag = (e.target.tagName || '').toUpperCase();
   if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) {
+    if (e.key === 'Enter' && e.target.id === 'checkpoint-source') {
+      e.preventDefault();
+      addCheckpointSource();
+      return;
+    }
     if (e.key === 'Enter') analyze();
     return;
   }
@@ -2264,7 +2598,12 @@ function getPlayerMctsParams(player) {
   const sims = parseInt(document.getElementById(prefix + '-sims').value) || 0;
   const m = parseInt(document.getElementById(prefix + '-m').value) || 16;
   if (sims <= 0) return {};
-  return { mcts_sims: sims, mcts_m_actions: m };
+  const useForcing = document.getElementById('play-use-forcing').checked;
+  return {
+    mcts_sims: sims,
+    mcts_m_actions: m,
+    disable_forcing_solver: !useForcing,
+  };
 }
 
 async function fetchBotMove(checkpoint, player) {
@@ -2405,20 +2744,7 @@ async function startBotLoop() {
   updatePlayStatus();
 }
 
-// Load checkpoints into per-player datalists
-async function loadPlayerCheckpoints() {
-  const resp = await fetch('/checkpoints');
-  const data = await resp.json();
-  _allCheckpoints = data;
-  for (const side of ['p1', 'p2']) {
-    populateCheckpointDatalist(side + '-ckpt-list', data);
-    maybeSetInitialCheckpointInput(side + '-ckpt', data);
-  }
-  setChampionRowVisibility(data);
-}
-
 loadCheckpoints();
-loadPlayerCheckpoints();
 drawBoard();
 
 // Pan: mousedown on SVG background starts drag
@@ -2469,7 +2795,6 @@ window.addEventListener('resize', () => updateTransform());
 // value automatically; we just rebuild the datalists.
 setInterval(async () => {
   await loadCheckpoints();
-  await loadPlayerCheckpoints();
 }, 30000);
 </script>
 </body></html>
@@ -2477,7 +2802,7 @@ setInterval(async () => {
 
 
 class Handler(BaseHTTPRequestHandler):
-    checkpoint_dir = "runs/ablation-baseline/checkpoints"
+    checkpoint_sources = ["runs/ablation-baseline/checkpoints"]
 
     def log_message(self, fmt, *args):
         # Quieter logging
@@ -2490,16 +2815,48 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(HTML.encode())
+        elif parsed.path == "/browse_directories":
+            try:
+                requested = parse_qs(parsed.query).get("path", [""])[0]
+                result = _browse_directories(requested)
+            except Exception as e:
+                result = {"error": str(e)}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
         elif parsed.path == "/checkpoints":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(_list_checkpoints(self.checkpoint_dir)).encode())
+            checkpoints = _list_checkpoint_sources(self.checkpoint_sources)
+            self.wfile.write(json.dumps(checkpoints).encode())
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path == "/analyze":
+        if self.path == "/checkpoint_sources":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            try:
+                source, added = _resolve_checkpoint_source(str(body.get("path", "")))
+                if source not in self.checkpoint_sources:
+                    self.checkpoint_sources.append(source)
+                result = {
+                    "source": source,
+                    "added_checkpoints": added,
+                    "checkpoints": _list_checkpoint_sources(self.checkpoint_sources),
+                }
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode())
+            except Exception as e:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+        elif self.path == "/analyze":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
             try:
@@ -2512,6 +2869,7 @@ class Handler(BaseHTTPRequestHandler):
                     max_moves=body.get("max_moves", 40),
                     mcts_sims=body.get("mcts_sims", 0),
                     mcts_m_actions=body.get("mcts_m_actions", 16),
+                    disable_forcing_solver=body.get("disable_forcing_solver", False),
                     setup_stones=body.get("setup_stones"),
                     setup_current_player=body.get("setup_current_player", "P2"),
                     setup_moves_remaining=body.get("setup_moves_remaining", 2),
@@ -2560,6 +2918,7 @@ class Handler(BaseHTTPRequestHandler):
                     max_moves=body.get("max_moves", 40),
                     mcts_sims=body.get("mcts_sims", 0),
                     mcts_m_actions=body.get("mcts_m_actions", 16),
+                    disable_forcing_solver=body.get("disable_forcing_solver", False),
                     setup_stones=body.get("setup_stones"),
                     setup_current_player=body.get("setup_current_player", "P2"),
                     setup_moves_remaining=body.get("setup_moves_remaining", 2),
@@ -2631,7 +2990,7 @@ def main():
     raw = tomllib.loads(Path(args.config).read_text())
     _model_config_dict = raw.get("model", {})
     ckpt_dir = _checkpoint_dir_from_config(raw, args.checkpoint_dir)
-    Handler.checkpoint_dir = ckpt_dir
+    Handler.checkpoint_sources = [ckpt_dir]
 
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"

@@ -80,6 +80,7 @@
           <option value="idtt" selected>IDTT · shortest bounded proof</option>
           <option value="dfpn">DFPN · deep proof search</option>
           <option value="pdspn">PDS-PN · layered deep search</option>
+          <option value="pdspn-shortest">PDS-PN shortest · certify minimum</option>
           <option value="pns">PNS · verdict-only cross-check</option>
         </select>
       </label>
@@ -107,8 +108,8 @@
         <span>PN leaf cap</span>
         <select id="analysis-forcing-leaf-budget">
           <option value="1000">1k · light</option>
-          <option value="2000">2k</option>
-          <option value="5000" selected>5k · recommended</option>
+          <option value="2000" selected>2k · shortest-search balance</option>
+          <option value="5000">5k · deep-win biased</option>
           <option value="10000">10k</option>
           <option value="25000">25k</option>
           <option value="50000">50k · intensive</option>
@@ -176,6 +177,7 @@
     <div class="proof-explorer-actions">
       <button id="proof-back-btn" onclick="proofExplorerBack()" title="Previous proof decision">&#8592; Back</button>
       <button onclick="proofExplorerReset()" title="Return to the certificate root">Reset</button>
+      <button id="proof-shortest-line-btn" onclick="proofExplorerToggleShortestLine()" hidden>Max-delay line</button>
       <button id="proof-worst-btn" class="proof-primary" onclick="proofExplorerWorstCase()" title="Advance along a defense that maximizes the certified bound">Next worst case &#8594;</button>
       <button id="proof-alternatives-btn" onclick="proofExplorerFindAlternatives()" title="Jump to the nearest proof position with multiple certified attacks">Find alternatives</button>
       <button onclick="proofFitBoard()" title="Fit the current proof position on screen">Fit board</button>
@@ -201,6 +203,7 @@
     <aside class="proof-explorer-panel">
       <div class="proof-progress-copy"><span id="proof-progress-label"></span><span id="proof-node-label"></span></div>
       <div class="proof-progress-track"><div id="proof-progress-bar"></div></div>
+      <div id="proof-optimization-note" class="proof-optimization-note" hidden></div>
       <div id="proof-step-card"></div>
       <div id="proof-choices" class="proof-choices"></div>
       <div class="proof-path-heading"><span>Your path through the proof</span><small>click any step to rewind</small></div>

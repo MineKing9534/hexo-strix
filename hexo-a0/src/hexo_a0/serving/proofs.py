@@ -163,8 +163,46 @@ def validate_proof_bundle(bundle: dict) -> None:
     if _plain_int(verification.get("proofEdges"), "verification.proofEdges", 0,
                   10_000_000) != edges:
         raise ProofValidationError("verification edge count does not match the certificate")
-    _plain_int(verification.get("maxAttackerTurns"), "verification.maxAttackerTurns",
-               1, 100_000)
+    proof_upper = _plain_int(
+        verification.get("maxAttackerTurns"), "verification.maxAttackerTurns", 1, 100_000)
+
+    optimization = bundle.get("optimization")
+    if optimization is not None:
+        if not isinstance(optimization, dict):
+            raise ProofValidationError("optimization must be an object")
+        if optimization.get("method") != "pdspn-shortest-v1":
+            raise ProofValidationError("unsupported proof optimization method")
+        shortest = optimization.get("shortestCertified")
+        if not isinstance(shortest, bool):
+            raise ProofValidationError("optimization.shortestCertified must be a boolean")
+        upper = _plain_int(optimization.get("bestUpperDepth"),
+                           "optimization.bestUpperDepth", 1, 255)
+        lower = _plain_int(optimization.get("excludedThroughDepth"),
+                           "optimization.excludedThroughDepth", 0, 254)
+        _plain_int(optimization.get("thresholdProbes"),
+                   "optimization.thresholdProbes", 0, 1_000_000_000)
+        if lower >= upper:
+            raise ProofValidationError("optimization bounds are inconsistent")
+        if upper > proof_upper:
+            raise ProofValidationError("optimization upper bound exceeds the proof DAG")
+        if shortest and lower + 1 != upper:
+            raise ProofValidationError("certified shortest bounds must be adjacent")
+        sample_line = optimization.get("sampleLine")
+        if sample_line is not None:
+            if not isinstance(sample_line, list) or not 1 <= len(sample_line) <= 510:
+                raise ProofValidationError("optimization.sampleLine must contain 1..510 turns")
+            expected = position["attacker"]
+            for index, turn in enumerate(sample_line):
+                if not isinstance(turn, dict):
+                    raise ProofValidationError(
+                        f"optimization.sampleLine[{index}] must be an object")
+                _plain_int(turn.get("turn"),
+                           f"optimization.sampleLine[{index}].turn", 0, 509)
+                if turn.get("player") != expected:
+                    raise ProofValidationError(
+                        f"optimization.sampleLine[{index}].player is out of turn")
+                _action(turn.get("cells"), f"optimization.sampleLine[{index}].cells")
+                expected = "P2" if expected == "P1" else "P1"
 
 
 class ProofStore:

@@ -451,6 +451,8 @@ fn prover_config(
         pn2_nodes: pn2_nodes.max(1),
         leaf_budget: 1_000_000,
         leaf_budget_max: 10_000_000,
+        root_screen_budget: 0,
+        root_screen_per_attack: 5_000,
         time_limit_s: 0.0,
         race_set: Vec::new(),
     }

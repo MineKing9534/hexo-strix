@@ -6,7 +6,10 @@
 use super::io::{Line, PosConfig, Position, Verdict};
 use super::kernel::KernelCtx;
 use super::pn::{INF, ProofTt, one_plus_eps, sat_add};
-use super::{Ctl, DriverKind, ProverConfig, certificate, dfpn, hybrid, idtt, pdspn};
+use super::{
+    Ctl, DriverKind, ProverConfig, certificate, dfpn, guided_idtt, guided_pdspn_shortest,
+    hybrid, idtt, pdspn,
+};
 use hexo_engine::types::{Coord, Player};
 use std::path::PathBuf;
 use Player::{P1, P2};
@@ -30,6 +33,21 @@ fn assert_pv_wins(p: &Position, pv: &[Coord]) {
     }
     assert!(g.is_terminal(), "PV must end the game");
     assert_eq!(g.winner(), Some(p.attacker), "PV must end in the attacker's win");
+}
+
+fn attacker_turns_in_pv(p: &Position, pv: &[Coord]) -> u8 {
+    let mut g = p.to_game();
+    let mut previous = None;
+    let mut turns = 0u8;
+    for &coord in pv {
+        let player = g.current_player().expect("PV cannot continue past terminal");
+        if previous != Some(player) && player == p.attacker {
+            turns = turns.saturating_add(1);
+        }
+        g.apply_move(coord).expect("PV move must be legal");
+        previous = Some(player);
+    }
+    turns
 }
 
 /// Fast parity config: small TT, generous node budget (these solve in ms), no
@@ -144,6 +162,116 @@ fn parity_pdspn_matches_idtt_fast() {
     assert!(
         checked_incomplete_defense,
         "fast proof corpus must exercise all-defense completeness checking"
+    );
+}
+
+#[test]
+fn verified_pdspn_certificate_guides_shortest_idtt_without_changing_depth() {
+    let cfg = fast_cfg();
+    let ctl = Ctl::new(0.0);
+    let p = pos(XSNFYLL, P2, 2);
+    let baseline = idtt(&p, &cfg, &ctl);
+    let pd = pdspn::solve(&p, &cfg, &ctl);
+    let certificate = pd.certificate.as_ref().expect("pdspn WIN certificate");
+    let mut guided_cfg = cfg.clone();
+    guided_cfg.root_screen_budget = 1_000;
+    guided_cfg.root_screen_per_attack = 100;
+    guided_cfg.pn2_nodes = 10;
+    let guided = guided_idtt(&p, certificate, &guided_cfg, &ctl).expect("verified guide");
+
+    assert_eq!(guided.verdict, Verdict::Win);
+    assert_eq!(guided.depth, baseline.depth, "guidance must preserve shortest depth");
+    assert_eq!(guided.stats.best_upper_depth, guided.depth.unwrap());
+    assert_eq!(
+        guided.stats.excluded_through_depth,
+        guided.depth.unwrap().saturating_sub(1),
+        "a shortest-depth claim must exclude every shallower threshold",
+    );
+    assert_pv_wins(&p, &guided.pv);
+    assert!(guided.stats.screened_attacks > 0, "fixture must exercise the PDS root screen");
+    assert_eq!(
+        guided.stats.screen_refuted_attacks
+            + guided.stats.screen_winning_attacks
+            + guided.stats.screen_unresolved_attacks,
+        guided.stats.screened_attacks,
+        "every generated root attack must be classified conservatively",
+    );
+}
+
+#[test]
+fn depth_bounded_pdspn_matches_idtt_shortest_thresholds() {
+    let cfg = fast_cfg();
+    let ctl = Ctl::new(0.0);
+    for (name, p) in [
+        ("xsnfyll", pos(XSNFYLL, P2, 2)),
+        ("hz3hty", pos(HZ3HTY, P1, 2)),
+        ("l9mxn59", pos(L9MXN59, P1, 2)),
+    ] {
+        let shortest = idtt(&p, &cfg, &ctl).depth.expect("fixture IDTT win");
+        if shortest > 1 {
+            let miss_cfg = ProverConfig { depth_cap: shortest - 1, ..cfg.clone() };
+            let miss = pdspn::solve_bounded(&p, &miss_cfg, &ctl);
+            assert_eq!(
+                miss.verdict,
+                Verdict::No,
+                "{name}: bounded PDS-PN must exclude every threshold below IDTT's shortest win",
+            );
+        }
+        let hit_cfg = ProverConfig { depth_cap: shortest, ..cfg.clone() };
+        let hit = pdspn::solve_bounded(&p, &hit_cfg, &ctl);
+        assert_eq!(hit.verdict, Verdict::Win, "{name}: bounded PDS-PN threshold hit");
+        assert_pv_wins(&p, &hit.pv);
+    }
+}
+
+#[test]
+fn depth_bounded_driver_reports_an_exclusion_not_a_global_no() {
+    let fork: &[(Coord, Player)] = &[
+        ((0, 0), P1), ((1, 0), P1), ((2, 0), P1), ((0, 1), P1), ((0, 2), P1),
+    ];
+    let p = pos(fork, P1, 2);
+    let miss_cfg = ProverConfig {
+        driver: DriverKind::PdspnDepth,
+        depth_cap: 1,
+        ..fast_cfg()
+    };
+    let miss = super::run(&p, &[], &miss_cfg);
+    assert_eq!(miss.verdict, Verdict::BudgetExceeded);
+    assert_eq!(miss.stats.excluded_through_depth, 1);
+    assert_eq!(miss.stats.best_upper_depth, 0);
+
+    let hit_cfg = ProverConfig { depth_cap: 2, ..miss_cfg };
+    let hit = super::run(&p, &[], &hit_cfg);
+    assert_eq!(hit.verdict, Verdict::Win);
+    assert_eq!(hit.stats.best_upper_depth, 2);
+    assert_eq!(hit.depth, Some(2));
+    assert_pv_wins(&p, &hit.pv);
+    assert_eq!(attacker_turns_in_pv(&p, &hit.pv), 2);
+    let certificate = hit.certificate.as_ref().expect("bounded win certificate");
+    assert_eq!(certificate::verify(&p, certificate).unwrap().max_attacker_turns, 2);
+}
+
+#[test]
+fn certificate_guided_pdspn_finds_the_exact_shortest_interval() {
+    let cfg = fast_cfg();
+    let ctl = Ctl::new(0.0);
+    let p = pos(XSNFYLL, P2, 2);
+    let shortest = idtt(&p, &cfg, &ctl).depth.expect("fixture IDTT win");
+    let pd = pdspn::solve(&p, &cfg, &ctl);
+    let certificate = pd.certificate.as_ref().expect("pdspn certificate");
+    let result = guided_pdspn_shortest(&p, certificate, &cfg, &ctl)
+        .expect("verified shortest-PDS guide");
+    assert_eq!(result.verdict, Verdict::Win);
+    assert_eq!(result.depth, Some(shortest));
+    assert_eq!(result.stats.best_upper_depth, shortest);
+    assert_eq!(result.stats.excluded_through_depth, shortest.saturating_sub(1));
+    assert_pv_wins(&p, &result.pv);
+    assert_eq!(attacker_turns_in_pv(&p, &result.pv), shortest);
+    assert_eq!(
+        certificate::verify(&p, result.certificate.as_ref().expect("shortest certificate"))
+            .unwrap()
+            .max_attacker_turns,
+        u32::from(shortest),
     );
 }
 

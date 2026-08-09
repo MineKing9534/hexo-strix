@@ -27,6 +27,7 @@ function engineValue(api, engine) {
     pns: api.SolverEngineEnum.Pns,
     dfpn: api.SolverEngineEnum.Dfpn,
     pdspn: api.SolverEngineEnum.Pdspn,
+    "pdspn-shortest": api.SolverEngineEnum.Pdspn,
   };
   if (!(engine in engines)) throw new Error(`Unknown solver engine: ${engine}`);
   return engines[engine];
@@ -88,7 +89,7 @@ self.onmessage = async (event) => {
   const message = event.data || {};
   if (message.type !== "solve" && message.type !== "verify") return;
   const requestId = message.requestId;
-  let solver, position, limits, outcome, verification;
+  let solver, position, limits, outcome, proofOutcome, verification;
   try {
     const api = await loadApi();
     const input = message.position;
@@ -126,9 +127,40 @@ self.onmessage = async (event) => {
     );
     limits.pn2_nodes = BigInt(message.leafNodeBudget || "50000");
     const started = performance.now();
-    outcome = message.width === "wide"
-      ? solver.solve_wide(position, limits)
-      : solver.solve(position, limits);
+    let initialNodes = 0n;
+    let optimized = false;
+    if (message.engine === "pdspn-shortest") {
+      let certificateJson = message.certificate
+        ? JSON.stringify(message.certificate)
+        : "";
+      if (!certificateJson) {
+        proofOutcome = message.width === "wide"
+          ? solver.solve_wide(position, limits)
+          : solver.solve(position, limits);
+        certificateJson = proofOutcome.certificate_json;
+        if (!certificateJson) {
+          // The prerequisite proof did not resolve. Return that honest result;
+          // no shortest optimization can begin without a verified upper bound.
+          outcome = proofOutcome;
+          proofOutcome = null;
+        } else {
+          initialNodes = BigInt(proofOutcome.nodes);
+        }
+      }
+      if (certificateJson) {
+        outcome = solver.optimize_certificate(
+          position,
+          limits,
+          certificateJson,
+          message.width === "wide",
+        );
+        optimized = true;
+      }
+    } else {
+      outcome = message.width === "wide"
+        ? solver.solve_wide(position, limits)
+        : solver.solve(position, limits);
+    }
     const elapsedMs = performance.now() - started;
     const pv = serializePv(api, outcome);
     const certificateJson = outcome.certificate_json;
@@ -144,13 +176,19 @@ self.onmessage = async (event) => {
       result: {
         kind: kindName(api, outcome.kind),
         depth: outcome.depth > 0 ? outcome.depth : null,
-        nodes: outcome.nodes.toString(),
+        nodes: (initialNodes + BigInt(outcome.nodes)).toString(),
         elapsedMs,
         turns: pv.turns,
         pv: pv.placements,
         pvOwners: pv.owners,
         certificate,
         certificateSummary,
+        bestUpperDepth: optimized && outcome.best_upper_depth > 0
+          ? outcome.best_upper_depth : null,
+        excludedThroughDepth: optimized && outcome.excluded_through_depth > 0
+          ? outcome.excluded_through_depth : 0,
+        thresholdProbes: optimized ? Number(outcome.threshold_probes) : 0,
+        shortestCertified: optimized && Boolean(outcome.shortest_certified),
       },
     });
   } catch (error) {
@@ -161,6 +199,7 @@ self.onmessage = async (event) => {
     });
   } finally {
     freeQuietly(verification);
+    freeQuietly(proofOutcome);
     freeQuietly(outcome);
     freeQuietly(solver);
     freeQuietly(limits);
