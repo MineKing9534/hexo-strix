@@ -15,6 +15,7 @@ from hexo_klent.config import AlgorithmConfig, KlentModelConfig
 from hexo_klent.model import (
     BatchOutput,
     KlentNet,
+    RasterKlentNet,
     make_klent_net,
 )
 
@@ -36,7 +37,7 @@ class KlentMCTSAdapter(nn.Module):
 
     def __init__(
         self,
-        network: KlentNet,
+        network: KlentNet | RasterKlentNet,
         algorithm: AlgorithmConfig,
     ) -> None:
         super().__init__()

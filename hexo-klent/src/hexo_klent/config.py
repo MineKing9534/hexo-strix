@@ -24,6 +24,10 @@ class KlentModelConfig(ModelConfig):
     ray_branch_scale: float = 1.0
     exact_graft_init: bool = True
     ray_after_layers: list[int] = field(default_factory=list)
+    axial_attention_radius: int = 8
+    axial_attention_layers: list[int] = field(default_factory=list)
+    cnn_expansion: int = 2
+    cnn_dilations: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -63,6 +67,10 @@ class CollectionConfig:
     parallel_games: int = 64
     inference_batch_size: int = 64
     inference_edge_budget: int = 250_000
+    # Optional finite self-play board. A radius r permits the D6-symmetric
+    # axial hexagon max(|q|, |r|, |q+r|) <= r, whose raster bound is
+    # (2r + 1) squared. Zero retains normal unbounded HeXO play.
+    board_radius: int = 0
     # Dense rasters scale with the spatial bounding box rather than the number
     # of active cells. End a wandering lane at this exact, bootstrapped
     # truncation boundary before it can create an unsafe fit example. Zero
@@ -120,6 +128,9 @@ class EvaluationOpponentConfig:
 
     name: str = ""
     kind: str = "random"
+    # Optional per-opponent cadence. Omitted values inherit
+    # ``EvaluationConfig.interval``; zero disables only this opponent.
+    interval: int | None = None
     checkpoint: str = ""
     lag_iterations: int = 0
     best_promotion_win_rate: float = 0.55
@@ -151,6 +162,28 @@ class EvaluationConfig:
     opponents: list[EvaluationOpponentConfig] = field(
         default_factory=_default_evaluation_opponents
     )
+
+
+def evaluation_opponent_interval(
+    evaluation: EvaluationConfig,
+    opponent: EvaluationOpponentConfig,
+) -> int:
+    """Return an opponent's explicit cadence or the suite fallback."""
+
+    if opponent.interval is None:
+        return evaluation.interval
+    return opponent.interval
+
+
+def evaluation_opponent_is_due(
+    evaluation: EvaluationConfig,
+    opponent: EvaluationOpponentConfig,
+    iteration: int,
+) -> bool:
+    """Return whether ``opponent`` should run at ``iteration``."""
+
+    interval = evaluation_opponent_interval(evaluation, opponent)
+    return interval > 0 and iteration % interval == 0
 
 
 @dataclass
@@ -266,6 +299,8 @@ def _validate(cfg: Config) -> None:
         raise ValueError("collection.inference_batch_size must be positive")
     if cfg.collection.inference_edge_budget < 0:
         raise ValueError("collection.inference_edge_budget cannot be negative")
+    if cfg.collection.board_radius < 0:
+        raise ValueError("collection.board_radius cannot be negative")
     if cfg.collection.dense_position_cell_limit < 0:
         raise ValueError(
             "collection.dense_position_cell_limit cannot be negative"
@@ -273,7 +308,13 @@ def _validate(cfg: Config) -> None:
     if (
         cfg.collection.dense_position_cell_limit > 0
         and cfg.model.architecture
-        not in {"dense_axis", "persistent_ray_axis"}
+        not in {
+            "dense_axis",
+            "persistent_ray_axis",
+            "hex_axial_cnn",
+            "hex_dilated_cnn",
+            "hex_d6_dilated_cnn",
+        }
     ):
         raise ValueError(
             "collection.dense_position_cell_limit is only valid for "
@@ -285,6 +326,56 @@ def _validate(cfg: Config) -> None:
         raise ValueError("collection.batch_timeout_ms cannot be negative")
     if cfg.training.batch_size <= 0:
         raise ValueError("training.batch_size must be positive")
+    if cfg.model.architecture not in {
+        "graph",
+        "dense_axis",
+        "persistent_ray_axis",
+        "hex_axial_cnn",
+        "hex_dilated_cnn",
+        "hex_d6_dilated_cnn",
+    }:
+        raise ValueError(
+            f"unsupported model architecture {cfg.model.architecture!r}"
+        )
+    if cfg.model.architecture == "hex_axial_cnn":
+        if cfg.model.num_layers <= 0:
+            raise ValueError("hex_axial_cnn requires model.num_layers > 0")
+        if cfg.model.hidden_dim % cfg.model.num_heads != 0:
+            raise ValueError(
+                "hex_axial_cnn requires hidden_dim divisible by num_heads"
+            )
+        if cfg.model.axial_attention_radius <= 0:
+            raise ValueError(
+                "hex_axial_cnn axial_attention_radius must be positive"
+            )
+        if cfg.model.cnn_expansion <= 0:
+            raise ValueError("hex_axial_cnn cnn_expansion must be positive")
+        invalid_attention_layers = [
+            layer
+            for layer in cfg.model.axial_attention_layers
+            if layer < 0 or layer >= cfg.model.num_layers
+        ]
+        if invalid_attention_layers:
+            raise ValueError(
+                "hex_axial_cnn axial_attention_layers must be in "
+                f"[0,{cfg.model.num_layers}): {invalid_attention_layers}"
+            )
+    if cfg.model.architecture in {
+        "hex_dilated_cnn",
+        "hex_d6_dilated_cnn",
+    }:
+        architecture = cfg.model.architecture
+        if cfg.model.num_layers <= 0:
+            raise ValueError(f"{architecture} requires model.num_layers > 0")
+        if cfg.model.cnn_expansion <= 0:
+            raise ValueError(f"{architecture} cnn_expansion must be positive")
+        if len(cfg.model.cnn_dilations) != cfg.model.num_layers:
+            raise ValueError(
+                f"{architecture} cnn_dilations must contain exactly "
+                "model.num_layers entries"
+            )
+        if any(dilation <= 0 for dilation in cfg.model.cnn_dilations):
+            raise ValueError(f"{architecture} cnn_dilations must be positive")
     if cfg.training.edge_budget < 0:
         raise ValueError("training.edge_budget cannot be negative")
     if cfg.training.policy_diagnostic_samples < 0:
@@ -380,6 +471,10 @@ def _validate(cfg: Config) -> None:
         )
     opponent_names: set[str] = set()
     for opponent in cfg.evaluation.opponents:
+        if opponent.interval is not None and opponent.interval < 0:
+            raise ValueError(
+                "evaluation opponent interval cannot be negative"
+            )
         if opponent.kind not in {
             "random",
             "sealbot",
@@ -500,15 +595,6 @@ def _validate(cfg: Config) -> None:
     if cfg.model.axis_window < cfg.game.win_length - 1:
         raise ValueError(
             "model.axis_window must be at least game.win_length - 1"
-        )
-    if cfg.model.architecture not in {
-        "graph",
-        "dense_axis",
-        "persistent_ray_axis",
-    }:
-        raise ValueError(
-            "model.architecture must be 'graph', 'dense_axis', or "
-            "'persistent_ray_axis'"
         )
     if not 1 <= cfg.model.dense_ray_radius <= 5:
         raise ValueError("model.dense_ray_radius must be between 1 and 5")

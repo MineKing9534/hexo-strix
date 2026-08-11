@@ -459,6 +459,38 @@ def test_eta_models_regular_and_scheduled_evaluation_generations_separately(
     assert dashboard._eta_estimate().remaining_seconds == pytest.approx(76.0)
 
 
+def test_dashboard_schedules_each_opponent_at_its_own_interval(tmp_path):
+    dashboard = _dashboard(tmp_path)
+    inherited = dashboard.config.evaluation.opponents[0]
+    inherited.name = "inherited"
+    inherited.games = 8
+    frequent = EvaluationOpponentConfig(
+        name="frequent",
+        games=2,
+        interval=3,
+    )
+    disabled = EvaluationOpponentConfig(
+        name="disabled",
+        games=64,
+        interval=0,
+    )
+    dashboard.config.evaluation.interval = 10
+    dashboard.config.evaluation.opponents = [
+        inherited,
+        frequent,
+        disabled,
+    ]
+
+    assert dashboard._configured_evaluation_names(3) == {"frequent"}
+    assert dashboard._configured_evaluation_names(10) == {"inherited"}
+    assert dashboard._configured_evaluation_names(30) == {
+        "inherited",
+        "frequent",
+    }
+    assert dashboard._is_scheduled_evaluation(6) is True
+    assert dashboard._is_scheduled_evaluation(7) is False
+
+
 def test_eta_scales_changed_evaluation_workload_and_reacquires_suite(
     tmp_path,
     monkeypatch,

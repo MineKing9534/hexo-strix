@@ -28,6 +28,7 @@ docs/*
 docs/research/*
 !docs/research/2026-07-14-solver-zobrist-collision-and-wl4-guard.md
 !docs/research/2026-07-22-tight-window-kernel.md
+!docs/research/amdgpu-ttm-bulk-move-report-20260814.md
 *.pt             # model checkpoints
 *.bin
 # ...EXCEPT the committed A3 wire-states golden fixtures (cross-language pin;

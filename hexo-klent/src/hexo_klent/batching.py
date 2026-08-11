@@ -16,13 +16,11 @@ from hexo_klent.model import is_dense_axis_config
 _RASTER_BUCKETS = (9, 17, 25, 33, 41, 49, 65, 81, 97, 129)
 
 
-def raster_shape(state: object) -> tuple[int, int]:
-    """Return the exact default Rust crop bucket for one non-terminal state."""
+def raster_shape_from_coords(
+    coords: list[tuple[int, int]],
+) -> tuple[int, int]:
+    """Return the exact default Rust crop bucket for axial coordinates."""
 
-    coords = [
-        coord for coord, _player in state.placed_stones()
-    ]
-    coords.extend(state.legal_moves())
     if not coords:
         raise ValueError("cannot determine raster shape for an empty state")
     q_values, r_values = zip(*coords, strict=True)
@@ -36,6 +34,14 @@ def raster_shape(state: object) -> tuple[int, int]:
         return 1 if span <= 1 else 1 + 8 * ((span - 1 + 7) // 8)
 
     return round_bucket(span_q), round_bucket(span_r)
+
+
+def raster_shape(state: object) -> tuple[int, int]:
+    """Return the exact default Rust crop bucket for one non-terminal state."""
+
+    coords = [coord for coord, _player in state.placed_stones()]
+    coords.extend(state.legal_moves())
+    return raster_shape_from_coords(coords)
 
 
 def order_states_for_batching(

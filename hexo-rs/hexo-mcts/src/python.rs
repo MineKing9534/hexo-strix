@@ -34,6 +34,15 @@ fn player_str(p: Player) -> &'static str {
     }
 }
 
+fn validate_board_radius(board_radius: Option<i32>) -> PyResult<Option<i32>> {
+    if let Some(radius) = board_radius {
+        if radius < 1 {
+            return Err(PyValueError::new_err("board_radius must be >= 1"));
+        }
+    }
+    Ok(board_radius)
+}
+
 #[pyclass(name = "GameConfig", module = "hexo_rs", skip_from_py_object)]
 #[derive(Clone)]
 struct PyGameConfig {
@@ -111,13 +120,15 @@ pub struct PyGameState {
 #[pymethods]
 impl PyGameState {
     #[new]
-    #[pyo3(signature = (config=None))]
-    fn new(config: Option<&PyGameConfig>) -> Self {
-        let inner = match config {
-            Some(cfg) => GameState::with_config(cfg.inner),
-            None => GameState::new(),
-        };
-        PyGameState { inner }
+    #[pyo3(signature = (config=None, board_radius=None))]
+    fn new(
+        config: Option<&PyGameConfig>,
+        board_radius: Option<i32>,
+    ) -> PyResult<Self> {
+        let board_radius = validate_board_radius(board_radius)?;
+        let config = config.map(|cfg| cfg.inner).unwrap_or(GameConfig::FULL_HEXO);
+        let inner = GameState::with_config_and_board_radius(config, board_radius);
+        Ok(PyGameState { inner })
     }
 
     fn apply_move(&mut self, q: i32, r: i32) -> PyResult<()> {
@@ -142,12 +153,19 @@ impl PyGameState {
     ///     moves_remaining: 1 or 2 — placements left this turn.
     ///     config: GameConfig (optional, defaults to FULL_HEXO).
     #[staticmethod]
-    #[pyo3(signature = (stones, current_player, moves_remaining=2, config=None))]
+    #[pyo3(signature = (
+        stones,
+        current_player,
+        moves_remaining=2,
+        config=None,
+        board_radius=None,
+    ))]
     fn from_state(
         stones: Vec<((i32, i32), String)>,
         current_player: String,
         moves_remaining: u8,
         config: Option<&PyGameConfig>,
+        board_radius: Option<i32>,
     ) -> PyResult<Self> {
         if moves_remaining != 1 && moves_remaining != 2 {
             return Err(PyValueError::new_err("moves_remaining must be 1 or 2"));
@@ -184,8 +202,28 @@ impl PyGameState {
                 )));
             }
         }
+        let board_radius = validate_board_radius(board_radius)?;
+        if let Some(radius) = board_radius {
+            let outside = typed_stones.iter().find_map(|&(coord, _)| {
+                let q = i64::from(coord.0);
+                let r = i64::from(coord.1);
+                let distance = q.abs().max(r.abs()).max((q + r).abs());
+                (distance > i64::from(radius)).then_some(coord)
+            });
+            if let Some(coord) = outside {
+                return Err(PyValueError::new_err(format!(
+                    "stone {coord:?} lies outside board_radius {radius}"
+                )));
+            }
+        }
         let cfg = config.map(|c| c.inner).unwrap_or(GameConfig::FULL_HEXO);
-        let inner = GameState::from_state(&typed_stones, cur, moves_remaining, cfg);
+        let inner = GameState::from_state_with_board_radius(
+            &typed_stones,
+            cur,
+            moves_remaining,
+            cfg,
+            board_radius,
+        );
         Ok(PyGameState { inner })
     }
 
@@ -229,6 +267,10 @@ impl PyGameState {
         PyGameConfig { inner: *self.inner.config() }
     }
 
+    fn board_radius(&self) -> Option<i32> {
+        self.inner.board_radius()
+    }
+
     /// Pickle support. Reconstructs the state via `from_state`, which only
     /// supports non-terminal positions (the engine's `from_state` doesn't run a
     /// win check). Reanalyze never targets terminal positions anyway — the
@@ -260,7 +302,13 @@ impl PyGameState {
         // depend on lookup details of the module attribute.
         let cls = py.get_type::<PyGameState>();
         let constructor = cls.getattr("from_state")?;
-        let args = (stones, current_player, moves_remaining, config);
+        let args = (
+            stones,
+            current_player,
+            moves_remaining,
+            config,
+            self.inner.board_radius(),
+        );
         Ok((constructor, args).into_pyobject(py)?.unbind().into())
     }
 

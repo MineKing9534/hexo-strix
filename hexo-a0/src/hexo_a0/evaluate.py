@@ -21,6 +21,9 @@ def _uses_dense_raster(model_config) -> bool:
     return getattr(model_config, "architecture", "graph") in {
         "dense_axis",
         "persistent_ray_axis",
+        "hex_axial_cnn",
+        "hex_dilated_cnn",
+        "hex_d6_dilated_cnn",
     }
 
 

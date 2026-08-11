@@ -1565,6 +1565,96 @@ def test_lagged_evaluation_uses_resume_checkpoint_history(tmp_path):
     resumed_branch.close()
 
 
+def test_evaluation_opponents_run_on_independent_cadences(
+    tmp_path,
+    monkeypatch,
+):
+    import hexo_klent.trainer as trainer_module
+
+    config = Config(
+        model=tiny_model_config(),
+        game=GameConfig(
+            win_length=2, placement_radius=1, rollout_horizon=4
+        ),
+        collection=CollectionConfig(
+            positions_per_iteration=6,
+            parallel_games=2,
+            inference_batch_size=2,
+        ),
+        training=TrainingConfig(
+            batch_size=16,
+            edge_budget=0,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+        ),
+        evaluation=EvaluationConfig(
+            interval=2,
+            opening_plies=0,
+            opponents=[
+                EvaluationOpponentConfig(
+                    name="suite_default",
+                    kind="random",
+                    games=2,
+                ),
+                EvaluationOpponentConfig(
+                    name="every_three",
+                    kind="random",
+                    interval=3,
+                    games=4,
+                ),
+                EvaluationOpponentConfig(
+                    name="disabled",
+                    kind="random",
+                    interval=0,
+                    games=6,
+                ),
+            ],
+        ),
+        run=RunConfig(
+            iterations=3,
+            device="cpu",
+            precision="float32",
+            output_dir=str(tmp_path / "cadences"),
+            checkpoint_interval=0,
+            seed=23,
+        ),
+    )
+    evaluated_games = []
+
+    def fake_evaluate(_kind, _model, **kwargs):
+        games = kwargs["games"]
+        evaluated_games.append(games)
+        return EvaluationStats(
+            games=games,
+            wins=games,
+            losses=0,
+            truncations=0,
+            decided_rate=1.0,
+            win_rate_decided=1.0,
+            mean_game_length=2.0,
+            mean_opponent_depth=0.0,
+            opening_pairs=0,
+            frac_unique_opening=0.0,
+        )
+
+    monkeypatch.setattr(trainer_module, "evaluate_opponent", fake_evaluate)
+    trainer = Trainer(config, tensorboard=False)
+    first = trainer.run_iteration()
+    second = trainer.run_iteration()
+    third = trainer.run_iteration()
+    trainer.close()
+
+    assert not any(key.startswith("evaluation/") for key in first)
+    assert second["evaluation/suite_default/games"] == 2.0
+    assert second["evaluation/suite_default/configured_interval"] == 2.0
+    assert "evaluation/every_three/games" not in second
+    assert third["evaluation/every_three/games"] == 4.0
+    assert third["evaluation/every_three/configured_interval"] == 3.0
+    assert "evaluation/suite_default/games" not in third
+    assert not any("disabled" in key for key in (*second, *third))
+    assert evaluated_games == [2, 4]
+
+
 def test_best_so_far_evaluation_promotes_and_persists_across_rounds(
     tmp_path, monkeypatch
 ):

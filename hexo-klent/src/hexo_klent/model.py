@@ -23,6 +23,11 @@ from hexo_axis_models.checkpoint import (
     convert_strix_axis_state_dict,
     extract_state_dict,
 )
+from hexo_klent.hex_axial_cnn import (
+    HexAxialCNNBackbone,
+    HexD6DilatedCNNBackbone,
+    HexDilatedCNNBackbone,
+)
 
 
 @dataclass(frozen=True)
@@ -233,6 +238,9 @@ def is_dense_axis_config(config: object) -> bool:
     return getattr(config, "architecture", "graph") in {
         "dense_axis",
         "persistent_ray_axis",
+        "hex_axial_cnn",
+        "hex_dilated_cnn",
+        "hex_d6_dilated_cnn",
     }
 
 
@@ -382,7 +390,271 @@ class PersistentRayKlentNet(
         self._configure_klent_outputs()
 
 
-RasterKlentNet = DenseAxisKlentNet | PersistentRayKlentNet
+class HexCNNKlentNet(nn.Module):
+    """Shared legal policy/Q outputs for native hex-raster CNN trunks."""
+
+    def __init__(self, config: ModelConfig, backbone: nn.Module) -> None:
+        super().__init__()
+        self.config = config
+        self.backbone = backbone
+        self.policy_head = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.policy_hidden),
+            nn.SiLU(),
+            nn.Linear(config.policy_hidden, 1),
+        )
+        self.q_head = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.q_hidden),
+            nn.SiLU(),
+            nn.Linear(config.q_hidden, 1),
+        )
+        self.reset_output_heads()
+
+    def reset_output_heads(self) -> None:
+        for head in (self.policy_head, self.q_head):
+            output = head[-1]
+            if not isinstance(output, nn.Linear):
+                raise TypeError("unexpected hex CNN output-head layout")
+            nn.init.zeros_(output.weight)
+            nn.init.zeros_(output.bias)
+
+    def _forward_batch_core(
+        self,
+        batch,
+        *,
+        legal_idx: Tensor | None = None,
+    ) -> BatchOutput:
+        del legal_idx
+        features = self.backbone(
+            batch.planes,
+            batch.scalars,
+            batch.active_mask,
+        )
+        flattened = features.permute(0, 2, 3, 1).reshape(
+            -1,
+            features.shape[1],
+        )
+        legal = flattened.index_select(
+            0,
+            batch.legal_flat_indices.to(torch.long),
+        )
+        policy_logits = self.policy_head(legal).squeeze(-1)
+        q_values = torch.tanh(self.q_head(legal).squeeze(-1))
+        legal_counts = batch.legal_offsets[1:] - batch.legal_offsets[:-1]
+        return BatchOutput(policy_logits, q_values, legal_counts)
+
+    def forward_batch(self, batch) -> BatchOutput:
+        return self._forward_batch_core(batch)
+
+
+class HexAxialCNNKlentNet(HexCNNKlentNet):
+    """KLENT policy/Q network using a hex CNN plus axial attention."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        backbone = HexAxialCNNBackbone(
+            channels=config.hidden_dim,
+            blocks=config.num_layers,
+            heads=config.num_heads,
+            attention_radius=int(
+                getattr(config, "axial_attention_radius", 8)
+            ),
+            attention_layers=tuple(
+                int(layer)
+                for layer in getattr(config, "axial_attention_layers", ())
+            ),
+            expansion=int(getattr(config, "cnn_expansion", 2)),
+            dropout=config.dropout,
+        )
+        super().__init__(config, backbone)
+
+
+class HexDilatedCNNKlentNet(HexCNNKlentNet):
+    """KLENT network using gated multiscale hex-axis convolutions."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        backbone = HexDilatedCNNBackbone(
+            channels=config.hidden_dim,
+            dilations=tuple(
+                int(value)
+                for value in getattr(config, "cnn_dilations", ())
+            ),
+            expansion=int(getattr(config, "cnn_expansion", 2)),
+            dropout=config.dropout,
+        )
+        super().__init__(config, backbone)
+
+
+class HexD6DilatedCNNKlentNet(HexCNNKlentNet):
+    """KLENT CNN with exact D6-equivariant multiscale spatial mixing."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        backbone = HexD6DilatedCNNBackbone(
+            channels=config.hidden_dim,
+            dilations=tuple(
+                int(value)
+                for value in getattr(config, "cnn_dilations", ())
+            ),
+            expansion=int(getattr(config, "cnn_expansion", 2)),
+            dropout=config.dropout,
+        )
+        super().__init__(config, backbone)
+
+
+@dataclass(frozen=True)
+class D6CNNConversionReport:
+    """Summary of projecting an orientation-specific CNN onto D6 orbits."""
+
+    copied_tensors: int
+    projected_blocks: int
+    source_parameters: int
+    target_parameters: int
+
+
+@dataclass(frozen=True)
+class D6CNNDepthGraftReport:
+    """Summary of losslessly extending an exact-D6 CNN with identity blocks."""
+
+    copied_tensors: int
+    source_blocks: int
+    target_blocks: int
+    source_parameters: int
+    target_parameters: int
+
+
+def convert_hex_dilated_to_d6(
+    source: HexDilatedCNNKlentNet,
+    target: HexD6DilatedCNNKlentNet,
+) -> D6CNNConversionReport:
+    """Project a learned dilated CNN into the exactly equivariant model.
+
+    Non-spatial tensors are copied exactly.  For every axial mixer, the three
+    axis centres and biases are averaged, as are the six reflected endpoints.
+    The old pointwise gate has no non-trivial scalar-field D6 projection: its
+    row-mean component adds the same logit to every axis and therefore cancels
+    in the softmax. The new gate over shared line responses starts at zero.
+    """
+
+    source_blocks = source.backbone.blocks
+    target_blocks = target.backbone.blocks
+    if len(source_blocks) != len(target_blocks):
+        raise ValueError("source and target CNNs must have the same block count")
+
+    source_state = source.state_dict()
+    converted = target.state_dict()
+    copied = 0
+    for name, value in source_state.items():
+        target_value = converted.get(name)
+        if target_value is not None and target_value.shape == value.shape:
+            target_value.copy_(value)
+            copied += 1
+
+    endpoint_indices = (
+        ((1, 0), (1, 2)),
+        ((0, 1), (2, 1)),
+        ((0, 2), (2, 0)),
+    )
+    centre = (1, 1)
+    with torch.no_grad():
+        for source_block, target_block in zip(
+            source_blocks,
+            target_blocks,
+            strict=True,
+        ):
+            old = source_block.axis_conv
+            new = target_block.axis_conv
+            weights = old.axis_conv.weight.reshape(
+                old.channels,
+                3,
+                3,
+                3,
+            )
+            centre_weights = torch.stack(
+                [weights[:, axis, centre[0], centre[1]] for axis in range(3)],
+                dim=1,
+            )
+            endpoint_weights = torch.stack(
+                [
+                    weights[:, axis, row, column]
+                    for axis, endpoints in enumerate(endpoint_indices)
+                    for row, column in endpoints
+                ],
+                dim=1,
+            )
+            new.main_center.copy_(centre_weights.mean(dim=1))
+            new.main_neighbor.copy_(endpoint_weights.mean(dim=1))
+            new.main_bias.copy_(
+                old.axis_conv.bias.reshape(old.channels, 3).mean(dim=1)
+            )
+            new.axis_gate.zero_()
+
+    target.load_state_dict(converted, strict=True)
+    return D6CNNConversionReport(
+        copied_tensors=copied,
+        projected_blocks=len(source_blocks),
+        source_parameters=sum(parameter.numel() for parameter in source.parameters()),
+        target_parameters=sum(parameter.numel() for parameter in target.parameters()),
+    )
+
+
+def graft_hex_d6_depth(
+    source: HexD6DilatedCNNKlentNet,
+    target: HexD6DilatedCNNKlentNet,
+) -> D6CNNDepthGraftReport:
+    """Copy an exact-D6 CNN into a deeper, initially equivalent network.
+
+    The target's dilation schedule must extend the source schedule. All source
+    tensors, including the learned heads and output normalization, are copied
+    exactly. Added residual blocks retain their random internal initialization
+    but start with a zero layer scale, so they are exact identities until
+    optimization begins to open them.
+    """
+
+    source_blocks = source.backbone.blocks
+    target_blocks = target.backbone.blocks
+    if len(target_blocks) <= len(source_blocks):
+        raise ValueError("target D6 CNN must have more blocks than the source")
+    source_dilations = tuple(block.axis_conv.dilation for block in source_blocks)
+    target_dilations = tuple(block.axis_conv.dilation for block in target_blocks)
+    if target_dilations[: len(source_dilations)] != source_dilations:
+        raise ValueError(
+            "target D6 CNN dilation schedule must extend the source schedule"
+        )
+
+    source_state = source.state_dict()
+    grafted = target.state_dict()
+    missing_or_mismatched = [
+        name
+        for name, value in source_state.items()
+        if name not in grafted or grafted[name].shape != value.shape
+    ]
+    if missing_or_mismatched:
+        raise ValueError(
+            "source and target D6 CNN tensors are not depth-compatible: "
+            + ", ".join(missing_or_mismatched)
+        )
+
+    with torch.no_grad():
+        for name, value in source_state.items():
+            grafted[name].copy_(value)
+        for block_index in range(len(source_blocks), len(target_blocks)):
+            grafted[f"backbone.blocks.{block_index}.layer_scale"].zero_()
+
+    target.load_state_dict(grafted, strict=True)
+    return D6CNNDepthGraftReport(
+        copied_tensors=len(source_state),
+        source_blocks=len(source_blocks),
+        target_blocks=len(target_blocks),
+        source_parameters=sum(parameter.numel() for parameter in source.parameters()),
+        target_parameters=sum(parameter.numel() for parameter in target.parameters()),
+    )
+
+
+RasterKlentNet = (
+    DenseAxisKlentNet
+    | PersistentRayKlentNet
+    | HexAxialCNNKlentNet
+    | HexDilatedCNNKlentNet
+    | HexD6DilatedCNNKlentNet
+)
 
 
 def make_klent_net(
@@ -392,6 +664,12 @@ def make_klent_net(
 
     if is_persistent_ray_config(config):
         return PersistentRayKlentNet(config)
+    if getattr(config, "architecture", "graph") == "hex_axial_cnn":
+        return HexAxialCNNKlentNet(config)
+    if getattr(config, "architecture", "graph") == "hex_dilated_cnn":
+        return HexDilatedCNNKlentNet(config)
+    if getattr(config, "architecture", "graph") == "hex_d6_dilated_cnn":
+        return HexD6DilatedCNNKlentNet(config)
     if is_dense_axis_config(config):
         return DenseAxisKlentNet(config)
     return KlentNet(config)
@@ -414,6 +692,52 @@ def compile_klent_forward(
         int(inductor_config.compile_threads),
         4,
     )
+
+    if isinstance(
+        model,
+        (HexDilatedCNNKlentNet, HexD6DilatedCNNKlentNet),
+    ):
+        # The trunk is composed only of convolutions, pointwise operations,
+        # and legal gathers. Inductor can retain dynamic raster and population
+        # dimensions in one reusable graph, avoiding a cold compile for every
+        # finite crop bucket.
+        model._forward_batch_core = torch.compile(
+            model._forward_batch_core,
+            dynamic=True,
+        )
+        return
+
+    if isinstance(model, HexAxialCNNKlentNet):
+        # Keep raster H/W static so Inductor sees one of the finite crop
+        # buckets. Mark only population dimensions dynamic; fully static
+        # compilation would recompile for every final partial microbatch.
+        eager_core = model._forward_batch_core
+        compiled_core = torch.compile(eager_core)
+
+        def spatially_specialized_core(
+            batch,
+            *,
+            legal_idx: Tensor | None = None,
+        ):
+            # Raster legal indices are already embedded in the batch. Accept
+            # the graph-compatible MCTS argument without specializing on it.
+            del legal_idx
+            for tensor in (
+                batch.planes,
+                batch.scalars,
+                batch.active_mask,
+                batch.legal_offsets,
+                batch.legal_flat_indices,
+            ):
+                # A final crop bucket can contain exactly one state, making
+                # legal_offsets length two provably static. AUTO-style marking
+                # retains dynamic populations when possible without turning
+                # that valid specialization into a constraint violation.
+                torch._dynamo.maybe_mark_dynamic(tensor, 0)
+            return compiled_core(batch)
+
+        model._forward_batch_core = spatially_specialized_core
+        return
 
     if isinstance(
         model,

@@ -28,6 +28,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from hexo_klent.config import evaluation_opponent_is_due
+
 _CYAN = "#5cecff"
 _BLUE = "#6d8cff"
 _MAGENTA = "#ff4fd8"
@@ -670,20 +672,31 @@ class TrainingDashboard:
 
     def _is_scheduled_evaluation(self, iteration: int) -> bool:
         evaluation = self.config.evaluation
-        return bool(
-            evaluation.interval > 0
-            and evaluation.opponents
-            and iteration % evaluation.interval == 0
+        return any(
+            evaluation_opponent_is_due(evaluation, opponent, iteration)
+            for opponent in evaluation.opponents
+        )
+
+    def _scheduled_evaluation_opponents(self, iteration: int) -> tuple:
+        evaluation = self.config.evaluation
+        return tuple(
+            opponent
+            for opponent in evaluation.opponents
+            if evaluation_opponent_is_due(
+                evaluation,
+                opponent,
+                iteration,
+            )
         )
 
     @staticmethod
     def _contains_evaluation(metrics: dict[str, float]) -> bool:
         return any(key.startswith("evaluation/") for key in metrics)
 
-    def _configured_evaluation_names(self) -> set[str]:
+    def _configured_evaluation_names(self, iteration: int) -> set[str]:
         return {
             opponent.name or opponent.kind
-            for opponent in self.config.evaluation.opponents
+            for opponent in self._scheduled_evaluation_opponents(iteration)
         }
 
     @staticmethod
@@ -763,23 +776,19 @@ class TrainingDashboard:
         historical_game_totals = [
             total for total in historical_game_totals if total > 0.0
         ]
-        configured_games = sum(
-            opponent.games
-            for opponent in self.config.evaluation.opponents
+        latest_evaluation_iteration = (
+            int(evaluation_metrics[-1].get("iteration", 0.0))
+            if evaluation_metrics
+            else 0
         )
-        if historical_game_totals and configured_games > 0:
-            historical_games = float(median(historical_game_totals))
-            overhead = max(0.0, evaluation_duration - regular_duration)
-            evaluation_duration = regular_duration + overhead * (
-                configured_games / historical_games
-            )
         latest_evaluation_names = (
             self._metric_evaluation_names(evaluation_metrics[-1])
             if evaluation_metrics
             else set()
         )
         evaluation_suite_matches = (
-            latest_evaluation_names == self._configured_evaluation_names()
+            latest_evaluation_names
+            == self._configured_evaluation_names(latest_evaluation_iteration)
         )
 
         pending = list(range(current_iteration + 1, stop_at + 1))
@@ -787,13 +796,33 @@ class TrainingDashboard:
             self._is_scheduled_evaluation(iteration)
             for iteration in pending
         )
-        predicted = [
-            (
-                evaluation_duration
-                if self._is_scheduled_evaluation(iteration)
-                else regular_duration
+        historical_games = (
+            float(median(historical_game_totals))
+            if historical_game_totals
+            else 0.0
+        )
+        evaluation_overhead = max(
+            0.0,
+            evaluation_duration - regular_duration,
+        )
+
+        def predicted_iteration_duration(iteration: int) -> float:
+            due_games = sum(
+                opponent.games
+                for opponent in self._scheduled_evaluation_opponents(
+                    iteration
+                )
             )
-            for iteration in pending
+            if due_games <= 0:
+                return regular_duration
+            if historical_games <= 0:
+                return evaluation_duration
+            return regular_duration + evaluation_overhead * (
+                due_games / historical_games
+            )
+
+        predicted = [
+            predicted_iteration_duration(iteration) for iteration in pending
         ]
         if not predicted or state == "COMPLETE":
             remaining = 0.0

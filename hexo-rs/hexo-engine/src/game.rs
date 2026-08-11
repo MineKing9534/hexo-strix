@@ -50,6 +50,18 @@ pub struct GameState {
     offsets: Arc<[Coord]>,
     /// Cached set of legal moves, updated incrementally on each apply_move.
     cached_legal: CoordSet,
+    /// Optional D6-symmetric finite training board. A radius `r` permits the
+    /// axial hexagon `max(|q|, |r|, |q+r|) <= r`; `None` is the production
+    /// unbounded board.
+    board_radius: Option<i32>,
+}
+
+#[inline]
+fn inside_board_radius(coord: Coord, radius: i32) -> bool {
+    let q = i64::from(coord.0);
+    let r = i64::from(coord.1);
+    let radius = i64::from(radius);
+    q.abs().max(r.abs()).max((q + r).abs()) <= radius
 }
 
 impl GameState {
@@ -66,14 +78,32 @@ impl GameState {
     /// # Panics
     /// Panics if `win_length < 2`, `placement_radius < 1`, or `max_moves < 1`.
     pub fn with_config(config: GameConfig) -> Self {
+        Self::with_config_and_board_radius(config, None)
+    }
+
+    /// Creates a game optionally confined to a finite, origin-centred hexagon.
+    ///
+    /// A board radius of `r` has a `(2r + 1) × (2r + 1)` axial raster bound
+    /// while preserving all rotations and reflections of the hex lattice.
+    pub fn with_config_and_board_radius(
+        config: GameConfig,
+        board_radius: Option<i32>,
+    ) -> Self {
         assert!(config.win_length >= 2, "win_length must be >= 2");
         assert!(config.placement_radius >= 1, "placement_radius must be >= 1");
         assert!(config.max_moves >= 1, "max_moves must be >= 1");
+        if let Some(radius) = board_radius {
+            assert!(radius >= 1, "board_radius must be >= 1");
+        }
 
         let board = Board::new();
         let offsets: Arc<[Coord]> = hex_offsets(config.placement_radius).into();
-        let initial_legal: CoordSet =
-            legal_moves(&board, config.placement_radius).into_iter().collect();
+        let initial_legal: CoordSet = legal_moves(&board, config.placement_radius)
+            .into_iter()
+            .filter(|&coord| {
+                board_radius.map_or(true, |radius| inside_board_radius(coord, radius))
+            })
+            .collect();
         GameState {
             board,
             turn: TurnState::P2Turn { moves_left: 2 },
@@ -82,6 +112,7 @@ impl GameState {
             winner: None,
             offsets,
             cached_legal: initial_legal,
+            board_radius,
         }
     }
 
@@ -112,7 +143,11 @@ impl GameState {
         let stones = self.board.stones();
         for &(dq, dr) in self.offsets.iter() {
             let cell = (coord.0 + dq, coord.1 + dr);
-            if !stones.contains_key(&cell) {
+            if !stones.contains_key(&cell)
+                && self
+                    .board_radius
+                    .map_or(true, |radius| inside_board_radius(cell, radius))
+            {
                 self.cached_legal.insert(cell);
             }
         }
@@ -213,6 +248,11 @@ impl GameState {
         &self.config
     }
 
+    /// Finite origin-centred hex-board radius, or `None` for normal play.
+    pub fn board_radius(&self) -> Option<i32> {
+        self.board_radius
+    }
+
     /// Reconstructs a non-terminal `GameState` directly from a stone set and
     /// turn info, bypassing the move-replay path. Intended for tests and
     /// benchmarks that need to materialise positions extracted from external
@@ -226,7 +266,34 @@ impl GameState {
         moves_remaining: u8,
         config: GameConfig,
     ) -> Self {
+        Self::from_state_with_board_radius(
+            stones,
+            current_player,
+            moves_remaining,
+            config,
+            None,
+        )
+    }
+
+    /// Reconstructs a position with the same optional finite-board semantics
+    /// as [`with_config_and_board_radius`](Self::with_config_and_board_radius).
+    pub fn from_state_with_board_radius(
+        stones: &[(Coord, Player)],
+        current_player: Player,
+        moves_remaining: u8,
+        config: GameConfig,
+        board_radius: Option<i32>,
+    ) -> Self {
         assert!(moves_remaining == 1 || moves_remaining == 2);
+        if let Some(radius) = board_radius {
+            assert!(radius >= 1, "board_radius must be >= 1");
+            assert!(
+                stones
+                    .iter()
+                    .all(|&(coord, _)| inside_board_radius(coord, radius)),
+                "from_state: stones must lie inside board_radius"
+            );
+        }
         let mut board = Board::new();
         // Board::new() seeds (0,0)=P1; replay the rest from the input.
         for &(coord, player) in stones {
@@ -238,8 +305,12 @@ impl GameState {
                 .expect("from_state: stones must not collide");
         }
         let offsets: Arc<[Coord]> = hex_offsets(config.placement_radius).into();
-        let cached_legal: CoordSet =
-            legal_moves(&board, config.placement_radius).into_iter().collect();
+        let cached_legal: CoordSet = legal_moves(&board, config.placement_radius)
+            .into_iter()
+            .filter(|&coord| {
+                board_radius.map_or(true, |radius| inside_board_radius(coord, radius))
+            })
+            .collect();
         let turn = match current_player {
             Player::P1 => TurnState::P1Turn { moves_left: moves_remaining },
             Player::P2 => TurnState::P2Turn { moves_left: moves_remaining },
@@ -253,6 +324,7 @@ impl GameState {
             winner: None,
             offsets,
             cached_legal,
+            board_radius,
         }
     }
 }
@@ -298,6 +370,30 @@ mod tests {
             "expected P1 stone at origin, got {:?}",
             stones
         );
+    }
+
+    #[test]
+    fn finite_board_is_a_d6_symmetric_hexagon() {
+        let config = GameConfig {
+            win_length: 6,
+            placement_radius: 2,
+            max_moves: 100,
+        };
+        let mut gs = GameState::with_config_and_board_radius(config, Some(2));
+
+        assert_eq!(gs.board_radius(), Some(2));
+        assert_eq!(gs.legal_move_count(), 18);
+        assert!(gs.legal_moves().iter().all(|&coord| {
+            inside_board_radius(coord, 2)
+        }));
+        for boundary in [(2, 0), (0, 2), (-2, 2), (-2, 0), (0, -2), (2, -2)] {
+            assert!(gs.legal_moves_set().contains(&boundary));
+        }
+        assert_eq!(gs.apply_move((2, 2)), Err(MoveError::OutOfRange));
+        gs.apply_move((2, 0)).unwrap();
+        assert!(gs.legal_moves().iter().all(|&coord| {
+            inside_board_radius(coord, 2)
+        }));
     }
 
     // ------------------------------------------------------------------

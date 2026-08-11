@@ -293,6 +293,102 @@ uv run hexo-klent train \
   --init-from runs/klent/dense-from-scratch/s1/checkpoints/final.pt
 ```
 
+### Hex axial CNN backend
+
+`model.architecture = "hex_axial_cnn"` is a non-compatible student rather
+than a transcription of Axis-GINE. It applies depthwise six-neighbour hex
+convolutions, pointwise channel expansion, and bounded sliding-window
+attention along the q, r, and q+r axes. Attention is linear in line length;
+it never constructs a full line-by-line attention matrix. Inactive crop cells
+are masked throughout and normalization is per cell, so adding inactive
+padding does not alter predictions. The model deliberately does not make the
+crop periodic: a toroidal seam would introduce false neighbours and false
+winning lines on HeXO's infinite plane.
+
+The supplied S4 model has 650,202 parameters, compared with 699,658 in its
+Axis-GINE teacher. Because its tensors are not checkpoint-compatible, create
+a generation-zero KLENT checkpoint by distilling the teacher's complete legal
+policy and action-Q vectors:
+
+```console
+uv run hexo-klent distill \
+  --config configs/klent/hex-axial-cnn/s4-from-graph220-distilled.toml \
+  --teacher runs/klent/axis-gine/s4-from-mc25-tau16-alpha001-full-batch2048/checkpoints/checkpoint_000220.pt \
+  --positions 32768 \
+  --parallel-games 64 \
+  --epochs 4 \
+  --batch-size 2048 \
+  --no-student-compile \
+  --learning-rate 1e-3
+```
+
+`--no-student-compile` is a distillation-only execution override for ROCm
+Inductor builds that cannot compile the axial attention backward graph. It
+does not change the checkpoint's saved `run.compile = true` setting used by
+subsequent KLENT training.
+
+Use `--init-student CHECKPOINT` to continue a representation-compatible CNN
+from fresh teacher games. The restore is strict: every model setting and state
+tensor must match. Distillation reports held-out policy KL, Q MSE, top-1
+agreement, and the weighted validation objective after every epoch. A bounded
+adaptive continuation can set a generous `--epochs` maximum together with
+`--early-stop-patience` and `--early-stop-min-delta`. The final fitted epoch is
+saved by default because closer imitation is not necessarily greater playing
+strength; `--restore-best-fit` instead selects the epoch with the lowest
+held-out imitation objective. Optional
+`--target-policy-kl`, `--target-q-mse`, and `--target-top1` stop early once all
+specified targets are met. Top-1 is a fraction on the command line, so 25%
+is written as `--target-top1 0.25`.
+
+`model.architecture = "hex_d6_dilated_cnn"` is the exact-symmetry variant of
+the gated multiscale CNN. Its three undirected axial branches share one line
+kernel, each line ties its reflected endpoints, and the content gate obeys the
+same sharing. Consequently every intermediate feature is a D6 scalar field and
+the complete policy/Q function is rotation- and reflection-equivariant by
+construction. It does not pay for six or twelve orientation feature copies.
+
+An existing `hex_dilated_cnn` distillation can be supplied through
+`--init-student`. The loader copies all compatible trunk/head tensors and
+orbit-averages the learned spatial parameters into the exact model before
+continuing distillation. This is a lossy projection only for the old model's
+orientation-dependent component; the source checkpoint is never modified.
+
+The original planar CNNs are translation-equivariant but are not D6-invariant
+by construction. `--augment-symmetries` transforms each training state and
+permutes its complete policy/Q labels on a balanced 12-orientation schedule;
+each example sees every rotation/reflection once per twelve epochs. Held-out
+validation remains in the original orientation. This teaches approximate D6
+invariance without the 12x inference cost of averaging an ensemble, but it
+does not turn the CNN architecture itself into a mathematically exact
+invariant network.
+
+Playing strength can diverge from exact teacher agreement. Set
+`--strength-eval-interval 5` to run the configured paired-opening protocol
+every five epochs against both the graph teacher and the student from five
+epochs earlier (the initialization checkpoint is epoch zero). The defaults
+use 32 games at 24 simulations and 8 retained actions; override them with the
+`--strength-eval-*` options. Evaluation-point checkpoints are retained under
+`distillation_epochs/`, while every epoch is appended to
+`distillation-metrics.jsonl` for live monitoring and later comparison.
+
+Distillation is terminal-only by default, like ordinary KLENT collection. For
+opening/tactics-heavy imitation, `--teacher-horizon 64` instead retains the
+first 64 placements of each teacher game. This is safe only for distillation:
+the examples use frozen teacher policy/Q labels and never construct outcome
+returns from the incomplete games. Ordinary KLENT FIT remains terminal-only,
+and spatial/chunk safety truncations are always discarded. The command
+atomically writes `checkpoint_000000.pt` plus a provenance report and refuses
+to overwrite an existing result. It saves a fresh AdamW state at the config's
+KLENT learning rate rather than carrying distillation optimizer moments into
+on-policy learning. Continue normally:
+
+```console
+uv run hexo-klent train \
+  --config configs/klent/hex-axial-cnn/s4-from-graph220-distilled.toml \
+  --resume latest \
+  --tui
+```
+
 Ctrl-C is handled by the parent process: it stops and reaps the persistent
 actors, closes TensorBoard, and exits with status 130 without child-process
 tracebacks. An interrupted iteration is not added to `metrics.jsonl` and does
@@ -542,6 +638,7 @@ Each named opponent emits `evaluation/<name>/...`:
 | `configured_depth` | SealBot's configured fixed maximum depth, when applicable. |
 | `placement_radius` | Radius actually used for this opponent, including any opponent-level override. |
 | `mcts_simulations`, `mcts_actions` | Model-side Gumbel MCTS budget. Zero simulations means greedy raw-policy play. |
+| `configured_interval` | Effective evaluation cadence for this opponent after applying its override or the suite fallback. |
 | `opponent_mcts_simulations`, `opponent_mcts_actions` | Checkpoint-side Gumbel MCTS budget. Emitted for fixed, lagged, and best-so-far checkpoint opponents. |
 | `opening_plies`, `opening_temperature` | Paired-opening settings used by fixed, lagged, and best-so-far checkpoint opponents. Eight plies are four complete two-placement HeXO turns. |
 | `configured_lag_iterations` | Requested generation distance for a lagged opponent. |
@@ -563,6 +660,8 @@ opening_generator = "alternate"
 [[evaluation.opponents]]
 name = "random"
 kind = "random"
+# Optional. Omit to inherit evaluation.interval; zero disables this opponent.
+interval = 5
 games = 64
 
 [[evaluation.opponents]]
@@ -615,6 +714,13 @@ mcts_actions = 8
 opponent_mcts_simulations = 24
 opponent_mcts_actions = 8
 ```
+
+`evaluation.interval` is the default cadence. An opponent-level `interval`
+overrides it, allowing cheap lagged, best-so-far, random, or shallow SealBot
+probes to run more frequently than expensive fixed-checkpoint matches. An
+explicit opponent interval of zero disables that opponent without removing its
+configuration. Existing configs that omit opponent intervals retain their
+current suite-wide scheduling exactly.
 
 Each opponent faces the KLENT model with sides alternated between games.
 Fixed and lagged checkpoint matches additionally use the same paired-opening

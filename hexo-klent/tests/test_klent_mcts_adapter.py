@@ -99,7 +99,14 @@ def test_adapter_does_not_reimprove_policy_for_test_time_value():
 
 @pytest.mark.parametrize(
     "architecture",
-    ["graph", "dense_axis", "persistent_ray_axis"],
+    [
+        "graph",
+        "dense_axis",
+        "persistent_ray_axis",
+        "hex_axial_cnn",
+        "hex_dilated_cnn",
+        "hex_d6_dilated_cnn",
+    ],
 )
 def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(
     tmp_path,
@@ -107,13 +114,27 @@ def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(
 ):
     config = (
         tiny_dense_model_config()
-        if architecture in {"dense_axis", "persistent_ray_axis"}
+        if architecture in {
+            "dense_axis",
+            "persistent_ray_axis",
+            "hex_axial_cnn",
+            "hex_dilated_cnn",
+            "hex_d6_dilated_cnn",
+        }
         else tiny_model_config()
     )
     if architecture == "persistent_ray_axis":
         config.architecture = architecture
         config.ray_channels = 4
         config.ray_update_hidden = 8
+    elif architecture == "hex_axial_cnn":
+        config.architecture = architecture
+        config.axial_attention_radius = 2
+        config.axial_attention_layers = [0]
+    elif architecture in {"hex_dilated_cnn", "hex_d6_dilated_cnn"}:
+        config.architecture = architecture
+        config.num_layers = 2
+        config.cnn_dilations = [1, 2]
     algorithm = AlgorithmConfig()
     network = make_klent_net(config)
     checkpoint_path = tmp_path / f"klent-{architecture}.pt"

@@ -109,6 +109,157 @@ def _parser() -> argparse.ArgumentParser:
     )
     train.add_argument("-v", "--verbose", action="store_true")
 
+    distill = subparsers.add_parser(
+        "distill",
+        help="distill a graph KLENT checkpoint into a native hex CNN",
+    )
+    distill.add_argument("--config", required=True, help="target TOML configuration")
+    distill.add_argument("--teacher", required=True, help="graph KLENT checkpoint")
+    distill.add_argument(
+        "--init-student",
+        help=(
+            "initialize the target CNN weights from an earlier distilled "
+            "checkpoint before fitting fresh teacher positions"
+        ),
+    )
+    distill.add_argument(
+        "--positions",
+        type=int,
+        help="teacher positions to collect (default: config collection size)",
+    )
+    distill.add_argument(
+        "--parallel-games",
+        type=int,
+        help=(
+            "distillation-only live lane count; does not alter the saved "
+            "KLENT training config"
+        ),
+    )
+    distill.add_argument(
+        "--teacher-horizon",
+        type=int,
+        help=(
+            "distillation-only teacher prefix length in placements; "
+            "horizon-capped prefixes are retained because distillation uses "
+            "teacher policy/Q labels rather than outcome returns"
+        ),
+    )
+    distill.add_argument("--epochs", type=int, default=4)
+    distill.add_argument(
+        "--augment-symmetries",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "train on a balanced schedule of all 12 D6 rotations/reflections; "
+            "validation remains in the original orientation"
+        ),
+    )
+    distill.add_argument(
+        "--batch-size",
+        type=int,
+        help="logical distillation batch (default: config training batch)",
+    )
+    distill.add_argument("--validation-positions", type=int, default=2_048)
+    distill.add_argument("--device", help="override run.device")
+    distill.add_argument(
+        "--precision",
+        choices=("float32", "bf16"),
+        help="override run.precision",
+    )
+    distill.add_argument(
+        "--workers",
+        type=int,
+        help="override collection.workers",
+    )
+    distill.add_argument(
+        "--output",
+        help=(
+            "checkpoint path (default: run.output_dir/checkpoints/"
+            "checkpoint_000000.pt)"
+        ),
+    )
+    distill.add_argument("--temperature", type=float, default=1.0)
+    distill.add_argument("--policy-weight", type=float, default=1.0)
+    distill.add_argument("--q-weight", type=float, default=1.0)
+    distill.add_argument("--learning-rate", type=float, default=1e-3)
+    distill.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help=(
+            "stop after this many epochs without a meaningful held-out "
+            "objective improvement (0 disables plateau stopping)"
+        ),
+    )
+    distill.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="absolute held-out objective improvement required to reset patience",
+    )
+    distill.add_argument(
+        "--restore-best-fit",
+        action="store_true",
+        help=(
+            "save the epoch with the lowest held-out imitation objective "
+            "instead of the final fitted epoch"
+        ),
+    )
+    distill.add_argument(
+        "--strength-eval-interval",
+        type=int,
+        default=0,
+        help=(
+            "run paired-opening matches against the graph teacher and an "
+            "equally lagged student every N epochs (0 disables)"
+        ),
+    )
+    distill.add_argument(
+        "--strength-eval-games",
+        type=int,
+        default=32,
+        help="games per periodic distillation strength opponent",
+    )
+    distill.add_argument(
+        "--strength-eval-mcts-simulations",
+        type=int,
+        default=24,
+    )
+    distill.add_argument(
+        "--strength-eval-mcts-actions",
+        type=int,
+        default=8,
+    )
+    distill.add_argument(
+        "--target-policy-kl",
+        type=float,
+        help="stop once held-out policy KL is at or below this value",
+    )
+    distill.add_argument(
+        "--target-q-mse",
+        type=float,
+        help="stop once held-out Q MSE is at or below this value",
+    )
+    distill.add_argument(
+        "--target-top1",
+        type=float,
+        help=(
+            "stop once held-out policy top-1 agreement reaches this fraction; "
+            "all configured targets must be met"
+        ),
+    )
+    distill.add_argument(
+        "--student-compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "compile the student FIT core (default: run.compile); "
+            "--no-student-compile does not alter the saved training config"
+        ),
+    )
+    distill.add_argument("--seed", type=int)
+    distill.add_argument("-v", "--verbose", action="store_true")
+
     sprt = subparsers.add_parser(
         "sprt",
         help="run a fixed-checkpoint pentanomial SPRT match",
@@ -214,6 +365,65 @@ def main(argv: list[str] | None = None) -> None:
         finally:
             if dashboard is not None:
                 dashboard.close()
+    elif args.command == "distill":
+        from hexo_a0.gpu_memory import configure_cuda_alloc
+
+        configure_cuda_alloc()
+        from hexo_klent.config import load_config
+        from hexo_klent.distill import distill_checkpoint
+
+        config = load_config(args.config)
+        if args.workers is not None:
+            if args.workers <= 0:
+                raise SystemExit("--workers must be positive")
+            config.collection.workers = args.workers
+        positions = (
+            config.collection.positions_per_iteration
+            if args.positions is None
+            else args.positions
+        )
+        batch_size = (
+            config.training.batch_size
+            if args.batch_size is None
+            else args.batch_size
+        )
+        try:
+            distill_checkpoint(
+                config,
+                args.teacher,
+                positions=positions,
+                epochs=args.epochs,
+                batch_size=batch_size,
+                validation_positions=args.validation_positions,
+                device_str=args.device,
+                precision=args.precision,
+                output=args.output,
+                temperature=args.temperature,
+                policy_weight=args.policy_weight,
+                q_weight=args.q_weight,
+                learning_rate=args.learning_rate,
+                parallel_games=args.parallel_games,
+                teacher_horizon=args.teacher_horizon,
+                augment_symmetries=args.augment_symmetries,
+                student_compile=args.student_compile,
+                student_checkpoint=args.init_student,
+                seed=args.seed,
+                early_stop_patience=args.early_stop_patience,
+                early_stop_min_delta=args.early_stop_min_delta,
+                restore_best_fit=args.restore_best_fit,
+                strength_eval_interval=args.strength_eval_interval,
+                strength_eval_games=args.strength_eval_games,
+                strength_eval_mcts_simulations=(
+                    args.strength_eval_mcts_simulations
+                ),
+                strength_eval_mcts_actions=args.strength_eval_mcts_actions,
+                target_policy_kl=args.target_policy_kl,
+                target_q_mse=args.target_q_mse,
+                target_top1=args.target_top1,
+            )
+        except KeyboardInterrupt:
+            logger.info("distillation interrupted before checkpoint commit")
+            raise SystemExit(130) from None
     elif args.command == "sprt":
         from hexo_a0.gpu_memory import configure_cuda_alloc
 

@@ -33,7 +33,13 @@ from hexo_klent.batching import (
     prepare_graph_batches,
     raster_shape,
 )
-from hexo_klent.config import Config, KlentModelConfig, TrainingConfig
+from hexo_klent.config import (
+    Config,
+    KlentModelConfig,
+    TrainingConfig,
+    evaluation_opponent_interval,
+    evaluation_opponent_is_due,
+)
 from hexo_klent.evaluation import (
     CheckpointOpponentCache,
     evaluate_opponent,
@@ -42,6 +48,7 @@ from hexo_klent.model import (
     DenseAxisKlentNet,
     KlentNet,
     PersistentRayKlentNet,
+    RasterKlentNet,
     compile_klent_forward,
     is_dense_axis_config,
     load_dense_klent_graft,
@@ -615,7 +622,7 @@ def _attach_search_q_teacher_labels(
 
 
 def _measure_auxiliary_q_diagnostics(
-    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+    model: KlentNet | RasterKlentNet,
     samples: list[TrajectoryStep],
     *,
     model_config,
@@ -830,7 +837,7 @@ def _measure_policy_target_diagnostics(
 
 
 def _measure_policy_q_trunk_gradients(
-    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+    model: KlentNet | RasterKlentNet,
     samples: list[TrajectoryStep],
     *,
     model_config,
@@ -1492,7 +1499,7 @@ def train_epoch(
 
 @contextmanager
 def _output_heads_only_scope(
-    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+    model: KlentNet | RasterKlentNet,
     *,
     include_policy: bool,
 ) -> Iterator[list[torch.nn.Parameter]]:
@@ -1532,7 +1539,7 @@ def _output_heads_only_scope(
 
 @contextmanager
 def _critic_head_only_scope(
-    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+    model: KlentNet | RasterKlentNet,
 ) -> Iterator[list[torch.nn.Parameter]]:
     """Temporarily make the action-Q head the only trainable module."""
 
@@ -1542,7 +1549,7 @@ def _critic_head_only_scope(
 
 @contextmanager
 def _heads_only_scope(
-    model: KlentNet | DenseAxisKlentNet | PersistentRayKlentNet,
+    model: KlentNet | RasterKlentNet,
 ) -> Iterator[list[torch.nn.Parameter]]:
     """Temporarily train both output heads but not their shared trunk."""
 
@@ -1879,8 +1886,9 @@ class Trainer:
             (KlentNet, DenseAxisKlentNet, PersistentRayKlentNet),
         ):
             raise ValueError(
-                "checkpoint initialization requires a graph or dense-axis "
-                "model architecture"
+                "checkpoint initialization requires a compatible graph or "
+                "axis-transcription model; use `hexo-klent distill` for "
+                "native hex CNN architectures"
             )
 
         path = Path(path).expanduser().resolve()
@@ -2220,6 +2228,7 @@ class Trainer:
             dense_position_cell_limit=(
                 self.config.collection.dense_position_cell_limit
             ),
+            board_radius=self.config.collection.board_radius,
             workers=self.config.collection.workers,
             batch_timeout_ms=self.config.collection.batch_timeout_ms,
             device=self.device,
@@ -2599,14 +2608,14 @@ class Trainer:
 
         evaluation = self.config.evaluation
         pending_best_promotions: list[str] = []
-        if (
-            evaluation.interval > 0
-            and evaluation.opponents
-            and next_iteration % evaluation.interval == 0
-        ):
-            for opponent_index, opponent in enumerate(
-                evaluation.opponents
-            ):
+        if evaluation.opponents:
+            for opponent_index, opponent in enumerate(evaluation.opponents):
+                if not evaluation_opponent_is_due(
+                    evaluation,
+                    opponent,
+                    next_iteration,
+                ):
+                    continue
                 opponent_name = opponent.name or opponent.kind
                 evaluation_kind = opponent.kind
                 evaluation_checkpoint = opponent.checkpoint
@@ -2692,6 +2701,9 @@ class Trainer:
                 )
                 metrics[f"{prefix}/mcts_actions"] = float(
                     opponent.mcts_actions
+                )
+                metrics[f"{prefix}/configured_interval"] = float(
+                    evaluation_opponent_interval(evaluation, opponent)
                 )
                 if opponent.kind in {
                     "checkpoint",

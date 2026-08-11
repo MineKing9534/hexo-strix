@@ -14,6 +14,10 @@ from hexo_klent.config import AlgorithmConfig, KlentModelConfig
 from hexo_klent.mcts_adapter import KlentMCTSAdapter
 from hexo_klent.model import (
     DenseAxisKlentNet,
+    HexAxialCNNKlentNet,
+    HexCNNKlentNet,
+    HexD6DilatedCNNKlentNet,
+    HexDilatedCNNKlentNet,
     PersistentRayKlentNet,
     make_klent_net,
 )
@@ -45,6 +49,11 @@ def _tiny_dense_config(
         num_heads=1,
         policy_hidden=8,
         q_hidden=4,
+        cnn_dilations=(
+            [1]
+            if architecture in {"hex_dilated_cnn", "hex_d6_dilated_cnn"}
+            else []
+        ),
         pre_norm=True,
         dropout=0.0,
         graph_type="axis",
@@ -64,6 +73,9 @@ def _tiny_dense_config(
     [
         ("dense_axis", DenseAxisKlentNet),
         ("persistent_ray_axis", PersistentRayKlentNet),
+        ("hex_axial_cnn", HexAxialCNNKlentNet),
+        ("hex_dilated_cnn", HexDilatedCNNKlentNet),
+        ("hex_d6_dilated_cnn", HexD6DilatedCNNKlentNet),
     ],
 )
 def test_policy_viewer_bridges_dense_klent_checkpoint_everywhere(
@@ -77,7 +89,12 @@ def test_policy_viewer_bridges_dense_klent_checkpoint_everywhere(
     network = make_klent_net(config)
     assert isinstance(network, network_type)
     with torch.no_grad():
-        network.q_head.fc2.bias.fill_(math.atanh(0.25))
+        q_output = (
+            network.q_head[-1]
+            if isinstance(network, HexCNNKlentNet)
+            else network.q_head.fc2
+        )
+        q_output.bias.fill_(math.atanh(0.25))
 
     checkpoint = tmp_path / "dense-klent.pt"
     torch.save(
@@ -106,6 +123,7 @@ def test_policy_viewer_bridges_dense_klent_checkpoint_everywhere(
     )
     assert len(analysis["legal"]) == 6
     assert sum(analysis["probs"]) == pytest.approx(1.0)
+    assert analysis["raw_q"] == pytest.approx([0.25] * 6)
     assert analysis["value"] == pytest.approx(0.25)
     assert analysis["node_info"]
 
@@ -179,6 +197,36 @@ def test_policy_viewer_resolves_klent_checkpoint_directory_and_final(tmp_path):
         )
         == "explicit/checkpoints"
     )
+
+
+def test_policy_viewer_resolves_periodic_distillation_epoch_checkpoints(tmp_path):
+    viewer = _load_policy_viewer()
+    output_dir = tmp_path / "d6-distillation"
+    epoch_6 = (
+        output_dir
+        / "distillation_epochs"
+        / "epoch_0006"
+        / "checkpoints"
+        / "checkpoint_000000.pt"
+    )
+    epoch_12 = (
+        output_dir
+        / "distillation_epochs"
+        / "epoch_0012"
+        / "checkpoints"
+        / "checkpoint_000000.pt"
+    )
+    epoch_6.parent.mkdir(parents=True)
+    epoch_12.parent.mkdir(parents=True)
+    epoch_6.touch()
+    epoch_12.touch()
+
+    source, checkpoints = viewer._resolve_checkpoint_source(str(output_dir))
+
+    assert source == str(output_dir.resolve())
+    assert checkpoints == [str(epoch_6.resolve()), str(epoch_12.resolve())]
+    assert viewer._directory_checkpoint_count(output_dir) == 2
+    assert viewer._list_checkpoint_sources([source]) == checkpoints
 
 
 def test_policy_viewer_adds_runtime_checkpoint_sources_across_runs(tmp_path):

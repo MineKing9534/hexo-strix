@@ -1,0 +1,154 @@
+# MVP true-CNN S4 branch distilled from the graph run's best-so-far checkpoint.
+#
+# Unlike dense_axis and persistent_ray_axis, this is not a compatibility
+# transcription of Axis-GINE. It consumes the common HXR1 raster with a
+# depthwise hex-neighbour convolution, pointwise channel mixing, and bounded
+# content-dependent attention along q, r, and q+r lines. The windowed attention
+# is linear in line length and does not materialize all-pairs line matrices.
+#
+# First create the generation-zero checkpoint while no other trainer owns the
+# GPU (the command refuses to overwrite an existing result):
+#
+#   .venv/bin/hexo-klent distill \
+#     --config configs/klent/hex-axial-cnn/s4-from-graph220-distilled.toml \
+#     --teacher runs/klent/axis-gine/s4-from-mc25-tau16-alpha001-full-batch2048/checkpoints/checkpoint_000220.pt \
+#     --positions 32768 --parallel-games 64 \
+#     --epochs 4 --batch-size 2048 --no-student-compile \
+#     --learning-rate 1e-3
+#
+# The distilled checkpoint contains fresh KLENT AdamW state, so ordinary
+# terminal-only on-policy training starts with:
+#
+#   .venv/bin/hexo-klent train \
+#     --config configs/klent/hex-axial-cnn/s4-from-graph220-distilled.toml \
+#     --resume latest --tui
+
+[model]
+architecture = "hex_axial_cnn"
+dense_ray_radius = 5
+
+hidden_dim = 128
+num_layers = 6
+num_heads = 8
+dropout = 0.0
+policy_hidden = 128
+q_hidden = 64
+
+axial_attention_radius = 8
+axial_attention_layers = [1, 3, 5]
+cnn_expansion = 2
+
+# HXR1 schema controls shared with the other raster backends.
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 8
+rollout_horizon = 500
+
+[algorithm]
+alpha = 0.01
+beta = 0.10
+tau = 16.0
+
+[collection]
+positions_per_iteration = 131_072
+parallel_games = 512
+inference_batch_size = 256
+inference_edge_budget = 1_000_000
+dense_position_cell_limit = 200_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 2_048
+edge_budget = 500_000
+policy_diagnostic_samples = 2_048
+grad_accumulation = true
+prefetch_batches = true
+fit_max_autotune = false
+fit_compile_seed_nodes = 0
+learning_rate = 5e-5
+learning_rate_warmup_iterations = 5
+learning_rate_warmup_start_iteration = 0
+learning_rate_warmup_start_factor = 0.1
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 0.0
+critic_head_only = false
+heads_only = false
+
+[evaluation]
+interval = 10
+opening_plies = 8
+opening_temperature = 0.5
+opening_generator = "alternate"
+
+[[evaluation.opponents]]
+name = "source_graph_gen220"
+kind = "checkpoint"
+checkpoint = "runs/klent/axis-gine/s4-from-mc25-tau16-alpha001-full-batch2048/checkpoints/checkpoint_000220.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "source_d6_qhead_215547"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00215547.pt"
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "best_so_far"
+kind = "best_so_far"
+checkpoint = "runs/klent/axis-gine/s4-from-mc25-tau16-alpha001-full-batch2048/checkpoints/checkpoint_000220.pt"
+best_promotion_win_rate = 0.55
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "lag_5"
+kind = "lagged"
+lag_iterations = 5
+games = 32
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[[evaluation.opponents]]
+name = "sealbot_r8_d4"
+kind = "sealbot"
+games = 8
+depth = 4
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+
+[run]
+iterations = 20
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/hex-axial-cnn/s4-from-graph220-distilled"
+checkpoint_interval = 1
+seed = 0

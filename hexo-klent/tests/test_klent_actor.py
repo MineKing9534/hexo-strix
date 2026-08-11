@@ -15,6 +15,7 @@ from hexo_klent.actor import (
     flatten_trajectories,
     terminal_played_q_calibration,
 )
+from hexo_klent.batching import raster_shape
 from hexo_klent.config import AlgorithmConfig, GameConfig
 from hexo_klent.model import KlentNet
 
@@ -105,6 +106,35 @@ def test_collect_games_drains_to_terminal_games_with_fresh_targets():
         / len(samples)
     )
     assert stats.mean_q_span == pytest.approx(0.0)
+
+
+def test_collect_games_confines_play_to_d6_symmetric_finite_board():
+    model_config = tiny_model_config()
+    model = KlentNet(model_config)
+    board_radius = 2
+
+    trajectories, stats = collect_games(
+        model,
+        model_config=model_config,
+        game_config=GameConfig(
+            win_length=2, placement_radius=2, rollout_horizon=8
+        ),
+        algorithm=AlgorithmConfig(),
+        positions=12,
+        parallel_games=2,
+        inference_batch_size=2,
+        board_radius=board_radius,
+        device=torch.device("cpu"),
+        seed=17,
+    )
+
+    assert stats.positions >= 12
+    for sample in flatten_trajectories(trajectories):
+        assert sample.state.board_radius() == board_radius
+        height, width = raster_shape(sample.state)
+        assert height == width
+        for q, r in sample.state.legal_moves():
+            assert max(abs(q), abs(r), abs(q + r)) <= board_radius
 
 
 def test_terminal_played_q_calibration_uses_terminal_player_outcomes():
@@ -220,6 +250,41 @@ def test_rollout_horizon_discards_the_entire_nonterminal_game():
     assert trajectories == []
 
 
+def test_distillation_can_retain_horizon_capped_teacher_prefixes():
+    model_config = tiny_model_config()
+    model = KlentNet(model_config)
+
+    trajectories, stats = collect_games(
+        model,
+        model_config=model_config,
+        game_config=GameConfig(
+            win_length=6, placement_radius=1, rollout_horizon=2
+        ),
+        algorithm=AlgorithmConfig(),
+        positions=4,
+        parallel_games=2,
+        inference_batch_size=2,
+        device=torch.device("cpu"),
+        seed=17,
+        retain_horizon_truncations=True,
+    )
+
+    assert stats.truncations == 2
+    assert stats.horizon_truncations == 2
+    assert stats.spatial_truncations == 0
+    assert stats.chunk_truncations == 0
+    assert stats.positions == 4
+    assert stats.discarded_positions == 0
+    assert len(trajectories) == 2
+    assert all(trajectory.truncated for trajectory in trajectories)
+    assert all(trajectory.winner is None for trajectory in trajectories)
+    assert all(
+        step.return_target is None
+        for trajectory in trajectories
+        for step in trajectory.steps
+    )
+
+
 def test_position_budget_drains_live_games_to_terminal_results():
     model_config = tiny_model_config()
     model = KlentNet(model_config)
@@ -288,6 +353,7 @@ def test_dense_spatial_boundary_discards_wandering_games():
         dense_position_cell_limit=17 * 17,
         seed=29,
         worker_processes=1,
+        retain_horizon_truncations=True,
     )
 
     assert stats.positions == 0

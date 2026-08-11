@@ -2,7 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from hexo_klent.config import load_config
+from hexo_klent.config import (
+    evaluation_opponent_interval,
+    load_config,
+)
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "config.toml"
@@ -18,6 +21,7 @@ def test_config_fixture_loads_algorithm_collection_and_model():
     assert config.model.node_coords is False
     assert config.collection.positions_per_iteration == 16
     assert config.collection.parallel_games == 4
+    assert config.collection.board_radius == 0
     assert config.collection.workers == 2
     assert config.training.grad_accumulation is True
     assert config.training.prefetch_batches is False
@@ -105,6 +109,24 @@ def test_parallel_games_cannot_exceed_position_budget(tmp_path):
         ValueError,
         match="parallel_games cannot exceed.*positions_per_iteration",
     ):
+        load_config(path)
+
+
+def test_finite_collection_board_radius_loads_and_must_be_nonnegative(
+    tmp_path,
+):
+    path = tmp_path / "finite-board.toml"
+    path.write_text(
+        "[collection]\nboard_radius = 20\n",
+        encoding="utf-8",
+    )
+    assert load_config(path).collection.board_radius == 20
+
+    path.write_text(
+        "[collection]\nboard_radius = -1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="board_radius cannot be negative"):
         load_config(path)
 
 
@@ -295,6 +317,89 @@ def test_persistent_ray_rejects_invalid_branch_layer(tmp_path):
         load_config(path)
 
 
+def test_hex_axial_cnn_loads_attention_configuration(tmp_path):
+    path = tmp_path / "hex-axial-cnn.toml"
+    path.write_text(
+        "[model]\n"
+        'architecture = "hex_axial_cnn"\n'
+        "hidden_dim = 32\n"
+        "num_layers = 4\n"
+        "num_heads = 4\n"
+        "axial_attention_radius = 6\n"
+        "axial_attention_layers = [1, 3]\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.model.architecture == "hex_axial_cnn"
+    assert config.model.axial_attention_radius == 6
+    assert config.model.axial_attention_layers == [1, 3]
+
+
+def test_hex_axial_cnn_rejects_invalid_attention_layer(tmp_path):
+    path = tmp_path / "bad-hex-axial-cnn.toml"
+    path.write_text(
+        "[model]\n"
+        'architecture = "hex_axial_cnn"\n'
+        "num_layers = 2\n"
+        "axial_attention_layers = [2]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="axial_attention_layers"):
+        load_config(path)
+
+
+def test_hex_dilated_cnn_loads_multiscale_dilations(tmp_path):
+    path = tmp_path / "hex-dilated-cnn.toml"
+    path.write_text(
+        "[model]\n"
+        'architecture = "hex_dilated_cnn"\n'
+        "hidden_dim = 32\n"
+        "num_layers = 4\n"
+        "cnn_dilations = [1, 2, 4, 8]\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.model.architecture == "hex_dilated_cnn"
+    assert config.model.cnn_dilations == [1, 2, 4, 8]
+
+
+def test_hex_dilated_cnn_requires_one_dilation_per_layer(tmp_path):
+    path = tmp_path / "bad-hex-dilated-cnn.toml"
+    path.write_text(
+        "[model]\n"
+        'architecture = "hex_dilated_cnn"\n'
+        "num_layers = 4\n"
+        "cnn_dilations = [1, 2, 4]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="cnn_dilations"):
+        load_config(path)
+
+
+def test_hex_d6_dilated_cnn_loads_multiscale_dilations(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[model]\n"
+        'architecture = "hex_d6_dilated_cnn"\n'
+        "hidden_dim = 32\n"
+        "num_layers = 4\n"
+        "cnn_expansion = 3\n"
+        "cnn_dilations = [1, 2, 4, 8]\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.model.architecture == "hex_d6_dilated_cnn"
+    assert config.model.cnn_dilations == [1, 2, 4, 8]
+
+
 def test_sealbot_opponent_requires_fixed_depth(tmp_path):
     path = tmp_path / "sealbot-without-depth.toml"
     path.write_text(
@@ -409,6 +514,52 @@ def test_lagged_opponent_loads_shared_search_budget(tmp_path):
     assert opponent.lag_iterations == 250
     assert opponent.mcts_simulations == 24
     assert opponent.mcts_actions == 8
+
+
+def test_opponent_interval_overrides_suite_fallback(tmp_path):
+    path = tmp_path / "opponent-intervals.toml"
+    path.write_text(
+        "[evaluation]\n"
+        "interval = 10\n"
+        "[[evaluation.opponents]]\n"
+        'name = "inherited"\n'
+        'kind = "random"\n'
+        "games = 4\n"
+        "[[evaluation.opponents]]\n"
+        'name = "frequent"\n'
+        'kind = "random"\n'
+        "interval = 3\n"
+        "games = 4\n"
+        "[[evaluation.opponents]]\n"
+        'name = "disabled"\n'
+        'kind = "random"\n'
+        "interval = 0\n"
+        "games = 4\n",
+        encoding="utf-8",
+    )
+
+    evaluation = load_config(path).evaluation
+    assert [
+        evaluation_opponent_interval(evaluation, opponent)
+        for opponent in evaluation.opponents
+    ] == [10, 3, 0]
+
+
+def test_opponent_interval_cannot_be_negative(tmp_path):
+    path = tmp_path / "negative-opponent-interval.toml"
+    path.write_text(
+        "[[evaluation.opponents]]\n"
+        'kind = "random"\n'
+        "interval = -1\n"
+        "games = 4\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="evaluation opponent interval cannot be negative",
+    ):
+        load_config(path)
 
 
 def test_best_so_far_opponent_loads_initial_checkpoint_and_threshold(tmp_path):

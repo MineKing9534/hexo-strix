@@ -52,7 +52,7 @@ def _load_model(ckpt_path: str):
         # policy/value heads. Reuse the evaluation adapter so the viewer sees
         # the same derived state value as self-play and MCTS:
         # V(s) = E_{pi_improved}[Q(s, a)]. This also reconstructs the dense
-        # raster backend for dense_axis and persistent_ray_axis.
+        # raster backend for all KLENT dense execution architectures.
         from hexo_klent.mcts_adapter import adapt_checkpoint
 
         loaded = adapt_checkpoint(ckpt, torch.device("cpu"))
@@ -108,6 +108,34 @@ def _evaluate_states(model, mc, states):
     return (
         [torch.as_tensor(chunk, dtype=torch.float32) for chunk in logits],
         torch.as_tensor(values, dtype=torch.float32),
+    )
+
+
+def _evaluate_klent_state(model, mc, state):
+    """Return native KLENT logits, Q, and derived value in one forward."""
+
+    network = getattr(model, "network", None)
+    if network is None:
+        return None
+    from hexo_klent.batching import prepare_graph_batches
+
+    prepared = prepare_graph_batches(
+        [state],
+        model_config=mc,
+        edge_budget=0,
+    )
+    if len(prepared) != 1 or prepared[0][1] != slice(0, 1):
+        raise RuntimeError("single-state KLENT Q evaluation split unexpectedly")
+    batch, _state_slice = prepared[0]
+    with torch.inference_mode():
+        output = network.forward_batch(batch)
+    if output.legal_counts.tolist() != [len(state.legal_moves())]:
+        raise RuntimeError("KLENT output count does not match legal moves")
+    values = model._state_values(output)
+    return (
+        output.policy_logits.detach().float().cpu(),
+        output.q_values.detach().float().cpu(),
+        values.detach().float().cpu()[0],
     )
 
 
@@ -208,7 +236,8 @@ def _analyze(moves, checkpoint, win_length, placement_radius, max_moves,
     if state.is_terminal():
         winner = state.winner()
         return {
-            "legal": [], "probs": [], "logits": [], "value": 0.0,
+            "legal": [], "probs": [], "logits": [], "raw_q": None,
+            "value": 0.0,
             "stones": state.placed_stones(),
             "entropy": 0.0, "max_entropy": 0.0,
             "threats": [], "graph_edges": [], "node_info": [],
@@ -217,11 +246,18 @@ def _analyze(moves, checkpoint, win_length, placement_radius, max_moves,
 
     data = _make_graph_fn(mc)(state)
 
-    # Always get raw logits + value from the network
-    raw_chunks, raw_values = _evaluate_states(model, mc, [state])
-    raw_logits = raw_chunks[0]
-    raw_value = raw_values[0]
+    # KLENT exposes policy and per-action Q from the same native forward. Keep
+    # production policy/value checkpoints on the established evaluator path.
+    klent_state = _evaluate_klent_state(model, mc, state)
+    if klent_state is None:
+        raw_chunks, raw_values = _evaluate_states(model, mc, [state])
+        raw_logits = raw_chunks[0]
+        raw_value = raw_values[0]
+        raw_q_tensor = None
+    else:
+        raw_logits, raw_q_tensor, raw_value = klent_state
     logits_list = raw_logits.tolist()          # list[float]
+    raw_q = raw_q_tensor.tolist() if raw_q_tensor is not None else None
     value = float(raw_value.item())            # float
     legal_coords = [list(coord) for coord in state.legal_moves()]
 
@@ -354,6 +390,7 @@ def _analyze(moves, checkpoint, win_length, placement_radius, max_moves,
     return {
         "legal": legal_coords,
         "probs": probs,
+        "raw_q": raw_q,
         "q_hat": q_hat,
         "improved_policy": improved_pol,
         "candidate_set": candidate_set,
@@ -512,6 +549,48 @@ def _list_checkpoints(ckpt_dir: str):
     return out
 
 
+def _list_distillation_epoch_checkpoints(run_dir: str) -> list[str]:
+    """Return periodic distillation snapshots in ascending epoch order."""
+
+    path = Path(run_dir)
+    epochs_dir = (
+        path
+        if path.name == "distillation_epochs"
+        else path / "distillation_epochs"
+    )
+    if not epochs_dir.is_dir():
+        return []
+
+    epoch_dirs: list[tuple[int, Path]] = []
+    for child in epochs_dir.glob("epoch_*"):
+        if not child.is_dir():
+            continue
+        try:
+            epoch = int(child.name.removeprefix("epoch_"))
+        except ValueError:
+            continue
+        epoch_dirs.append((epoch, child))
+
+    checkpoints: list[str] = []
+    for _epoch, epoch_dir in sorted(epoch_dirs):
+        checkpoints.extend(_list_checkpoints(str(epoch_dir)))
+        nested = epoch_dir / "checkpoints"
+        if nested.is_dir():
+            checkpoints.extend(_list_checkpoints(str(nested)))
+    return list(dict.fromkeys(checkpoints))
+
+
+def _list_source_directory_checkpoints(path: Path) -> list[str]:
+    """List conventional and periodic-distillation checkpoints for a directory."""
+
+    checkpoints = _list_checkpoints(str(path))
+    nested = path / "checkpoints"
+    if nested.is_dir():
+        checkpoints.extend(_list_checkpoints(str(nested)))
+    checkpoints.extend(_list_distillation_epoch_checkpoints(str(path)))
+    return list(dict.fromkeys(checkpoints))
+
+
 def _resolve_checkpoint_source(source: str) -> tuple[str, list[str]]:
     """Resolve a runtime source into its canonical path and checkpoints.
 
@@ -536,17 +615,11 @@ def _resolve_checkpoint_source(source: str) -> tuple[str, list[str]]:
     if not path.is_dir():
         raise ValueError(f"Checkpoint source is not a file or directory: {path}")
 
-    checkpoints = _list_checkpoints(str(path))
-    nested = path / "checkpoints"
-    if nested.is_dir():
-        checkpoints.extend(_list_checkpoints(str(nested)))
-
-    # A malformed run can expose the same file through both conventions.
-    checkpoints = list(dict.fromkeys(checkpoints))
+    checkpoints = _list_source_directory_checkpoints(path)
     if not checkpoints:
         raise ValueError(
-            f"No checkpoint_*.pt, final.pt, or self_play/champion.pt found in {path}"
-            " (or its checkpoints/ directory)"
+            f"No checkpoint_*.pt, final.pt, self_play/champion.pt, or "
+            f"distillation epoch checkpoint found in {path}"
         )
     return str(path), checkpoints
 
@@ -571,13 +644,10 @@ def _directory_checkpoint_count(path: Path) -> int:
     """Count checkpoints selectable by adding ``path`` as a source."""
 
     try:
-        checkpoints = _list_checkpoints(str(path))
-        nested = path / "checkpoints"
-        if nested.is_dir():
-            checkpoints.extend(_list_checkpoints(str(nested)))
+        checkpoints = _list_source_directory_checkpoints(path)
     except OSError:
         return 0
-    return len(dict.fromkeys(checkpoints))
+    return len(checkpoints)
 
 
 def _browse_directories(path: str = "", default_root: str = "runs") -> dict:
@@ -786,6 +856,14 @@ svg.panning { cursor: grabbing; }
       <label style="font-size:11px">Sims <input id="mcts-sims" type="number" value="128" min="1" max="1000" style="width:60px"></label>
       <label style="font-size:11px;margin-left:8px">m <input id="mcts-m" type="number" value="16" min="1" max="128" style="width:50px"></label>
     </div>
+  </div>
+  <div id="policy-overlay-controls" style="margin-top:8px;padding:8px;background:#0a1a30;border-radius:4px;font-size:12px">
+    <div style="color:#aaa;font-weight:bold;margin-bottom:5px">Board overlay</div>
+    <div style="display:flex;gap:4px">
+      <button id="overlay-policy" onclick="setPolicyOverlay('policy')" style="flex:1;width:auto;margin-top:0;padding:5px;font-size:11px">Policy</button>
+      <button id="overlay-q" onclick="setPolicyOverlay('q')" disabled title="Load a KLENT checkpoint to view its action values" style="flex:1;width:auto;margin-top:0;padding:5px;font-size:11px;background:#555;color:#888">KLENT Q</button>
+    </div>
+    <div id="policy-overlay-note" style="margin-top:5px;color:#888;line-height:1.35">Policy probability heatmap.</div>
   </div>
   <label><input type="checkbox" id="auto-analyze" style="width:auto"> Auto-analyze on click</label>
   <div style="margin-top:10px;display:flex;gap:4px">
@@ -1001,6 +1079,8 @@ let isPanning = false, panStartX = 0, panStartY = 0, panStartVX = 0, panStartVY 
 let wasDragging = false;
 let selectedNode = null; // {q, r} of node whose edges to highlight
 let viewMode = 'policy'; // 'policy' or 'graph'
+let policyOverlay = 'policy'; // 'policy' or native per-action KLENT 'q'
+let analysisCheckpointLabel = '';
 const AXIS_COLORS = ['#ff6b6b', '#6bff6b', '#6b6bff']; // (1,0)=red, (0,1)=green, (1,-1)=blue
 const AXIS_NAMES = ['(1,0)', '(0,1)', '(1,-1)'];
 
@@ -1049,7 +1129,37 @@ function setMode(m) {
   if (m === 'setup') {
     analysisResult = null; // analysis from previous mode no longer aligned
   }
+  updatePolicyOverlayControls();
   updateReplayUI();
+  drawBoard();
+}
+
+function updatePolicyOverlayControls() {
+  const policyButton = document.getElementById('overlay-policy');
+  const qButton = document.getElementById('overlay-q');
+  const note = document.getElementById('policy-overlay-note');
+  const qAvailable = !!(analysisResult && Array.isArray(analysisResult.raw_q));
+  if (policyOverlay === 'q' && !qAvailable) policyOverlay = 'policy';
+  qButton.disabled = !qAvailable;
+  for (const [button, active] of [
+    [policyButton, policyOverlay === 'policy'],
+    [qButton, policyOverlay === 'q'],
+  ]) {
+    button.style.background = active ? '#00d4ff' : '#555';
+    button.style.color = active ? '#1a1a2e' : (button.disabled ? '#888' : '#ccc');
+  }
+  note.textContent = policyOverlay === 'q'
+    ? 'Raw Q(s,a), current-player perspective. Fixed red −1 → grey 0 → green +1 scale.'
+    : (qAvailable
+        ? 'Policy heatmap. KLENT Q is available for this checkpoint.'
+        : 'Policy probability heatmap. KLENT Q becomes available on KLENT checkpoints.');
+}
+
+function setPolicyOverlay(layer) {
+  if (layer === 'q' && !(analysisResult && Array.isArray(analysisResult.raw_q))) return;
+  policyOverlay = layer;
+  updatePolicyOverlayControls();
+  renderAnalysisSummary();
   drawBoard();
 }
 
@@ -1466,18 +1576,22 @@ function drawBoard() {
     moves.forEach((m, i) => { stoneMap[`${m.q},${m.r}`] = whoseStone(i); });
   }
 
-  // Build prob lookup (+ q_hat / candidate lookups when MCTS supplied them).
+  // Build policy, native KLENT-Q, and MCTS-Q lookups.
   const probMap = {};
+  const rawQMap = {};
   const qHatMap = {};
   const candMap = {};
   let maxProb = 0;
-  const hasQ = !!(analysisResult && analysisResult.q_hat);
+  const hasRawQ = !!(analysisResult && Array.isArray(analysisResult.raw_q));
+  const showRawQ = policyOverlay === 'q' && hasRawQ;
+  const hasQ = !showRawQ && !!(analysisResult && analysisResult.q_hat);
   if (analysisResult) {
     analysisResult.legal.forEach((c, i) => {
       const p = analysisResult.probs[i];
       const key = `${c[0]},${c[1]}`;
       probMap[key] = p;
       if (p > maxProb) maxProb = p;
+      if (hasRawQ) rawQMap[key] = analysisResult.raw_q[i];
       if (hasQ) {
         qHatMap[key] = analysisResult.q_hat[i];
         candMap[key] = analysisResult.candidate_set ? analysisResult.candidate_set[i] : false;
@@ -1509,6 +1623,14 @@ function drawBoard() {
     const isSelected = selectedNode && selectedNode.q === c.q && selectedNode.r === c.r;
     if (stone === 'P1') cls = 'hex-p1';
     else if (stone === 'P2') cls = 'hex-p2';
+    else if (!isGraphMode && showRawQ && rawQMap[key] !== undefined) {
+      // Native learned Q(s,a), not search q_hat. Use a fixed absolute scale so
+      // colours remain comparable across cells, positions, and checkpoints.
+      const t = Math.max(-1, Math.min(1, rawQMap[key]));
+      const r = Math.round(t >= 0 ? 100 - 80 * t : 100 - 100 * t);
+      const g = Math.round(t >= 0 ? 100 + 100 * t : 100 + 80 * t);
+      fill = `fill:rgb(${r},${g},90)`;
+    }
     else if (!isGraphMode && hasQ && candMap[key]) {
       // Diverging eval colormap on q_hat ∈ [-1,1] from root-player perspective:
       // red (losing) → grey (even) → green (winning). Contention moves get the
@@ -1558,6 +1680,10 @@ function drawBoard() {
           const round = idx === 0 ? 0 : (((idx - 1) >> 2) + 1);
           hexHtml += `<text class="hex-prob" x="${p.x}" y="${p.y}">${round}</text>`;
         }
+      } else if (showRawQ && rawQMap[key] !== undefined) {
+        const q = Math.abs(rawQMap[key]) < 0.005 ? 0 : rawQMap[key];
+        const qStr = (q > 0 ? '+' : '') + q.toFixed(2);
+        hexHtml += `<text class="hex-prob" x="${p.x}" y="${p.y}">${qStr}</text>`;
       } else if (hasQ && inContention(key)) {
         // q_hat (eval) labeled only on in-contention candidates; also-rans keep
         // their muted color but no number.
@@ -1653,7 +1779,15 @@ function drawBoard() {
   // candidates) in cyan, so policy-vs-value disagreement is legible.
   if (!isGraphMode && analysisResult) {
     const ip = analysisResult.improved_policy;
-    if (ip) {
+    if (showRawQ) {
+      let bestIdx = 0;
+      for (let i = 1; i < analysisResult.raw_q.length; i++) {
+        if (analysisResult.raw_q[i] > analysisResult.raw_q[bestIdx]) bestIdx = i;
+      }
+      const best = analysisResult.legal[bestIdx];
+      const bp = axialToPixel(best[0], best[1]);
+      overlayHtml += `<polygon class="top-marker" points="${hexCorners(bp.x, bp.y)}" style="stroke-width:3;stroke:#fff"/>`;
+    } else if (ip) {
       let playIdx = 0;
       for (let i = 1; i < ip.length; i++) if (ip[i] > ip[playIdx]) playIdx = i;
       const pc = analysisResult.legal[playIdx];
@@ -2020,6 +2154,48 @@ document.addEventListener('DOMContentLoaded', () => {
 let analyzeSeq = 0;
 let analyzeAbort = null;
 
+function renderAnalysisSummary() {
+  if (!analysisResult || analysisResult.error) return;
+  const v = analysisResult.value;
+  const who = currentPlayer();
+  const vStr = v > 0 ? `+${v.toFixed(3)}` : v.toFixed(3);
+  const showRawQ = policyOverlay === 'q' && Array.isArray(analysisResult.raw_q);
+  const showMctsQ = !showRawQ && !!analysisResult.q_hat;
+  const cand = analysisResult.candidate_set || [];
+  const topMoves = analysisResult.legal
+    .map((c, i) => ({
+      c, p: analysisResult.probs[i], l: analysisResult.logits[i],
+      q: showRawQ ? analysisResult.raw_q[i] : (showMctsQ ? analysisResult.q_hat[i] : null),
+      cand: showRawQ ? true : !!cand[i],
+    }))
+    .filter(m => (showRawQ || showMctsQ) ? m.cand : true)
+    .sort((a, b) => (showRawQ || showMctsQ) ? (b.q - a.q) : (b.p - a.p))
+    .slice(0, 5)
+    .map((m, i) => {
+      if (showRawQ || showMctsQ) {
+        const q = Math.abs(m.q) < 0.0005 ? 0 : m.q;
+        const qStr = (q > 0 ? '+' : '') + q.toFixed(3);
+        const suffix = showRawQ ? 'raw KLENT Q' : `${(m.p*100).toFixed(0)}% visits`;
+        return `${i+1}. (${m.c[0]},${m.c[1]}) <b class="val">${qStr}</b> <span style="color:#888">${suffix}</span>`;
+      }
+      return `${i+1}. (${m.c[0]},${m.c[1]}) ${(m.p*100).toFixed(1)}% <span style="color:#888">[${m.l.toFixed(2)}]</span>`;
+    })
+    .join('<br>');
+  const ent = analysisResult.entropy;
+  const maxEnt = analysisResult.max_entropy;
+  const entPct = maxEnt > 0 ? (ent / maxEnt * 100).toFixed(0) : '?';
+  const layerLabel = showRawQ
+    ? ` <span style="color:#00d4ff">[raw KLENT Q; white=best Q]</span>`
+    : (getMctsParams().mcts_sims
+        ? ` <span style="color:#00d4ff">[MCTS q_hat — white=plays, cyan=best eval]</span>`
+        : ' <span style="color:#888">[raw policy]</span>');
+  document.getElementById('status').innerHTML =
+    `<b>Loaded:</b> <span style="color:#00d4ff">${analysisCheckpointLabel}</span><br>` +
+    `<b>Value:</b> <span class="val">${vStr}</span> (${who} to move, +1 = ${who} winning)<br>` +
+    `<b>Entropy:</b> ${ent} / ${maxEnt} bits (${entPct}% of uniform)${layerLabel}<br><br>` +
+    `<b>Top moves:</b><br>${topMoves}`;
+}
+
 async function analyze() {
   const resolved = resolveCheckpointFor('ckpt');
   if (resolved.error || !resolved.path) {
@@ -2062,37 +2238,11 @@ async function analyze() {
     if (analysisResult.error) {
       document.getElementById('status').innerHTML = `<span style="color:#f55">${analysisResult.error}</span>`;
       analysisResult = null;
+      updatePolicyOverlayControls();
     } else {
-      const v = analysisResult.value;
-      const who = currentPlayer();
-      const vStr = v > 0 ? `+${v.toFixed(3)}` : v.toFixed(3);
-      const hasQtop = !!analysisResult.q_hat;
-      const cand = analysisResult.candidate_set || [];
-      const topMoves = analysisResult.legal
-        .map((c, i) => ({c, p: analysisResult.probs[i], l: analysisResult.logits[i],
-                         q: hasQtop ? analysisResult.q_hat[i] : null, cand: !!cand[i]}))
-        // With MCTS, only searched candidates carry a meaningful q_hat.
-        .filter(m => hasQtop ? m.cand : true)
-        .sort((a, b) => hasQtop ? (b.q - a.q) : (b.p - a.p))
-        .slice(0, 5)
-        .map((m, i) => {
-          if (hasQtop) {
-            const q = Math.abs(m.q) < 0.0005 ? 0 : m.q;
-            const qStr = (q > 0 ? '+' : '') + q.toFixed(3);
-            return `${i+1}. (${m.c[0]},${m.c[1]}) <b class="val">${qStr}</b> <span style="color:#888">${(m.p*100).toFixed(0)}% visits</span>`;
-          }
-          return `${i+1}. (${m.c[0]},${m.c[1]}) ${(m.p*100).toFixed(1)}% <span style="color:#888">[${m.l.toFixed(2)}]</span>`;
-        })
-        .join('<br>');
-      const ent = analysisResult.entropy;
-      const maxEnt = analysisResult.max_entropy;
-      const entPct = maxEnt > 0 ? (ent / maxEnt * 100).toFixed(0) : '?';
-      const mctsLabel = getMctsParams().mcts_sims ? ` <span style="color:#00d4ff">[MCTS q_hat — white=plays, cyan=best eval]</span>` : ' <span style="color:#888">[raw policy]</span>';
-      document.getElementById('status').innerHTML =
-        `<b>Loaded:</b> <span style="color:#00d4ff">${ckptLabel}</span><br>` +
-        `<b>Value:</b> <span class="val">${vStr}</span> (${who} to move, +1 = ${who} winning)<br>` +
-        `<b>Entropy:</b> ${ent} / ${maxEnt} bits (${entPct}% of uniform)${mctsLabel}<br><br>` +
-        `<b>Top moves:</b><br>${topMoves}`;
+      analysisCheckpointLabel = ckptLabel;
+      updatePolicyOverlayControls();
+      renderAnalysisSummary();
 
       // Threats panel
       const threats = analysisResult.threats || [];
@@ -2123,6 +2273,23 @@ function isChampionPath(p) { return p.endsWith('/self_play/champion.pt'); }
 function checkpointStep(p) {
   const m = p.match(/checkpoint_(\d+)\.pt$/);
   return m ? parseInt(m[1], 10) : null;
+}
+
+function distillationEpoch(p) {
+  const m = p.match(/[\\/]distillation_epochs[\\/]epoch_(\d+)[\\/]/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function checkpointOrder(p) {
+  const epoch = distillationEpoch(p);
+  return epoch === null ? checkpointStep(p) : epoch;
+}
+
+function checkpointDisplay(p) {
+  const epoch = distillationEpoch(p);
+  if (epoch !== null) return `epoch ${epoch}`;
+  const step = checkpointStep(p);
+  return step === null ? p.split(/[\\/]/).pop() : `step ${step}`;
 }
 
 let _allCheckpoints = []; // cached from /checkpoints, used by resolveCheckpoint
@@ -2159,8 +2326,7 @@ function populateCheckpointDatalist(datalistId, data) {
   for (const path of data.slice().reverse()) {
     const opt = document.createElement('option');
     opt.value = path;
-    const step = checkpointStep(path);
-    opt.label = step === null ? path : `step ${step} — ${path}`;
+    opt.label = `${checkpointDisplay(path)} — ${path}`;
     dl.appendChild(opt);
   }
 }
@@ -2193,20 +2359,20 @@ function resolveCheckpoint(typed) {
   const raw = (typed || '').trim();
   const data = _allCheckpoints;
   const champions = data.filter(isChampionPath);
-  const numbered = data.map(p => ({p, step: checkpointStep(p)}))
+  const numbered = data.map(p => ({p, step: checkpointOrder(p)}))
                        .filter(x => x.step !== null);
 
   // A full .pt path can be used immediately even before its containing source
   // is added. The server reports a clear load error if the path is invalid.
   const looksLikePath = raw.includes('/') || raw.includes('\\');
   if (looksLikePath && raw.toLowerCase().endsWith('.pt') && !data.includes(raw)) {
-    return {path: raw, label: raw.split('/').pop()};
+    return {path: raw, label: checkpointDisplay(raw)};
   }
   if (!data.length) return {path: null, error: 'No checkpoints available; add a source above'};
   if (!raw) {
     const latest = numbered.reduce((best, item) =>
       best === null || item.step > best.step ? item : best, null);
-    if (latest) return {path: latest.p, label: `step ${latest.step} (latest)`};
+    if (latest) return {path: latest.p, label: `${checkpointDisplay(latest.p)} (latest)`};
     if (data.length === 1) return {path: data[0], label: data[0].split('/').pop()};
     return {path: null, error: 'Choose a checkpoint path'};
   }
@@ -2220,7 +2386,7 @@ function resolveCheckpoint(typed) {
   }
   // Exact full-path match
   if (data.includes(raw)) {
-    return {path: raw, label: raw.split('/').pop()};
+    return {path: raw, label: checkpointDisplay(raw)};
   }
   // Filename match (e.g. "checkpoint_147600.pt")
   const fnames = data.filter(p => p.split('/').pop() === raw);
@@ -2231,19 +2397,21 @@ function resolveCheckpoint(typed) {
   // Numeric step → exact, else closest
   const num = parseInt(t, 10);
   if (!isNaN(num) && /^\d+$/.test(t)) {
-    if (!numbered.length) return {path: null, error: 'No numbered training checkpoints'};
+    if (!numbered.length) return {path: null, error: 'No numbered checkpoints'};
     const exact = numbered.filter(x => x.step === num);
-    if (exact.length === 1) return {path: exact[0].p, label: `step ${num}`};
+    if (exact.length === 1) {
+      return {path: exact[0].p, label: checkpointDisplay(exact[0].p)};
+    }
     if (exact.length > 1) {
-      return {path: null, error: `Step ${num} exists in multiple loaded sources; choose a full path`};
+      return {path: null, error: `Index ${num} exists in multiple loaded sources; choose a full path`};
     }
     const distance = Math.min(...numbered.map(x => Math.abs(x.step - num)));
     const closest = numbered.filter(x => Math.abs(x.step - num) === distance);
     if (closest.length > 1) {
-      return {path: null, error: `Several checkpoints are equally close to step ${num}; choose a full path`};
+      return {path: null, error: `Several checkpoints are equally close to ${num}; choose a full path`};
     }
     return {path: closest[0].p,
-            label: `step ${closest[0].step} (closest to ${num})`};
+            label: `${checkpointDisplay(closest[0].p)} (closest to ${num})`};
   }
   return {path: null, error: `No checkpoint matches "${raw}"`};
 }
@@ -2251,7 +2419,7 @@ function resolveCheckpoint(typed) {
 function maybeSetInitialCheckpointInput(inputId, data) {
   const inp = document.getElementById(inputId);
   if (!inp || inp.value) return;
-  const training = data.map(p => ({p, step: checkpointStep(p)}))
+  const training = data.map(p => ({p, step: checkpointOrder(p)}))
                        .filter(x => x.step !== null)
                        .sort((a, b) => a.step - b.step);
   if (training.length) inp.value = training[training.length - 1].p;

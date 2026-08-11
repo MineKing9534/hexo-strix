@@ -131,6 +131,17 @@ def _rust_game_config(game_config):
     )
 
 
+def _new_game_state(game_config, board_radius: int = 0):
+    """Construct one normal or finite-board self-play state."""
+
+    import hexo_rs
+
+    return hexo_rs.GameState(
+        _rust_game_config(game_config),
+        board_radius=board_radius or None,
+    )
+
+
 def _attach_returns(
     trajectory: Trajectory,
     trace_decay: float,
@@ -162,6 +173,8 @@ def _collect_with_inference(
     dense_position_cell_limit: int,
     seed: int | None,
     worker_processes: int,
+    board_radius: int = 0,
+    retain_horizon_truncations: bool = False,
     completed_callback: CompletedTrajectoryFn | None = None,
     completed_chunk_positions: int = 0,
 ) -> tuple[list[Trajectory], CollectionStats]:
@@ -170,7 +183,10 @@ def _collect_with_inference(
     ``positions`` is the replacement-game budget, not a hard trajectory cut.
     Once it is reached, every live lane drains to a genuine terminal result.
     Games stopped by a safety horizon or dense spatial bound are excluded from
-    the returned training trajectories in their entirety.
+    the returned training trajectories in their entirety. Distillation may
+    explicitly retain horizon-capped prefixes because it consumes frozen
+    teacher outputs rather than outcome-derived return targets; spatial and
+    chunk safety truncations are never retained.
     """
 
     if positions <= 0 or parallel_games <= 0:
@@ -182,10 +198,7 @@ def _collect_with_inference(
             "completed_chunk_positions must be positive with a callback"
         )
 
-    import hexo_rs
-
     started_at = time.monotonic()
-    rust_config = _rust_game_config(game_config)
     generator = torch.Generator(device="cpu")
     if seed is None:
         generator.seed()
@@ -193,7 +206,7 @@ def _collect_with_inference(
         generator.manual_seed(seed)
 
     active: list[tuple[object, Trajectory]] = [
-        (hexo_rs.GameState(rust_config), Trajectory([]))
+        (_new_game_state(game_config, board_radius), Trajectory([]))
         for _ in range(parallel_games)
     ]
     completed: list[Trajectory] = []
@@ -260,7 +273,19 @@ def _collect_with_inference(
             discarded_position_count += length
             return
 
-        if trajectory.winner not in {"P1", "P2"} or trajectory.truncated:
+        retained_horizon = (
+            retain_horizon_truncations
+            and trajectory.truncated
+            and not trajectory.spatial_truncated
+            and not trajectory.chunk_truncated
+        )
+        if (
+            not retained_horizon
+            and (
+                trajectory.winner not in {"P1", "P2"}
+                or trajectory.truncated
+            )
+        ):
             raise RuntimeError(
                 "only genuinely terminal HeXO games may enter KLENT FIT"
             )
@@ -442,7 +467,8 @@ def _collect_with_inference(
                 elif game.move_count() >= game_config.rollout_horizon:
                     trajectory.truncated = True
                     finish_trajectory(
-                        trajectory, include_in_training=False
+                        trajectory,
+                        include_in_training=retain_horizon_truncations,
                     )
                 elif dense_position_cell_limit > 0:
                     height, width = raster_shape(game)
@@ -474,7 +500,10 @@ def _collect_with_inference(
                     max(0, remaining - len(active)),
                 )
                 active.extend(
-                    (hexo_rs.GameState(rust_config), Trajectory([]))
+                    (
+                        _new_game_state(game_config, board_radius),
+                        Trajectory([]),
+                    )
                     for _ in range(new_lanes)
                 )
 
@@ -536,8 +565,10 @@ def collect_games(
     device: torch.device,
     inference_edge_budget: int = 0,
     dense_position_cell_limit: int = 0,
+    board_radius: int = 0,
     precision: str = "float32",
     seed: int | None = None,
+    retain_horizon_truncations: bool = False,
 ) -> tuple[list[Trajectory], CollectionStats]:
     """Collect a position-budgeted chunk in the learner process."""
 
@@ -583,8 +614,10 @@ def collect_games(
             positions=positions,
             parallel_games=parallel_games,
             dense_position_cell_limit=dense_position_cell_limit,
+            board_radius=board_radius,
             seed=seed,
             worker_processes=1,
+            retain_horizon_truncations=retain_horizon_truncations,
         )
     finally:
         model.train(was_training)
@@ -597,7 +630,9 @@ class _CollectTask:
     positions: int
     parallel_games: int
     dense_position_cell_limit: int
+    board_radius: int
     seed: int | None
+    retain_horizon_truncations: bool = False
 
 
 @dataclass
@@ -755,8 +790,12 @@ def _actor_worker_main(
                 positions=task.positions,
                 parallel_games=task.parallel_games,
                 dense_position_cell_limit=task.dense_position_cell_limit,
+                board_radius=task.board_radius,
                 seed=task.seed,
                 worker_processes=1,
+                retain_horizon_truncations=(
+                    task.retain_horizon_truncations
+                ),
                 completed_callback=emit_trajectories,
                 completed_chunk_positions=result_chunk_positions,
             )
@@ -1029,6 +1068,8 @@ class SharedInferenceActors:
         precision: str,
         seed: int | None,
         dense_position_cell_limit: int = 0,
+        board_radius: int = 0,
+        retain_horizon_truncations: bool = False,
     ) -> tuple[list[Trajectory], CollectionStats]:
         """Collect one frozen generation while serving all actor requests."""
 
@@ -1059,7 +1100,11 @@ class SharedInferenceActors:
                     positions=shard_positions,
                     parallel_games=shard_lanes,
                     dense_position_cell_limit=dense_position_cell_limit,
+                    board_radius=board_radius,
                     seed=None if seed is None else seed + index * 1_000_003,
+                    retain_horizon_truncations=(
+                        retain_horizon_truncations
+                    ),
                 )
             )
 
@@ -1254,9 +1299,11 @@ def collect_games_parallel(
     batch_timeout_ms: float,
     device: torch.device,
     dense_position_cell_limit: int = 0,
+    board_radius: int = 0,
     precision: str = "float32",
     seed: int | None = None,
     actors: SharedInferenceActors | None = None,
+    retain_horizon_truncations: bool = False,
 ) -> tuple[list[Trajectory], CollectionStats]:
     """Collect through CPU actors sharing the parent learner's model."""
 
@@ -1271,9 +1318,11 @@ def collect_games_parallel(
             inference_batch_size=inference_batch_size,
             inference_edge_budget=inference_edge_budget,
             dense_position_cell_limit=dense_position_cell_limit,
+            board_radius=board_radius,
             device=device,
             precision=precision,
             seed=seed,
+            retain_horizon_truncations=retain_horizon_truncations,
         )
 
     owned_actors = actors is None
@@ -1293,6 +1342,8 @@ def collect_games_parallel(
             device=device,
             precision=precision,
             seed=seed,
+            board_radius=board_radius,
+            retain_horizon_truncations=retain_horizon_truncations,
         )
     finally:
         if owned_actors:
