@@ -1,0 +1,16 @@
+{
+  "name": "hexo-strix-browser-tests",
+  "private": true,
+  "scripts": {
+    "test:browser": "playwright test",
+    "test:browser:webkit": "PLAYWRIGHT_WEBKIT=1 playwright test --project=phone-webkit --project=tablet-webkit",
+    "test:browser:headed": "playwright test --headed",
+    "test:browser:report": "playwright show-report",
+    "typecheck:browser": "tsc -p hexo-a0/tests/browser/tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}

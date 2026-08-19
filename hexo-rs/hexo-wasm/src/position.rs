@@ -45,15 +45,10 @@ fn player_of(n: u8) -> Result<Player, InferError> {
     }
 }
 
-fn hex_distance_origin(q: i32, r: i32) -> i32 {
-    // axial hex distance from (0,0)
-    (q.abs() + r.abs() + (q + r).abs()) / 2
-}
-
 /// Validate every `from_state` precondition + game-rule sanity, returning `Err`
 /// instead of letting `from_state`/`Board::place` panic across the FFI boundary.
 /// Returns the constructed (non-terminal, playable) GameState.
-pub fn validate_and_build(pos: &PositionJson, model: &InferModel) -> Result<GameState, InferError> {
+pub fn validate_and_build(pos: &PositionJson, _model: &InferModel) -> Result<GameState, InferError> {
     let c = &pos.config;
     if c.win_length < 2 {
         return Err(err("win_length must be >= 2"));
@@ -69,33 +64,14 @@ pub fn validate_and_build(pos: &PositionJson, model: &InferModel) -> Result<Game
     }
     let to_move = player_of(pos.to_move)?;
 
-    // Training-config cross-check: a position larger than the model was trained on is
-    // out-of-distribution garbage, not just a weaker eval. The training game_config
-    // travels in the safetensors metadata.
-    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&model.config().metadata_json) {
-        if let Some(gc) = meta.get("game_config").and_then(|s| s.as_str()) {
-            if let Ok(tgc) = serde_json::from_str::<serde_json::Value>(gc) {
-                if let Some(twl) = tgc.get("win_length").and_then(|v| v.as_u64()) {
-                    if u64::from(c.win_length) > twl {
-                        return Err(err(format!(
-                            "position win_length {} exceeds the model's training win_length {twl}",
-                            c.win_length
-                        )));
-                    }
-                }
-                if let Some(tr) = tgc.get("placement_radius").and_then(|v| v.as_i64()) {
-                    if i64::from(c.placement_radius) > tr {
-                        return Err(err(format!(
-                            "position placement_radius {} exceeds the model's training radius {tr}",
-                            c.placement_radius
-                        )));
-                    }
-                }
-            }
-        }
-    }
+    // The checkpoint's game_config records its training distribution, but it
+    // is not a deployment constraint. The same network can evaluate larger
+    // radii, win lengths, and move budgets; callers may intentionally transfer
+    // a model across game geometries.
 
-    // Stones: player range, duplicates, radius, origin contract.
+    // Stones: player range, duplicates, and origin contract. Coordinates are
+    // intentionally not constrained by distance from the origin: the engine's
+    // placement radius expands legal moves around existing stones.
     let mut stones: Vec<(Coord, Player)> = Vec::with_capacity(pos.stones.len());
     let mut seen = std::collections::HashSet::with_capacity(pos.stones.len());
     let mut origin_ok = false;
@@ -112,12 +88,6 @@ pub fn validate_and_build(pos: &PositionJson, model: &InferModel) -> Result<Game
                 return Err(err("origin (0,0) must be P1 (the engine pre-seeds it)"));
             }
             origin_ok = true;
-        }
-        if hex_distance_origin(s.q, s.r) > c.placement_radius {
-            return Err(err(format!(
-                "stone ({}, {}) is outside placement_radius {}",
-                s.q, s.r, c.placement_radius
-            )));
         }
         stones.push((coord, p));
     }
@@ -220,6 +190,17 @@ pub fn best_move_impl(
         "move": {"q": result.action.0, "r": result.action.1},
         "value": value,
         "policy": policy_json(&result.coords, &result.improved_policy),
+        // Observatory diagnostics retain the engine's legal-move ordering.
+        // `policy` remains sorted for compatibility and therefore must not be
+        // used to index per-child values.
+        "legal": result.coords.iter().map(|&(q, r)| [q, r]).collect::<Vec<_>>(),
+        "probs": result.per_child_prior,
+        "improved_policy": result.improved_policy,
+        "visit_counts": result.visit_counts,
+        "q_hat": result.per_child_q,
+        "candidate_set": (0..result.coords.len())
+            .map(|i| result.candidate_indices.contains(&i))
+            .collect::<Vec<_>>(),
     })
     .to_string())
 }
@@ -275,6 +256,31 @@ mod tests {
         assert!(v["move"]["q"].is_i64() && v["move"]["r"].is_i64());
         let psum: f64 = v["policy"].as_array().unwrap().iter().map(|e| e["p"].as_f64().unwrap()).sum();
         assert!((psum - 1.0).abs() < 1e-6, "best_move policy sums to {psum}");
+        let n = v["legal"].as_array().unwrap().len();
+        for field in ["probs", "improved_policy", "visit_counts", "q_hat", "candidate_set"] {
+            assert_eq!(v[field].as_array().unwrap().len(), n, "{field} aligns with legal moves");
+        }
+        assert_eq!(
+            v["candidate_set"].as_array().unwrap().iter()
+                .filter(|entry| entry.as_bool() == Some(true)).count(),
+            8,
+        );
+    }
+
+    #[test]
+    fn model_transfers_to_larger_game_geometry() {
+        let model = tiny_model();
+        let p = r#"{"config":{"win_length":6,"placement_radius":8,"max_moves":1000},"stones":[{"q":0,"r":0,"player":1}],"to_move":2,"moves_remaining":2}"#;
+        let out = best_move_impl(&model, p, 4, 4, 0).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["move"]["q"].is_i64() && v["move"]["r"].is_i64());
+    }
+
+    #[test]
+    fn evolved_stones_may_leave_origin_radius() {
+        let model = tiny_model();
+        let p = r#"{"config":{"win_length":6,"placement_radius":8,"max_moves":1000},"stones":[{"q":0,"r":0,"player":1},{"q":-3,"r":9,"player":2}],"to_move":2,"moves_remaining":1}"#;
+        best_move_impl(&model, p, 4, 4, 0).expect("expanded legal geometry is valid");
     }
 
     #[test]
@@ -324,7 +330,7 @@ mod tests {
             ("dup", pos(r#"{"q":0,"r":0,"player":1},{"q":1,"r":0,"player":2},{"q":1,"r":0,"player":2}"#, 1, 2), "duplicate"),
             ("origin-as-P2", pos(r#"{"q":0,"r":0,"player":2}"#, 1, 2), "origin"),
             ("origin-missing", pos(r#"{"q":1,"r":0,"player":2}"#, 1, 2), "origin"),
-            ("out-of-radius", pos(&format!(r#"{ORIGIN},{{"q":9,"r":0,"player":2}}"#), 1, 2), "radius"),
+            ("bad-max-moves", r#"{"config":{"win_length":6,"placement_radius":4,"max_moves":0},"stones":[{"q":0,"r":0,"player":1}],"to_move":2,"moves_remaining":2}"#.to_string(), "max_moves"),
             ("bad-config", r#"{"config":{"win_length":1,"placement_radius":4,"max_moves":300},"stones":[{"q":0,"r":0,"player":1}],"to_move":2,"moves_remaining":2}"#.to_string(), "win_length"),
             ("garbage-json", "{not json".to_string(), "JSON"),
         ];

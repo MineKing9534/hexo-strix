@@ -1265,6 +1265,22 @@ export class StrixSolver {
         return SolveOutcome.__wrap(ret[0]);
     }
     /**
+     * Wide-generator counterpart to `solve_threat`, used by Observatory's
+     * automatic per-position analysis.
+     * @param {Position} position
+     * @param {SolverLimits} limits
+     * @returns {SolveOutcome}
+     */
+    solve_threat_wide(position, limits) {
+        _assertClass(position, Position);
+        _assertClass(limits, SolverLimits);
+        const ret = wasm.strixsolver_solve_threat_wide(this.__wbg_ptr, position.__wbg_ptr, limits.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return SolveOutcome.__wrap(ret[0]);
+    }
+    /**
      * @param {Position} position
      * @param {SolverLimits} limits
      * @returns {SolveOutcome}

@@ -187,6 +187,15 @@ All three settings inherit from `[mcts]` when omitted from `[self_play.mcts]`.
 
 `hexo-a0 serve` starts an HTTP play-and-analyze server: a human can play the trained bot at selectable difficulty tiers, completed games are recorded to SQLite, and a token-gated `/admin` page exposes analysis. The web frontend (HTML/JS/CSS, fonts, and social-card assets) is served from `hexo_a0/serving/static` and `templates`. It's designed to bind `0.0.0.0` behind a reverse proxy / Tailscale Funnel with `--url-prefix`.
 
+Modern browsers download the deployed safetensors checkpoint once and run bot
+moves, Gumbel MCTS analysis, and forced-win search locally in a Web Worker via
+`hexo-wasm`. The server still validates and records placements. Server-side
+inference remains only as an automatic compatibility fallback when WASM or the
+model asset cannot load, so normal traffic does not queue behind shared compute.
+The analysis screen replays a pasted game immediately without loading the model;
+users can then analyze only the selected position or explicitly run analysis over
+the full game.
+
 ```bash
 hexo-a0 serve --config config.toml --checkpoint <ckpt.pt> --port 8765
 ```

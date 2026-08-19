@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Play HeXO</title>
 <meta name="description" content="Play &amp; analyse infinite hex tic-tac-toe against an AlphaZero engine.">
 <meta name="theme-color" content="#0d0f0e">
@@ -52,8 +52,9 @@
   <div id="analysis-controls">
     <div id="analysis-sheet-handle" data-label="Controls" onclick="toggleAnalysisSheet(event)" aria-label="Toggle controls panel" role="button" tabindex="0"></div>
     <div id="analysis-controls-body">
-    <div id="hds-import" style="border-bottom:1px solid #15191a;padding-bottom:10px;margin-bottom:10px">
-      <label>Import from hexo.did.science
+    <details id="hds-import" class="analysis-advanced">
+      <summary>Import from hexo.did.science</summary>
+      <label>Sandbox URL or code
         <input id="hds-input" type="text" placeholder="https://hexo.did.science/sandbox/5knldz6 or 5knldz6">
       </label>
       <div class="row">
@@ -66,14 +67,17 @@
         <textarea id="hds-htttx" rows="4" readonly></textarea>
         <button onclick="copyHdsHtttx()" style="flex:0 0 auto;width:auto;padding:6px 10px;background:#232826;color:#d8d2c6">Copy HTTTX</button>
       </div>
-    </div>
+    </details>
     <label>Paste HTTTX
-      <textarea id="analysis-htttx" rows="4" placeholder="version[1];\n1. [1,0][2,0];\n..."></textarea>
+      <textarea id="analysis-htttx" rows="4" placeholder="version[1];\n1. [1,0][2,0];\n..." oninput="analysisInputChanged()"></textarea>
     </label>
-    <div id="analysis-forcing-depth-control">
-      <div class="analysis-solver-heading">
-        <div class="analysis-solver-title">Forced-win proof lab</div>
+    <details id="analysis-forcing-depth-control" class="analysis-advanced">
+      <summary class="analysis-solver-summary">
+        <span class="analysis-solver-title">Forced-win proof lab</span>
         <span class="analysis-local-badge">on this device</span>
+      </summary>
+      <div class="analysis-solver-heading">
+        <span class="analysis-proof-caption">Manual proof controls</span>
       </div>
       <label for="analysis-forcing-engine">Engine
         <select id="analysis-forcing-engine" onchange="updateForcingSolverUi()">
@@ -126,13 +130,30 @@
       <div id="analysis-forcing-status" role="status" aria-live="polite">Ready. The solver runs in a background worker and does not use server CPU.</div>
       <div id="analysis-solver-help" class="analysis-depth-help">IDTT searches for the shortest forced win through the selected attacker-turn depth. The completing turn counts; a mid-turn start still counts as one turn.</div>
       <div class="analysis-budget-help">The work budget is an engine counter, not a time limit. PDS-PN counts outer nodes and has a separate per-frontier PN leaf cap. Compare verdicts—not raw counters. Wide search is more complete but may spend the budget faster.</div>
+    </details>
+    <div class="analysis-primary-row">
+      <button id="analysis-load-btn" onclick="loadGame()">Load game</button>
+      <label for="analysis-strength">Analysis strength
+        <select id="analysis-strength" onchange="saveAnalysisStrength()">
+          <option value="quick">Quick · 16 sims</option>
+          <option value="standard" selected>Standard · 64 sims</option>
+          <option value="strong">Strong · 128 sims</option>
+          <option value="deep">Deep · 256 sims</option>
+        </select>
+      </label>
     </div>
-    <div class="row">
-      <button onclick="loadAnalysis()">Load / Analyze</button>
+    <div class="analysis-run-actions">
+      <button id="analysis-position-btn" onclick="analyzeCurrentPosition()" disabled>Analyze position</button>
+      <button id="analysis-game-btn" onclick="analyzeWholeGame()" disabled>Analyze full game</button>
+    </div>
+    <details class="analysis-advanced analysis-display-options">
+      <summary>Display options</summary>
+      <div class="analysis-display-options-body">
       <label><input type="checkbox" id="analysis-heatmap" checked onchange="rerenderCurrentAnalysis()"> Suggested moves</label>
       <label><input type="checkbox" id="analysis-forcing" checked onchange="rerenderCurrentAnalysis()"> Forced wins</label>
       <label><input type="checkbox" id="analysis-threats" onchange="rerenderCurrentAnalysis()"> Threats</label>
-    </div>
+      </div>
+    </details>
     <div id="analysis-progress">
       <div id="analysis-progress-track"><div id="analysis-progress-bar"></div></div>
       <div id="analysis-progress-label"></div>
@@ -250,6 +271,7 @@ window.__HEXO_CFG__ = {
   winLength: __WIN_LENGTH__,
   placementRadius: __PLACEMENT_RADIUS__,
   maxMoves: __MAX_MOVES__,
+  modelUrl: "__PREFIX_RAW__/model.safetensors?v=__MODEL_V__",
   assetVersion: "__ASSET_V__"
 };
 </script>

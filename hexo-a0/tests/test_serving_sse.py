@@ -118,6 +118,9 @@ def test_static_serves_css_and_js():
         sw, sw_type, _, _, worker_js = _get(port, "/static/solver-worker.js")
         assert sw == 200 and sw_type == "text/javascript; charset=utf-8"
         assert b"StrixSolver" in worker_js and b"solve_wide" in worker_js
+        iw, iw_type, _, _, inference_js = _get(port, "/static/inference-worker.js")
+        assert iw == 200 and iw_type == "text/javascript; charset=utf-8"
+        assert b"StrixBot" in inference_js and b"analyzeGame" in inference_js
         pe, pe_type, _, _, proof_js = _get(port, "/static/proof-explorer.js")
         assert pe == 200 and pe_type == "text/javascript; charset=utf-8"
         assert b"buildProofModel" in proof_js and b"proofExplorerWorstCase" in proof_js
@@ -134,6 +137,15 @@ def test_html_exposes_authoritative_rules_to_worker_client():
         assert b"winLength: 6" in body
         assert b"placementRadius: 8" in body
         assert b"maxMoves: 400" in body
+        assert b'id="analysis-strength"' in body
+        assert b'id="analysis-load-btn"' in body and b"Load game" in body
+        assert b'id="analysis-position-btn"' in body and b"Analyze position" in body
+        assert b'id="analysis-game-btn"' in body and b"Analyze full game" in body
+        assert b"Deep &#183; 256 sims" in body or b"Deep" in body
+        assert b'<details id="hds-import"' in body
+        assert b'<details id="analysis-forcing-depth-control"' in body
+        assert b"analysis-display-options" in body
+        assert b"modelUrl:" in body and b"/model.safetensors?v=" in body
         assert b"DFPN" in body and b"PDS-PN" in body and b"PNS" in body
         assert b"analysis-download-certificate-btn" in body
         assert b"analysis-explore-certificate-btn" in body

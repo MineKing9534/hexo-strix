@@ -747,8 +747,9 @@ class GameManager:
     def restore_active_games(self) -> int:
         """Rebuild in-memory games persisted by a previous process. Call once at
         startup, before serving. Rows that are TTL-expired, rule-mismatched,
-        terminal, bot-to-move (nothing would ever schedule their bot turn), over
-        capacity, or fail replay are deleted instead of restored."""
+        terminal, over-capacity, or replay-invalid rows are deleted instead of
+        restored. Bot-to-move rows are valid: the browser-local bot resumes them
+        after fetching `/state`."""
         if self.recorder is None:
             return 0
         try:
@@ -791,7 +792,9 @@ class GameManager:
             state = self._hr.GameState(self._hr.GameConfig(**self.game_kwargs))
             for q, r, _p in move_log[1:]:
                 state.apply_move(q, r)
-            if state.is_terminal() or state.current_player() != row["human_side"]:
+            if state.is_terminal() or state.current_player() not in {
+                row["human_side"], row["bot_side"]
+            }:
                 return None
             difficulty = row["difficulty"]
             if self.difficulty_sims is not None and difficulty not in self.difficulty_sims:
@@ -821,6 +824,7 @@ class GameManager:
         rng=None,
         difficulty: str | None = None,
         self_reported_elo: float | None = None,
+        local_bot: bool = False,
     ) -> GameRecord:
         if human_side_request not in ("P1", "P2", "random"):
             raise GameError(
@@ -871,7 +875,7 @@ class GameManager:
             raise ServerBusyError("server at game capacity; try again shortly")
         # _mgr_lock released; rec.lock held continuously since insertion.
         try:
-            if rec.bot_side == state.current_player() and not state.is_terminal():
+            if not local_bot and rec.bot_side == state.current_player() and not state.is_terminal():
                 # Hold rec.lock for the initial bot turn: the record is already
                 # visible in self._games, so concurrent /state or /move must not
                 # observe a half-applied bot move. Matches apply_human_move's
@@ -991,7 +995,7 @@ class GameManager:
         else:
             self._record_terminal(rec, winner=winner, result_type="win")
 
-    def apply_human_move(self, game_id: str, q: int, r: int) -> GameRecord:
+    def apply_human_move(self, game_id: str, q: int, r: int, *, local_bot: bool = False) -> GameRecord:
         rec = self.get_game(game_id)
         if rec is None:
             raise UnknownGameError(f"unknown game_id {game_id}")
@@ -1012,11 +1016,52 @@ class GameManager:
             rec.last_active_at = _now_utc()
             self._maybe_record_engine_terminal(rec)
             if (
-                not rec.terminal_recorded
+                not local_bot
+                and not rec.terminal_recorded
                 and rec.state.current_player() == rec.bot_side
             ):
                 self.bot_turn_fn(rec)
                 self._maybe_record_engine_terminal(rec)
+            self._sync_active(rec)
+        return rec
+
+    def apply_bot_move(self, game_id: str, q: int, r: int) -> GameRecord:
+        """Validate and record a move selected by the browser-local bot."""
+        rec = self.get_game(game_id)
+        if rec is None:
+            raise UnknownGameError(f"unknown game_id {game_id}")
+        with rec.lock:
+            if rec.terminal_recorded or rec.state.is_terminal():
+                raise GameAlreadyOverError("game already over")
+            cur = rec.state.current_player()
+            if cur != rec.bot_side:
+                raise NotYourTurnError(f"current_player={cur}, bot_side={rec.bot_side}")
+            legal = {tuple(c) for c in rec.state.legal_moves()}
+            if (q, r) not in legal:
+                raise IllegalMoveError(f"({q},{r}) not in legal_moves")
+            try:
+                rec.state.apply_move(q, r)
+            except Exception as e:
+                raise IllegalMoveError(str(e)) from e
+            rec.move_log.append((q, r, rec.bot_side))
+            rec.last_active_at = _now_utc()
+            self._maybe_record_engine_terminal(rec)
+            self._sync_active(rec)
+        return rec
+
+    def apply_server_bot_turn(self, game_id: str) -> GameRecord:
+        """Compatibility fallback when a browser cannot run the local engine."""
+        rec = self.get_game(game_id)
+        if rec is None:
+            raise UnknownGameError(f"unknown game_id {game_id}")
+        with rec.lock:
+            if rec.terminal_recorded or rec.state.is_terminal():
+                raise GameAlreadyOverError("game already over")
+            if rec.state.current_player() != rec.bot_side:
+                raise NotYourTurnError("not the bot's turn")
+            self.bot_turn_fn(rec)
+            rec.last_active_at = _now_utc()
+            self._maybe_record_engine_terminal(rec)
             self._sync_active(rec)
         return rec
 

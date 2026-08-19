@@ -6,6 +6,7 @@ let isPanning = false, panStartX = 0, panStartY = 0, panStartVX = 0, panStartVY 
 let wasDragging = false;
 let gameState = null;
 let inFlight = false;
+let localBotInFlight = false;
 let selectedSide = "random";
 const DIFFICULTY_SIMS = (window.__HEXO_CFG__ || {}).difficultySims || {};
 const DEFAULT_DIFFICULTY = (window.__HEXO_CFG__ || {}).defaultDifficulty || "";
@@ -113,7 +114,7 @@ async function onCellClick(q, r) {
   try {
     const resp = await fetch(URL_PREFIX + "/move", {
       method: "POST", headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({game_id: gameState.game_id, q, r}),
+      body: JSON.stringify({game_id: gameState.game_id, q, r, local_bot: true}),
     });
     const body = await resp.json();
     if (resp.ok) {
@@ -134,6 +135,63 @@ function applyState(state) {
   drawBoard();
   updateUi();
   updateDifficultyBadge();
+  if (!state.terminal && !state.is_human_turn) queueMicrotask(runLocalBotTurn);
+}
+
+function localBotPosition(state) {
+  const cfg = window.__HEXO_CFG__ || {};
+  return {
+    config: {win_length: cfg.winLength, placement_radius: cfg.placementRadius, max_moves: cfg.maxMoves},
+    stones: (state.stones || []).map(s => ({
+      q: s[0][0], r: s[0][1], player: s[1] === "P1" ? 1 : 2,
+    })),
+    to_move: state.current_player === "P1" ? 1 : 2,
+    moves_remaining: state.moves_remaining_this_turn,
+  };
+}
+
+async function runLocalBotTurn() {
+  if (localBotInFlight || !gameState || gameState.terminal || gameState.is_human_turn) return;
+  localBotInFlight = true;
+  inFlight = true;
+  document.getElementById("board").classList.add("disabled");
+  try {
+    const stateAtStart = gameState;
+    const sims = Number(DIFFICULTY_SIMS[stateAtStart.difficulty] || 64);
+    const result = await localInference("bestMove", {
+      position: localBotPosition(stateAtStart), sims, mActions: 16,
+    });
+    if (!gameState || gameState.game_id !== stateAtStart.game_id) return;
+    const resp = await fetch(URL_PREFIX + "/bot_move", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({
+        game_id: stateAtStart.game_id, q: result.move.q, r: result.move.r,
+      }),
+    });
+    const body = await resp.json();
+    if (!resp.ok) throw new Error(body.error || resp.statusText);
+    applyState(body.state);
+  } catch (error) {
+    // Old/locked-down browsers keep working, but only they consume server inference.
+    try {
+      const resp = await fetch(URL_PREFIX + "/bot_turn_fallback", {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({game_id: gameState.game_id}),
+      });
+      const body = await resp.json();
+      if (!resp.ok) throw new Error(body.error || resp.statusText);
+      applyState(body.state);
+    } catch (fallbackError) {
+      setStatus(`Bot error: ${fallbackError.message || fallbackError}`, true);
+    }
+  } finally {
+    localBotInFlight = false;
+    inFlight = false;
+    document.getElementById("board").classList.remove("disabled");
+    // A two-placement bot turn needs a second locally selected move.
+    if (gameState && !gameState.terminal && !gameState.is_human_turn)
+      queueMicrotask(runLocalBotTurn);
+  }
 }
 
 function setStatus(text, isError = false) {
@@ -186,7 +244,7 @@ async function analyzeThisGame() {
     if (!resp.ok) { setStatus(body.error || "Analysis load failed", true); return; }
     document.getElementById("analysis-htttx").value = body.htttx;
     goToView("analysis");
-    loadAnalysis();
+    analyzeWholeGame();
   } catch (e) {
     setStatus(`Network error: ${e}`, true);
   }
@@ -452,6 +510,7 @@ async function startGame() {
         name: name || null,
         difficulty: selectedDifficulty,
         self_reported_elo: isFinite(elo) && elo >= 0 ? elo : null,
+        local_bot: true,
       }),
     });
     if (!resp.ok) {

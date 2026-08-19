@@ -979,6 +979,34 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_model_weights(self):
+            """Serve the exact deployed safetensors to the browser inference worker."""
+            target = Path(mgr.checkpoint_path)
+            if target.suffix != ".safetensors" or not target.is_file():
+                self.send_error(404)
+                return
+            try:
+                data = target.read_bytes()
+                st = target.stat()
+            except OSError:
+                self.send_error(404)
+                return
+            etag = f'"model-{st.st_mtime_ns:x}-{st.st_size:x}"'
+            if self.headers.get("If-None-Match") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "public, max-age=86400, immutable")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400, immutable")
+            self.send_header("ETag", etag)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+
         def _read_json(self, *, limit: int | None = None) -> dict:
             # Force the connection to close after this response. stdlib
             # http.server doesn't decode chunked bodies and we may reject before
@@ -1073,6 +1101,9 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                             .replace('__PLACEMENT_RADIUS__',
                                      str(int(mgr.game_kwargs["placement_radius"])))
                             .replace('__MAX_MOVES__', str(int(mgr.game_kwargs["max_moves"])))
+                            .replace('__MODEL_V__', str(Path(mgr.checkpoint_path).stat().st_mtime_ns)
+                                     if Path(mgr.checkpoint_path).is_file()
+                                     else _asset_version())
                             # absolute origin for OG tags; bare prefix for attribute contexts
                             .replace('__BASE_URL__', html.escape(base_url, quote=True))
                             .replace('__PREFIX_RAW__', html.escape(url_prefix, quote=True))
@@ -1091,6 +1122,8 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                 self._send_json_bytes(200, payload)
             elif path.startswith("/static/"):
                 self._send_static(path[len("/static/"):])
+            elif path == "/model.safetensors":
+                self._send_model_weights()
             elif path == "/stats":
                 self._send_json(200, mgr.recorder.bot_brag(mgr.model_label, mgr.model_step)
                                 if mgr.recorder else {"model_label": mgr.model_label})
@@ -1155,6 +1188,7 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                         name=body.get("name"),
                         difficulty=body.get("difficulty"),
                         self_reported_elo=elo_val,
+                        local_bot=body.get("local_bot") is True,
                     )
                     self._send_json(200, {
                         "game_id": rec.game_id,
@@ -1184,7 +1218,28 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                     if isinstance(q_raw, bool) or isinstance(r_raw, bool) \
                             or not isinstance(q_raw, int) or not isinstance(r_raw, int):
                         raise BadRequestError("q/r must be integers")
-                    rec = mgr.apply_human_move(gid, q_raw, r_raw)
+                    rec = mgr.apply_human_move(
+                        gid, q_raw, r_raw, local_bot=body.get("local_bot") is True)
+                    self._send_json(200, {"state": mgr.snapshot(rec, placement_radius=mgr.game_kwargs["placement_radius"],
+                                                                win_length=mgr.game_kwargs["win_length"], include_htttx=True)})
+                elif path == "/bot_move":
+                    body = self._read_json()
+                    gid = body.get("game_id")
+                    q_raw, r_raw = body.get("q"), body.get("r")
+                    if not isinstance(gid, str):
+                        raise BadRequestError("missing game_id")
+                    if isinstance(q_raw, bool) or isinstance(r_raw, bool) \
+                            or not isinstance(q_raw, int) or not isinstance(r_raw, int):
+                        raise BadRequestError("q/r must be integers")
+                    rec = mgr.apply_bot_move(gid, q_raw, r_raw)
+                    self._send_json(200, {"state": mgr.snapshot(rec, placement_radius=mgr.game_kwargs["placement_radius"],
+                                                                win_length=mgr.game_kwargs["win_length"], include_htttx=True)})
+                elif path == "/bot_turn_fallback":
+                    body = self._read_json()
+                    gid = body.get("game_id")
+                    if not isinstance(gid, str):
+                        raise BadRequestError("missing game_id")
+                    rec = mgr.apply_server_bot_turn(gid)
                     self._send_json(200, {"state": mgr.snapshot(rec, placement_radius=mgr.game_kwargs["placement_radius"],
                                                                 win_length=mgr.game_kwargs["win_length"], include_htttx=True)})
                 elif path == "/resign":

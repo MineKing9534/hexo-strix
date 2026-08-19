@@ -69,6 +69,30 @@ def test_apply_human_move_mutates_record():
     assert any(mv[0] == q and mv[1] == r for mv in rec2.move_log)
 
 
+def test_local_bot_mode_defers_opening_and_accepts_validated_bot_moves():
+    calls = []
+    m = _mgr(bot_turn_fn=lambda rec: calls.append(rec.game_id))
+    rec = m.create_game("P1", "a", random.Random(0), "standard", local_bot=True)
+    assert calls == []
+    assert rec.state.current_player() == rec.bot_side == "P2"
+
+    q, r = rec.state.legal_moves()[0]
+    m.apply_bot_move(rec.game_id, q, r)
+    assert rec.move_log[-1] == (q, r, "P2")
+    assert rec.state.current_player() == "P2"  # second placement of the turn
+
+
+def test_local_bot_mode_does_not_run_server_reply_after_human_turn():
+    calls = []
+    m = _mgr(bot_turn_fn=lambda rec: calls.append(rec.game_id))
+    rec = m.create_game("P2", "a", random.Random(0), "standard", local_bot=True)
+    for _ in range(2):
+        q, r = rec.state.legal_moves()[0]
+        m.apply_human_move(rec.game_id, q, r, local_bot=True)
+    assert calls == []
+    assert rec.state.current_player() == rec.bot_side == "P1"
+
+
 def test_apply_human_move_unknown_game_raises():
     with pytest.raises(UnknownGameError):
         _mgr().apply_human_move("nope", 1, 0)
@@ -390,9 +414,7 @@ def test_restore_skips_and_deletes_unreplayable(tmp_path):
     assert recorder.load_active() == []
 
 
-def test_restore_skips_and_deletes_bot_to_move(tmp_path):
-    # No-stuck-games invariant: nothing schedules a bot turn for a restored
-    # game, so a snapshot left bot-to-move must be dropped, not restored.
+def test_restore_keeps_bot_to_move_for_browser_local_resume(tmp_path):
     m1, recorder = _pmgr(tmp_path)
     m1.create_game("P2", "a", random.Random(0), "standard")
     row = recorder.load_active()[0]
@@ -400,8 +422,9 @@ def test_restore_skips_and_deletes_bot_to_move(tmp_path):
                             "human_side": "P1", "bot_side": "P2",
                             "move_log": [(0, 0, "P1")]})   # P2 (bot) to move
     m2, _ = _pmgr(tmp_path)
-    assert m2.restore_active_games() == 0
-    assert recorder.load_active() == []
+    assert m2.restore_active_games() == 1
+    restored = m2.get_game(row["game_id"])
+    assert restored is not None and restored.state.current_player() == "P2"
 
 
 def test_restore_respects_max_games(tmp_path):

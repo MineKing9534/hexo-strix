@@ -412,6 +412,21 @@ impl StrixSolver {
         Self::solve_inner(&flipped, limits, false)
     }
 
+    /// Wide-generator counterpart to `solve_threat`, used by Observatory's
+    /// automatic per-position analysis.
+    pub fn solve_threat_wide(
+        &self,
+        position: &Position,
+        limits: &SolverLimits,
+    ) -> Result<SolveOutcome, JsError> {
+        let mut flipped = position.clone();
+        flipped.to_move = match flipped.to_move {
+            Player::P1 => Player::P2,
+            Player::P2 => Player::P1,
+        };
+        Self::solve_inner(&flipped, limits, true)
+    }
+
     /// Defensive analysis for the side to move: detects the opponent's
     /// flipped-perspective forcing threat and reports which placements refute it
     /// (killers / pair anchors / best-delay fallback). Wraps

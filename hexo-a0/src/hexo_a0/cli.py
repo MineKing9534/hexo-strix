@@ -284,7 +284,7 @@ def main(argv=None):
                               help="Curriculum TOML; the [model] section is the architecture "
                                    "fallback when the checkpoint has no embedded model_config")
     serve_parser.add_argument("--checkpoint", type=str, required=True,
-                              help="Path to a single .pt checkpoint to serve")
+                              help="Path to a .pt or .safetensors checkpoint to serve")
     serve_parser.add_argument("--win-length", type=int, default=6)
     serve_parser.add_argument("--placement-radius", type=int, default=8)
     serve_parser.add_argument("--max-moves", type=int, default=400)

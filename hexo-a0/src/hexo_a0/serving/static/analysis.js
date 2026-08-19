@@ -36,7 +36,7 @@ async function convertHds() {
 function openConvertedInAnalysis() {
   if (!hdsConvertedHtttx) return;
   document.getElementById("analysis-htttx").value = hdsConvertedHtttx;
-  loadAnalysis();
+  loadGame();
 }
 
 async function copyHdsHtttx() {
@@ -74,7 +74,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     else if (location.hash.startsWith("#a=")) deepMoves = decodeMovesHash(location.hash.slice(3));
     if (deepMoves && deepMoves.length) {
       document.getElementById("analysis-htttx").value = serializeHtttx([[0, 0], ...deepMoves]);
-      loadAnalysis();
+      loadGame();
     }
     return;
   }
@@ -111,8 +111,15 @@ window.addEventListener("DOMContentLoaded", async () => {
 let analysisMode = false;
 let analysisMoves = [];          // loaded mainline move list incl. [0,0] seed
 let analysisTrajectory = null;   // /analyze_game result (drives the eval bar)
+const analysisCfg = window.__HEXO_CFG__ || {};
 const DEFAULT_ANALYSIS_FORCING_DEPTH = 12;
 const MAX_ANALYSIS_FORCING_DEPTH = 60;
+const ANALYSIS_STRENGTHS = {
+  quick: {sims: 16, forcingDepth: 8, forcingBudget: "20000"},
+  standard: {sims: 64, forcingDepth: 10, forcingBudget: "20000"},
+  strong: {sims: 128, forcingDepth: 12, forcingBudget: "250000"},
+  deep: {sims: 256, forcingDepth: 16, forcingBudget: "1000000"},
+};
 const FORCING_ENGINE_INFO = {
   idtt: {
     label: "IDTT",
@@ -178,6 +185,73 @@ let analysisTree = null;
 let analysisMain = [];
 let analysisCurrent = null;
 let analysisCancel = null;  // AbortController for an in-flight /analyze_game
+let inferenceWorker = null;
+let inferenceRequestSerial = 0;
+const inferencePending = new Map();
+
+function analysisStrength() {
+  const select = document.getElementById("analysis-strength");
+  const key = select?.value || localStorage.getItem("hexo_analysis_strength") || "standard";
+  const safe = ANALYSIS_STRENGTHS[key] ? key : "standard";
+  if (select) select.value = safe;
+  return {name: safe, ...ANALYSIS_STRENGTHS[safe]};
+}
+
+function saveAnalysisStrength() {
+  const selected = analysisStrength();
+  localStorage.setItem("hexo_analysis_strength", selected.name);
+}
+
+function inferenceWorkerUrl() {
+  const version = (window.__HEXO_CFG__ || {}).assetVersion || "";
+  return `${URL_PREFIX}/static/inference-worker.js?v=${version}`;
+}
+
+function getInferenceWorker() {
+  if (inferenceWorker) return inferenceWorker;
+  inferenceWorker = new Worker(inferenceWorkerUrl(), {type: "module", name: "strix-inference"});
+  inferenceWorker.onmessage = event => {
+    const message = event.data || {};
+    const pending = inferencePending.get(message.requestId);
+    if (!pending) return;
+    if (message.type === "progress") {
+      pending.progress?.(message.done, message.total);
+    } else if (message.type === "error") {
+      inferencePending.delete(message.requestId);
+      pending.reject(new Error(message.error || "local inference failed"));
+    } else if (message.type === "game" || message.type === "position" || message.type === "bestMove") {
+      inferencePending.delete(message.requestId);
+      pending.resolve(message.result);
+    }
+  };
+  inferenceWorker.onerror = event => {
+    const error = new Error(event.message || "local inference worker failed");
+    for (const pending of inferencePending.values()) pending.reject(error);
+    inferencePending.clear();
+    inferenceWorker?.terminate();
+    inferenceWorker = null;
+  };
+  return inferenceWorker;
+}
+
+function cancelLocalInference() {
+  if (!inferenceWorker) return;
+  inferenceWorker.terminate();
+  inferenceWorker = null;
+  for (const pending of inferencePending.values()) pending.reject(new DOMException("Cancelled", "AbortError"));
+  inferencePending.clear();
+}
+
+function localInference(type, payload, progress) {
+  const requestId = ++inferenceRequestSerial;
+  return new Promise((resolve, reject) => {
+    inferencePending.set(requestId, {resolve, reject, progress});
+    getInferenceWorker().postMessage({
+      type, requestId, modelUrl: (window.__HEXO_CFG__ || {}).modelUrl,
+      ...payload,
+    });
+  });
+}
 
 function _newNode(move, player, parent, result) {
   return {move, player, parent, children: [], result,
@@ -680,7 +754,98 @@ async function streamSSE(url, payload, onEvent, signal) {
   }
 }
 
-async function loadAnalysis() {
+function replayPlayerAt(index) {
+  return index === 0 ? 1 : (Math.floor((index - 1) / 2) % 2 === 0 ? 2 : 1);
+}
+
+function replayHasWin(stones, player, winLength) {
+  const occupied = new Set(stones.filter(s => s.player === player).map(s => `${s.q},${s.r}`));
+  for (const stone of stones) {
+    if (stone.player !== player) continue;
+    for (const [dq, dr] of [[1, 0], [0, 1], [1, -1]]) {
+      if (occupied.has(`${stone.q - dq},${stone.r - dr}`)) continue;
+      let count = 1;
+      while (occupied.has(`${stone.q + dq * count},${stone.r + dr * count}`)) count++;
+      if (count >= winLength) return true;
+    }
+  }
+  return false;
+}
+
+function replayLegalMoves(stones, radius) {
+  const occupied = new Set(stones.map(s => `${s.q},${s.r}`));
+  const legal = new Set();
+  for (const stone of stones) {
+    for (let dq = -radius; dq <= radius; dq++) {
+      for (let dr = -radius; dr <= radius; dr++) {
+        if ((Math.abs(dq) + Math.abs(dr) + Math.abs(dq + dr)) / 2 > radius) continue;
+        const key = `${stone.q + dq},${stone.r + dr}`;
+        if (!occupied.has(key)) legal.add(key);
+      }
+    }
+  }
+  return [...legal].map(key => key.split(",").map(Number));
+}
+
+function replayEntryAt(moves, end, config) {
+  const stones = moves.slice(0, end + 1).map((move, i) => ({
+    q: move[0], r: move[1], player: replayPlayerAt(i),
+  }));
+  const winnerNum = replayHasWin(stones, 1, config.win_length) ? 1
+    : replayHasWin(stones, 2, config.win_length) ? 2 : null;
+  const draw = end >= config.max_moves;
+  const terminal = Boolean(winnerNum || draw);
+  const placements = Math.max(0, end);
+  const toMove = Math.floor(placements / 2) % 2 === 0 ? 2 : 1;
+  const lastMover = stones[stones.length - 1].player;
+  const current = terminal ? (lastMover === 1 ? 2 : 1) : toMove;
+  return {
+    analyzed: false, value: null,
+    current_player: current === 1 ? "P1" : "P2",
+    terminal, winner: winnerNum ? `P${winnerNum}` : null,
+    // Legal expansion is generated lazily when this prefix is viewed. Long
+    // games can contain hundreds of prefixes; eagerly materialising every
+    // radius-expanded move list would make a nominally instant load expensive.
+    legal: terminal ? [] : null,
+    stones: stones.map(s => [[s.q, s.r], s.player === 1 ? "P1" : "P2"]),
+  };
+}
+
+function replayLoadedGame(moves) {
+  const config = {
+    win_length: analysisCfg.winLength,
+    placement_radius: analysisCfg.placementRadius,
+    max_moves: analysisCfg.maxMoves,
+  };
+  const seen = new Set();
+  const trajectory = [];
+  for (let i = 0; i < moves.length; i++) {
+    const key = `${moves[i][0]},${moves[i][1]}`;
+    if (seen.has(key)) throw new Error(`duplicate placement ${key} at move ${i + 1}`);
+    seen.add(key);
+    if (trajectory.length && trajectory[trajectory.length - 1].terminal)
+      throw new Error(`moves continue after the game ended at move ${i}`);
+    trajectory.push(replayEntryAt(moves, i, config));
+  }
+  return trajectory;
+}
+
+let analysisRunActive = false;
+function setAnalysisActionButtons(enabled, running = false) {
+  analysisRunActive = running;
+  const position = document.getElementById("analysis-position-btn");
+  const game = document.getElementById("analysis-game-btn");
+  const load = document.getElementById("analysis-load-btn");
+  if (position) position.disabled = !enabled || running || Boolean(analysisCurrent?.result?.terminal);
+  if (game) game.disabled = !enabled || running;
+  if (load) load.disabled = running;
+}
+
+function analysisInputChanged() {
+  if (!analysisRunActive) setAnalysisActionButtons(false);
+}
+
+function loadGame() {
   const text = document.getElementById("analysis-htttx").value;
   const moves = parseHtttx(text);
   if (moves.length === 0) {
@@ -689,42 +854,122 @@ async function loadAnalysis() {
   }
   analysisMoves = [[0, 0], ...moves];
   if (analysisCancel) analysisCancel.abort();
+  cancelLocalInference();
+  showProgress(false);
+  try {
+    const trajectory = replayLoadedGame(analysisMoves);
+    buildTreeFromTrajectory({trajectory, boundary_indices: []}, false);
+    setAnalysisActionButtons(true);
+  } catch (error) {
+    analysisTree = null;
+    analysisMain = [];
+    analysisCurrent = null;
+    analysisTrajectory = null;
+    setAnalysisActionButtons(false);
+    document.getElementById("analysis-info").textContent = `Could not load game: ${error.message || error}`;
+  }
+}
+
+async function analyzeWholeGame() {
+  const text = document.getElementById("analysis-htttx").value;
+  const moves = parseHtttx(text);
+  if (moves.length === 0) {
+    document.getElementById("analysis-info").textContent = "No moves parsed.";
+    return;
+  }
+  analysisMoves = [[0, 0], ...moves];
+  try {
+    replayLoadedGame(analysisMoves);
+  } catch (error) {
+    document.getElementById("analysis-info").textContent = `Could not load game: ${error.message || error}`;
+    return;
+  }
+  if (analysisCancel) analysisCancel.abort();
+  cancelLocalInference();
   const myCancel = new AbortController();
   analysisCancel = myCancel;
-  showProgress(true, "Starting analysis…", 0, 0, null);
+  setAnalysisActionButtons(true, true);
+  let localProgress = false;
+  showProgress(true, "Loading local analysis engine…", 0, analysisMoves.length, null);
   try {
-    let result = null;
-    await streamSSE(URL_PREFIX + "/analyze_game", {moves: analysisMoves},
-      (ev, data) => {
-        if (ev === "queued") {
-          showProgress(true, "Queued — another analysis is running…", 0, 0, null);
-        } else if (ev === "progress") {
-          showProgress(true, "Analyzing…", data.done, data.total, data.eta_seconds);
-        } else if (ev === "result") {
-          result = data;
-        } else if (ev === "error") {
-          throw new Error(data.error || "analysis failed");
-        }
-      }, myCancel.signal);
-    // A newer loadAnalysis may have started while we awaited; if so, this
+    const strength = analysisStrength();
+    const result = await localInference("analyzeGame", {
+      moves: analysisMoves,
+      config: {win_length: analysisCfg.winLength, placement_radius: analysisCfg.placementRadius, max_moves: analysisCfg.maxMoves},
+      sims: strength.sims, mActions: 16, strength,
+    }, (done, total) => {
+      localProgress = true;
+      showProgress(true, `Analyzing locally (${strength.name})…`, done, total, null);
+    });
+    // A newer analysis may have started while we awaited; if so, this
     // result is stale — discard it so it can't overwrite the newer tree.
     if (analysisCancel !== myCancel) return;
     showProgress(false);
+    setAnalysisActionButtons(true);
     if (!result) {
       document.getElementById("analysis-info").textContent = "Analysis returned no result.";
       return;
     }
     buildTreeFromTrajectory(result);
   } catch (e) {
-    if (analysisCancel === myCancel) showProgress(false);
     if (e.name === "AbortError") return;
-    if (analysisCancel === myCancel)
-      document.getElementById("analysis-info").textContent = `Analysis error: ${e.message || e}`;
+    // Compatibility path for browsers that cannot instantiate this WASM build.
+    // It is intentionally reached only after local initialization/search fails.
+    if (analysisCancel !== myCancel) return;
+    if (localProgress) {
+      showProgress(false);
+      setAnalysisActionButtons(true);
+      document.getElementById("analysis-info").textContent =
+        `Local analysis stopped after ${analysisMoves.length ? "partial progress" : "startup"}: ${e.message || e}`;
+      return;
+    }
+    showProgress(true, "Local engine unavailable; using server fallback…", 0, 0, null);
+    try {
+      let result = null;
+      await streamSSE(URL_PREFIX + "/analyze_game", {moves: analysisMoves}, (ev, data) => {
+        if (ev === "queued") showProgress(true, "Queued on compatibility server…", 0, 0, null);
+        else if (ev === "progress") showProgress(true, "Analyzing on server…", data.done, data.total, data.eta_seconds);
+        else if (ev === "result") result = data;
+      }, myCancel.signal);
+      if (analysisCancel !== myCancel) return;
+      showProgress(false);
+      setAnalysisActionButtons(true);
+      if (result) buildTreeFromTrajectory(result);
+      else throw e;
+    } catch (fallbackError) {
+      showProgress(false);
+      setAnalysisActionButtons(true);
+      if (fallbackError.name !== "AbortError")
+        document.getElementById("analysis-info").textContent = `Analysis error: ${fallbackError.message || fallbackError}`;
+    }
   }
 }
 
-function buildTreeFromTrajectory(result) {
-  analysisTrajectory = result;             // mainline result (drives eval bar)
+async function analyzeCurrentPosition() {
+  const node = analysisCurrent;
+  if (!node?.result || node.result.terminal) return;
+  setAnalysisActionButtons(true, true);
+  const strength = analysisStrength();
+  showProgress(true, `Analyzing this position locally (${strength.name})…`, 0, 0, null);
+  try {
+    const result = await analyzePosition(lineOf(node));
+    if (!result) throw new Error("analysis returned no result");
+    result.analyzed = true;
+    node.result = result;
+    if (analysisTrajectory && analysisMain[node.depth] === node)
+      analysisTrajectory.trajectory[node.depth] = result;
+    if (analysisCurrent === node) setCurrent(node);
+  } catch (error) {
+    if (analysisCurrent === node)
+      document.getElementById("analysis-info").textContent = `Position analysis error: ${error.message || error}`;
+  } finally {
+    showProgress(false);
+    setAnalysisActionButtons(Boolean(analysisTree));
+  }
+}
+
+function buildTreeFromTrajectory(result, analyzed = true) {
+  analysisTrajectory = analyzed ? result : null; // only analyzed games drive the eval bar
   const tr = result.trajectory || [];
   // Build the mainline spine. trajectory[i] is the position AFTER applying
   // analysisMoves[0..i]; node i's move is analysisMoves[i] (null for the seed).
@@ -750,6 +995,13 @@ function setCurrent(node) {
     cancelForcingSolve("Search cancelled because the selected position changed.");
   }
   analysisCurrent = node;
+  if (node?.result?.analyzed === false && node.result.legal === null) {
+    const stones = node.result.stones.map(s => ({
+      q: s[0][0], r: s[0][1], player: s[1] === "P1" ? 1 : 2,
+    }));
+    node.result.legal = replayLegalMoves(stones, analysisCfg.placementRadius);
+  }
+  setAnalysisActionButtons(Boolean(analysisTree), analysisRunActive);
   // Any ordinary navigation (slider, undo, board click, a plain move link)
   // dismisses a selected missed-win callout; showMissedWin re-selects it
   // AFTER calling this, once its own navigation has landed.
@@ -814,7 +1066,9 @@ function renderEvalBar() {
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#0a0c0b";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  if (!analysisTrajectory || !analysisTrajectory.trajectory) return;
+  const hasTrajectory = Boolean(analysisTrajectory?.trajectory?.length);
+  canvas.hidden = !hasTrajectory;
+  if (!hasTrajectory) return;
   const tr = analysisTrajectory.trajectory;
   const boundaries = new Set(analysisTrajectory.boundary_indices || []);
   const W = canvas.width, H = canvas.height;
@@ -960,12 +1214,26 @@ function labelFromLoss(matched, loss) {
 // POST a line to /analyze; returns the position result (JSON) or null.
 async function analyzePosition(moves) {
   try {
-    const resp = await fetch(URL_PREFIX + "/analyze", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({moves}),
-    });
-    return resp.ok ? await resp.json() : null;
-  } catch (_e) { return null; }
+    const strength = analysisStrength();
+    const position = {
+      config: {win_length: analysisCfg.winLength, placement_radius: analysisCfg.placementRadius, max_moves: analysisCfg.maxMoves},
+      stones: moves.map((move, i) => ({
+        q: move[0], r: move[1],
+        player: i === 0 ? 1 : (Math.floor((i - 1) / 2) % 2 === 0 ? 2 : 1),
+      })),
+      to_move: Math.floor(Math.max(0, moves.length - 1) / 2) % 2 === 0 ? 2 : 1,
+      moves_remaining: Math.max(0, moves.length - 1) % 2 === 0 ? 2 : 1,
+    };
+    return await localInference("analyzePosition", {position, sims: strength.sims, mActions: 16, strength});
+  } catch (_e) {
+    try {
+      const resp = await fetch(URL_PREFIX + "/analyze", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({moves}),
+      });
+      return resp.ok ? await resp.json() : null;
+    } catch (_fallbackError) { return null; }
+  }
 }
 
 // Client mirror of classify_turn_quality (analysis.py) — ORDER-INDEPENDENT: a
@@ -1064,8 +1332,9 @@ function renderNode(node) {
   const result = node.result;
   const info = document.getElementById("analysis-info");
   const cp = result.current_player || "?";
-  const v1 = effectiveP1Eval(result);
-  const evalStr = v1 >= 0 ? `+${v1.toFixed(2)}` : v1.toFixed(2);
+  const analyzed = result.analyzed !== false && Number.isFinite(result.value);
+  const v1 = analyzed || (result.terminal && result.winner) ? effectiveP1Eval(result) : null;
+  const evalStr = v1 == null ? null : (v1 >= 0 ? `+${v1.toFixed(2)}` : v1.toFixed(2));
   const q = qualityOf(node);
 
   updateGauge(v1, cp);
@@ -1148,7 +1417,9 @@ function renderNode(node) {
     info.classList.remove("vc");
     info.style.removeProperty("--c");
     html = `<span class="ro-pos">Position ${node.depth + 1}/${lineOf(node).length} · to move <b>${cp}</b></span>`
-         + `<span class="ro-eval"> · eval (P1) <b>${evalStr}</b></span>`
+         + (evalStr == null
+           ? `<span class="ro-eval ro-unanalysed"> · not analyzed</span>`
+           : `<span class="ro-eval"> · eval (P1) <b>${evalStr}</b></span>`)
          + renderTopMovesHtml(result);
   }
   info.innerHTML = html;
@@ -1510,36 +1781,28 @@ function analysisBranchAtDepth(depth, q, r) {
   return branchFrom(n || analysisCurrent, q, r);
 }
 
-async function branchFrom(node, q, r) {
+function branchFrom(node, q, r) {
+  // A touch drag ends with a browser-generated click on the last cell under
+  // the finger. Do not turn that pan gesture into an accidental move.
+  if (Date.now() < _analysisSuppressTapUntil) return;
   if (analysisPanning) return;
   if (!node || !node.result || !node.result.legal) return;
   if (!node.result.legal.some(c => c[0] === q && c[1] === r)) return;
   // If this child already exists (mainline or a prior side line), just go there.
   let child = node.children.find(c => c.move && c.move[0] === q && c.move[1] === r);
   if (child) { setCurrent(child); return; }
-  // New side line: add a child node, fetch its /analyze on demand.
-  child = _newNode([q, r], playerAtDepth(node.depth + 1), node, null);
+  // New side line: replay it immediately without inference. The user can then
+  // request analysis for exactly this position with the explicit button.
+  const moves = [...lineOf(node), [q, r]];
+  const config = {
+    win_length: analysisCfg.winLength,
+    placement_radius: analysisCfg.placementRadius,
+    max_moves: analysisCfg.maxMoves,
+  };
+  const result = replayEntryAt(moves, moves.length - 1, config);
+  child = _newNode([q, r], playerAtDepth(node.depth + 1), node, result);
   node.children.push(child);
   setCurrent(child);
-  const info = document.getElementById("analysis-info");
-  info.textContent = "Analyzing side line…";
-  try {
-    const moves = lineOf(child);
-    const resp = await fetch(URL_PREFIX + "/analyze", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({moves}),
-    });
-    const r2 = await resp.json();
-    if (!resp.ok) { discardSideLine(node, child, r2.error || resp.statusText); return; }
-    // /analyze returns the position AFTER the move; carry current_player + value.
-    child.result = r2;
-    // If this move completed a turn, judge it (best/good/mistake/blunder) just
-    // like the mainline — so extended/puzzle lines get verdicts too.
-    await attachSideLineVerdict(child);
-    if (analysisCurrent === child) { renderNode(child); renderMoveTree(); }
-  } catch (e) {
-    discardSideLine(node, child, `Network error: ${e}`);
-  }
 }
 
 // A failed /analyze must not leave `child` in the tree: branchFrom's
@@ -1764,6 +2027,8 @@ function serializeHtttx(moves) {
 
 // Pan/zoom for analysis board
 const analysisSvg = document.getElementById("analysis-board");
+let _analysisTouchDragged = false;
+let _analysisSuppressTapUntil = 0;
 analysisSvg.addEventListener("mousedown", e => {
   analysisPanning = true;
   analysisPanStart = { x: e.clientX, y: e.clientY, vx: analysisView.x, vy: analysisView.y };
@@ -1779,6 +2044,36 @@ window.addEventListener("mouseup", () => {
   analysisPanning = false;
   analysisSvg.classList.remove("panning");
 });
+// Single-finger pan for phones. The desktop mouse path above is not promoted
+// consistently by mobile browsers, and without this explicit path a finger
+// drag either scrolls the page or generates an accidental cell click.
+analysisSvg.addEventListener("touchstart", e => {
+  if (e.touches.length !== 1 || _analysisPinchStartDist) return;
+  const t = e.touches[0];
+  analysisPanning = true;
+  _analysisTouchDragged = false;
+  analysisPanStart = { x: t.clientX, y: t.clientY, vx: analysisView.x, vy: analysisView.y };
+  analysisSvg.classList.add("panning");
+}, {passive: true});
+analysisSvg.addEventListener("touchmove", e => {
+  if (e.touches.length !== 1 || _analysisPinchStartDist || !analysisPanning) return;
+  const t = e.touches[0];
+  const dx = t.clientX - analysisPanStart.x, dy = t.clientY - analysisPanStart.y;
+  if (Math.abs(dx) + Math.abs(dy) > 4) _analysisTouchDragged = true;
+  if (!_analysisTouchDragged) return;
+  e.preventDefault();
+  analysisView.x = analysisPanStart.vx + dx;
+  analysisView.y = analysisPanStart.vy + dy;
+  updateAnalysisTransform();
+}, {passive: false});
+const _endAnalysisTouch = () => {
+  if (_analysisTouchDragged) _analysisSuppressTapUntil = Date.now() + 300;
+  analysisPanning = false;
+  analysisSvg.classList.remove("panning");
+  _analysisTouchDragged = false;
+};
+analysisSvg.addEventListener("touchend", _endAnalysisTouch);
+analysisSvg.addEventListener("touchcancel", _endAnalysisTouch);
 analysisSvg.addEventListener("wheel", e => {
   e.preventDefault();
   const factor = Math.exp(-e.deltaY * 0.0004);

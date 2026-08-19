@@ -57,6 +57,9 @@ data/
 .coverage
 .cache/
 .rocprofv3/
+node_modules/
+hexo-a0/tests/browser-results/
+hexo-a0/tests/browser-report/
 
 # ---- Third-party repos co-located during development ----
 # SealBot eval opponent: clone Ramora0/HexTicTacToe into sealbot/
