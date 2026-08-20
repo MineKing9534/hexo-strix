@@ -240,14 +240,14 @@ function topbarMenuItems() {
     if (analysisBtn && window.innerWidth <= 480) {
       items.push({ label: "Analysis", onclick: "goToAnalysis()" });
     }
-    // Difficulty badge: shown in the topbar on wider screens, re-exposed
+    // Search-effort badge: shown in the topbar on wider screens, re-exposed
     // here as a read-only label on phones so the user still sees what
     // strength they're playing against.
     const badge = document.getElementById("difficulty-badge");
     if (badge && !badge.hidden && window.innerWidth <= 480) {
       const diffLabel = (DIFFICULTY_LABELS && DIFFICULTY_LABELS[badge.textContent])
         || badge.textContent;
-      items.push({ label: `Difficulty: ${diffLabel}`, disabled: true });
+      items.push({ label: `Search effort: ${diffLabel}`, disabled: true });
     }
   }
   // GitHub source link: present on both screens. Cloned as an <a> so the

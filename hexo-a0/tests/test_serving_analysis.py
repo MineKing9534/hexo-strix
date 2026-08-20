@@ -292,6 +292,32 @@ def test_classify_opponent_forced_win_is_always_blunder():
     assert q["player_end_q"] - q["engine_end_q"] == pytest.approx(-1.25)
 
 
+def test_classify_defender_in_already_lost_position_as_forced_not_blunder():
+    already_lost = {
+        "winner": "P2", "attacker_is_mover": False,
+        "first_move": [5, 5], "pv": [[5, 5]], "pv_len": 1,
+        "defense": {"killers": [], "pair_anchors": [],
+                    "best_delay": [6, 6]},
+    }
+    traj = [
+        _qt_entry("P1", [0.1, 0.8, 0.1], [0.1, 0.2, 0.1], [1, 1, 1],
+                  [[5, 5], [6, 6], [7, 7]], forcing=already_lost),
+        _qt_entry("P1", [0.5, 0.3, 0.2], [0.1, 0.15, 0.1], [1, 1, 1],
+                  [[5, 5], [7, 7], [8, 8]]),
+        _qt_entry("P2", [0.1, 0.1, 0.9], [0.1, 0.1, 0.25], [1, 1, 1],
+                  [[5, 5], [7, 7], [8, 8]], forcing=_QT_OPP_FORCED),
+    ]
+    q = classify_turn_quality(traj, [0, 2], [[0, 0], [5, 5], [7, 7]],
+                              turn_end_idx=2, prev_boundary_idx=0,
+                              eval_after_fn=lambda a, e0: _qt_offline(0.25))
+    assert q is not None
+    assert q["label"] == "forced"
+    assert q["forced_loss"] is True
+    assert q["forced_before_turn"] is True
+    assert q["loss"] == 0.0
+    assert q["player_end_q"] == pytest.approx(0.15)
+
+
 def test_classify_opponent_forced_win_overrides_match():
     # Same resulting board as the engine's line (matched) but that board is a
     # proven loss for the mover — still a blunder, never "best". One-placement
@@ -346,6 +372,31 @@ def test_classify_movers_own_forced_win_is_not_forced_blunder():
     assert q is not None
     assert q.get("forced_loss") is not True
     assert q["label"] != "blunder"  # loss 0.10 -> "good"; missed_win flags it elsewhere
+
+
+def test_classify_move_that_keeps_forced_win_as_winning_not_blunder():
+    own_win = {"winner": "P1", "attacker_is_mover": True,
+               "first_move": [5, 5], "pv": [[5, 5]], "pv_len": 1}
+    kept_win = {
+        "winner": "P1", "attacker_is_mover": False,
+        "first_move": [8, 8], "pv": [[8, 8]], "pv_len": 1,
+        "defense": {"killers": [], "pair_anchors": [],
+                    "best_delay": [9, 9]},
+    }
+    traj = [
+        _qt_entry("P1", [0.9], [0.94], [1], [[5, 5]], forcing=own_win),
+        _qt_entry("P1", [0.9, 0.1], [0.94, 0.35], [1, 1],
+                  [[6, 6], [7, 7]]),
+        _qt_entry("P2", [0.9], [0.2], [1], [[8, 8]], forcing=kept_win),
+    ]
+    q = classify_turn_quality(traj, [0, 2], [[0, 0], [5, 5], [7, 7]],
+                              turn_end_idx=2, prev_boundary_idx=0)
+    assert q is not None
+    assert q["matched"] is False
+    assert q["label"] == "winning"
+    assert q["loss"] == 0.0
+    assert q["proven_win"] is True
+    assert q["win_before_turn"] is True
 
 
 def test_classify_swing_is_correct_across_side_switch():

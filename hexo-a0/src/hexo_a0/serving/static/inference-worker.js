@@ -3,6 +3,11 @@
 
 let apiPromise;
 let botPromise;
+const ANALYSIS_CACHE_DB = "hexo-local-analysis";
+const ANALYSIS_CACHE_STORE = "positions";
+const ANALYSIS_CACHE_VERSION = 2;
+const ANALYSIS_CACHE_MAX_ENTRIES = 512;
+let analysisCachePromise;
 
 function versioned(relative) {
   const url = new URL(relative, import.meta.url);
@@ -10,7 +15,7 @@ function versioned(relative) {
   return url;
 }
 
-async function loadBot(modelUrl) {
+async function loadApi() {
   if (!apiPromise) {
     apiPromise = (async () => {
       const api = await import(versioned("./solver/hexo_wasm.js").href);
@@ -18,15 +23,90 @@ async function loadBot(modelUrl) {
       return api;
     })();
   }
+  return apiPromise;
+}
+
+async function loadBot(modelUrl) {
   if (!botPromise) {
     botPromise = (async () => {
-      const [api, response] = await Promise.all([apiPromise, fetch(modelUrl)]);
+      const [api, response] = await Promise.all([loadApi(), fetch(modelUrl)]);
       if (!response.ok) throw new Error(`model download failed: HTTP ${response.status}`);
       const weights = new Uint8Array(await response.arrayBuffer());
       return new api.StrixBot(weights);
     })();
   }
   return botPromise;
+}
+
+function openAnalysisCache() {
+  if (analysisCachePromise) return analysisCachePromise;
+  analysisCachePromise = new Promise((resolve, reject) => {
+    if (!self.indexedDB) { resolve(null); return; }
+    const request = self.indexedDB.open(ANALYSIS_CACHE_DB, 1);
+    request.onupgradeneeded = () => {
+      const store = request.result.createObjectStore(ANALYSIS_CACHE_STORE, {keyPath: "key"});
+      store.createIndex("saved", "saved");
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  }).catch(() => null);
+  return analysisCachePromise;
+}
+
+function analysisCacheKey(message, position) {
+  const strength = message.strength || {};
+  const stones = position.stones.map(stone => [stone.player, stone.q, stone.r])
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
+  return JSON.stringify([
+    ANALYSIS_CACHE_VERSION,
+    message.modelUrl,
+    position.config.win_length,
+    position.config.placement_radius,
+    position.config.max_moves,
+    position.to_move,
+    position.moves_remaining,
+    Number(message.sims || 0),
+    Number(message.mActions || 0),
+    message.autoForcing !== false,
+    Number(strength.forcingDepth || 0),
+    String(strength.forcingBudget || "0"),
+    stones,
+  ]);
+}
+
+async function analysisCacheGet(message, position) {
+  const db = await openAnalysisCache();
+  if (!db) return null;
+  return new Promise(resolve => {
+    const request = db.transaction(ANALYSIS_CACHE_STORE, "readonly")
+      .objectStore(ANALYSIS_CACHE_STORE).get(analysisCacheKey(message, position));
+    request.onsuccess = () => resolve(request.result?.result || null);
+    request.onerror = () => resolve(null);
+  });
+}
+
+async function analysisCachePut(message, position, result) {
+  const db = await openAnalysisCache();
+  if (!db) return;
+  await new Promise(resolve => {
+    const tx = db.transaction(ANALYSIS_CACHE_STORE, "readwrite");
+    const store = tx.objectStore(ANALYSIS_CACHE_STORE);
+    store.put({key: analysisCacheKey(message, position), saved: Date.now(), result});
+    const count = store.count();
+    count.onsuccess = () => {
+      let excess = count.result - ANALYSIS_CACHE_MAX_ENTRIES;
+      if (excess <= 0) return;
+      const cursor = store.index("saved").openKeyCursor();
+      cursor.onsuccess = () => {
+        if (!cursor.result || excess-- <= 0) return;
+        store.delete(cursor.result.primaryKey);
+        cursor.result.continue();
+      };
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();
+    tx.onabort = () => resolve();
+  });
 }
 
 function hasWin(stones, player, winLength) {
@@ -117,8 +197,60 @@ function forcingResult(api, outcome, attackerIsMover, position) {
   };
 }
 
-function solveForcing(api, position, depthCap = 10, nodeBudget = 20000n) {
-  let solver, solverPos, limits, outcome;
+function takeCoord(coord) {
+  if (!coord) return null;
+  try { return [coord.q, coord.r]; }
+  finally { try { coord.free(); } catch (_error) {} }
+}
+
+function takeDefense(outcome) {
+  const killers = outcome.killers.map(takeCoord);
+  const pairAnchors = outcome.pair_anchors.map(pair => {
+    try { return [takeCoord(pair.first), takeCoord(pair.second)]; }
+    finally { try { pair.free(); } catch (_error) {} }
+  });
+  return {
+    killers,
+    pair_anchors: pairAnchors,
+    best_delay: takeCoord(outcome.best_delay),
+    wide: true,
+  };
+}
+
+function solveOpponentDefense(api, position, depthCap, nodeBudget, fallbackForcing = null) {
+  let solver, solverPos, limits, outcome, threat;
+  try {
+    solver = new api.StrixSolver();
+    solverPos = solverPosition(api, position);
+    limits = new api.SolverLimits(depthCap, nodeBudget, api.SolverEngineEnum.Idtt);
+    outcome = solver.solve_defense_wide(solverPos, limits);
+    if (outcome.kind === api.DefenseKind.BudgetExceeded)
+      return {forcing: fallbackForcing, status: "budget"};
+    if (outcome.kind === api.DefenseKind.NoThreat)
+      return {forcing: null, status: "none"};
+
+    threat = outcome.threat;
+    const checked = forcingResult(api, threat, false, position);
+    if (!checked) return {forcing: fallbackForcing, status: "budget"};
+    // A win can remain proven when reconstruction of its example line runs
+    // out of budget. Keep an existing line in that case, but attach the
+    // authoritative defence classification from this pass.
+    const forcing = checked.pv.length || !fallbackForcing
+      ? checked : {...fallbackForcing, winner: checked.winner, attacker_is_mover: false};
+    forcing.defense = takeDefense(outcome);
+    forcing.defense_status = "checked";
+    return {forcing, status: "checked"};
+  } finally {
+    try { threat?.free(); } catch (_error) {}
+    try { outcome?.free(); } catch (_error) {}
+    try { limits?.free(); } catch (_error) {}
+    try { solverPos?.free(); } catch (_error) {}
+    try { solver?.free(); } catch (_error) {}
+  }
+}
+
+function solveForcing(api, position, depthCap = 10, nodeBudget = 20000n, withDefense = false) {
+  let solver, solverPos, limits, outcome, defenseOutcome;
   try {
     solver = new api.StrixSolver();
     solverPos = solverPosition(api, position);
@@ -127,14 +259,24 @@ function solveForcing(api, position, depthCap = 10, nodeBudget = 20000n) {
     let result = forcingResult(api, outcome, true, position);
     outcome.free(); outcome = null;
     if (!result) {
-      outcome = solver.solve_threat_wide(solverPos, limits);
-      result = forcingResult(api, outcome, false, position);
+      if (withDefense) {
+        defenseOutcome = solver.solve_defense_wide(solverPos, limits);
+        if (defenseOutcome.kind === api.DefenseKind.ThreatFound) {
+          outcome = defenseOutcome.threat;
+          result = forcingResult(api, outcome, false, position);
+          if (result) result.defense = takeDefense(defenseOutcome);
+        }
+      } else {
+        outcome = solver.solve_threat_wide(solverPos, limits);
+        result = forcingResult(api, outcome, false, position);
+      }
     }
     return result;
   } catch (_error) {
     return null;
   } finally {
     try { outcome?.free(); } catch (_error) {}
+    try { defenseOutcome?.free(); } catch (_error) {}
     try { limits?.free(); } catch (_error) {}
     try { solverPos?.free(); } catch (_error) {}
     try { solver?.free(); } catch (_error) {}
@@ -145,8 +287,145 @@ function forcingSettings(message) {
   const strength = message.strength || {};
   const depth = Number.isInteger(strength.forcingDepth) ? strength.forcingDepth : 10;
   const rawBudget = String(strength.forcingBudget || "20000");
-  const budget = /^\d+$/.test(rawBudget) ? BigInt(rawBudget) : 20000n;
+  const budget = message.autoForcing === false ? 0n
+    : /^\d+$/.test(rawBudget) ? BigInt(rawBudget) : 20000n;
   return {depth, budget};
+}
+
+const QUALITY_ICON = {best: "★", winning: "◆", good: "✓", mistake: "?", blunder: "✗", forced: "◇"};
+const QUALITY_COLOR = {best: "#f2c14e", winning: "#79cf9a", good: "#79cf9a",
+  mistake: "#e0a23a", blunder: "#e25c5c", forced: "#aeb8b1"};
+
+function sameMove(a, b) {
+  return Boolean(a && b && a[0] === b[0] && a[1] === b[1]);
+}
+
+function bestMoveByPolicy(entry) {
+  if (!entry?.improved_policy || !entry.legal) return null;
+  let best = -1, probability = -Infinity;
+  for (let i = 0; i < entry.improved_policy.length; i++) {
+    if (entry.candidate_set && !entry.candidate_set[i]) continue;
+    if (entry.improved_policy[i] > probability) {
+      probability = entry.improved_policy[i];
+      best = i;
+    }
+  }
+  return best >= 0 ? entry.legal[best] : null;
+}
+
+function qOfMove(entry, move) {
+  if (!entry?.q_hat || !entry.legal || !move) return null;
+  const index = entry.legal.findIndex(candidate => sameMove(candidate, move));
+  const value = index >= 0 ? Number(entry.q_hat[index]) : NaN;
+  return Number.isFinite(value) ? value : null;
+}
+
+function forcingIsCertain(forcing) {
+  if (!forcing) return false;
+  if (forcing.attacker_is_mover) return true;
+  const defense = forcing.defense;
+  return Boolean(defense && !defense.killers?.length && !defense.pair_anchors?.length && defense.best_delay);
+}
+
+async function completeNeededDefense(api, message, settings, position, entry, winner) {
+  let forcing = entry?.forcing;
+  if (!forcing || forcing.winner !== winner || forcing.attacker_is_mover ||
+      forcing.defense || forcing.defense_status || settings.budget <= 0n) return forcing;
+  const checked = solveOpponentDefense(api, position, settings.depth, settings.budget, forcing);
+  entry.forcing = checked.forcing;
+  await analysisCachePut(message, position, entry);
+  return entry.forcing;
+}
+
+// Classify a turn as soon as its final prefix is available. This consumes the
+// same trajectory entries the game analysis is already producing, so ratings
+// are ready when the worker returns rather than requiring a second UI phase.
+async function classifyCompletedTurn(api, message, settings, positions, trajectory, end, getBot) {
+  const terminal = Boolean(trajectory[end]?.terminal);
+  if (!(terminal || (end >= 2 && end % 2 === 0))) return null;
+  const startIndex = end - (terminal && end % 2 === 1 ? 1 : 2);
+  const start = trajectory[startIndex];
+  const finish = trajectory[end];
+  if (!start || !finish) return null;
+  const mover = start.current_player;
+  const opponent = mover === "P1" ? "P2" : "P1";
+  if (!opponent) return null;
+
+  const played = message.moves.slice(startIndex + 1, end + 1).map(move => move.slice(0, 2));
+  if (!played.length) return null;
+  const first = bestMoveByPolicy(start);
+  if (!first) return null;
+  const engineLine = [first];
+  let engineEndQ = qOfMove(start, first);
+  if (played.length >= 2) {
+    let afterFirst;
+    if (sameMove(first, played[0])) {
+      afterFirst = trajectory[startIndex + 1];
+    } else {
+      const offMoves = [...message.moves.slice(0, startIndex + 1), first];
+      const offPosition = positionAt(offMoves, offMoves.length - 1, message.config);
+      afterFirst = await analysisCacheGet(message, offPosition);
+      if (!afterFirst) {
+        const bot = await getBot();
+        afterFirst = analysisEntry(JSON.parse(bot.best_move(
+          JSON.stringify(offPosition), message.sims, message.mActions, 0n)), offPosition);
+        afterFirst.forcing = settings.budget > 0n
+          ? solveForcing(api, offPosition, settings.depth, settings.budget) : null;
+        await analysisCachePut(message, offPosition, afterFirst);
+      }
+    }
+    const second = bestMoveByPolicy(afterFirst);
+    if (!second) return null;
+    engineLine.push(second);
+    engineEndQ = qOfMove(afterFirst, second);
+  }
+
+  const matched = engineLine.length === played.length &&
+    played.every(move => engineLine.some(engineMove => sameMove(move, engineMove)));
+  let playerEndQ = qOfMove(trajectory[end - 1] || start, played[played.length - 1]);
+  let loss = !matched && engineEndQ != null && playerEndQ != null
+    ? Math.max(0, engineEndQ - playerEndQ) : 0;
+  let label = matched ? "best" : loss >= 0.40 ? "blunder" : loss >= 0.15 ? "mistake" : "good";
+
+  let startForcing = start.forcing;
+  if (startForcing?.winner === opponent)
+    startForcing = await completeNeededDefense(
+      api, message, settings, positions[startIndex], start, opponent);
+  const forcedBeforeTurn = Boolean(forcingIsCertain(startForcing) && startForcing.winner === opponent);
+  const forcedLoss = Boolean(
+    (finish.terminal && finish.winner === opponent) ||
+    (forcingIsCertain(finish.forcing) && finish.forcing.winner === opponent));
+  if (forcedLoss) {
+    if (forcedBeforeTurn) {
+      label = "forced";
+      loss = 0;
+    } else {
+      playerEndQ = -1;
+      loss = engineEndQ == null ? 1 : Math.max(0, engineEndQ - playerEndQ);
+      label = "blunder";
+    }
+  }
+
+  let endForcing = finish.forcing;
+  if (endForcing?.winner === mover)
+    endForcing = await completeNeededDefense(api, message, settings, positions[end], finish, mover);
+  const provenWin = Boolean(
+    (finish.terminal && finish.winner === mover) ||
+    (forcingIsCertain(endForcing) && endForcing.winner === mover));
+  const winBeforeTurn = Boolean(forcingIsCertain(start.forcing) && start.forcing.winner === mover);
+  if (provenWin && !matched) {
+    label = "winning";
+    loss = 0;
+  }
+
+  return {
+    label, icon: QUALITY_ICON[label], color: QUALITY_COLOR[label], matched,
+    engine_pair: engineLine, played_pair: played, loss,
+    player_end_q: playerEndQ, engine_end_q: engineEndQ,
+    forced_loss: forcedLoss, forced_before_turn: forcedBeforeTurn,
+    proven_win: provenWin, win_before_turn: winBeforeTurn,
+    turn_start_depth: startIndex,
+  };
 }
 
 function annotateMissedWins(api, moves, positions, trajectory) {
@@ -190,41 +469,109 @@ self.onmessage = async event => {
   const requestId = msg.requestId;
   let stage = "loading model";
   try {
-    const bot = await loadBot(msg.modelUrl);
-    const api = await apiPromise;
     if (msg.type === "bestMove") {
+      const bot = await loadBot(msg.modelUrl);
       stage = "local bot search";
       const result = JSON.parse(bot.best_move(JSON.stringify(msg.position), msg.sims, msg.mActions, 0n));
       self.postMessage({type: "bestMove", requestId, result});
       return;
     }
-    if (msg.type === "analyzePosition") {
-      stage = "local position analysis";
-      const result = JSON.parse(bot.best_move(JSON.stringify(msg.position), msg.sims, msg.mActions, 0n));
-      const entry = analysisEntry(result, msg.position);
+    if (msg.type === "analyzeDefense") {
+      const api = await loadApi();
       const settings = forcingSettings(msg);
-      entry.forcing = solveForcing(api, msg.position, settings.depth, settings.budget);
+      stage = "local defence check";
+      const result = settings.budget > 0n
+        ? solveOpponentDefense(
+          api, msg.position, settings.depth, settings.budget, msg.forcing || null)
+        : {forcing: msg.forcing || null, status: "disabled"};
+      const cached = await analysisCacheGet(msg, msg.position);
+      if (cached) {
+        cached.forcing = result.forcing;
+        await analysisCachePut(msg, msg.position, cached);
+      }
+      self.postMessage({type: "defense", requestId, result});
+      return;
+    }
+    if (msg.type === "analyzePosition") {
+      stage = "local analysis cache";
+      const cached = await analysisCacheGet(msg, msg.position);
+      if (cached) {
+        if (msg.previewValue) self.postMessage({type: "estimate", requestId, result: {
+          value: cached.value,
+          current_player: cached.current_player,
+        }});
+        self.postMessage({type: "position", requestId, result: cached});
+        return;
+      }
+      const bot = await loadBot(msg.modelUrl);
+      const api = await loadApi();
+      stage = "local position analysis";
+      let result = null;
+      let preview = null;
+      if (msg.previewValue) {
+        stage = "local value estimate";
+        result = JSON.parse(bot.best_move(JSON.stringify(msg.position), 0, msg.mActions, 0n));
+        preview = {
+          value: result.value,
+          current_player: msg.position.to_move === 1 ? "P1" : "P2",
+        };
+        self.postMessage({type: "estimate", requestId, result: {
+          ...preview,
+        }});
+      }
+      const settings = forcingSettings(msg);
+      stage = "local forced-win check";
+      const forcing = settings.budget > 0n
+        ? solveForcing(api, msg.position, settings.depth, settings.budget, true) : null;
+      if (preview) self.postMessage({type: "estimate", requestId, result: {
+        ...preview, forcing,
+      }});
+      if (!result || msg.sims > 0) {
+        stage = "local position search";
+        result = JSON.parse(bot.best_move(JSON.stringify(msg.position), msg.sims, msg.mActions, 0n));
+      }
+      const entry = analysisEntry(result, msg.position);
+      entry.forcing = forcing;
+      await analysisCachePut(msg, msg.position, entry);
       self.postMessage({type: "position", requestId, result: entry});
       return;
     }
     if (msg.type !== "analyzeGame") return;
+    const api = await loadApi();
+    let bot = null;
     stage = "local trajectory analysis";
     const trajectory = [];
     const positions = [];
     const settings = forcingSettings(msg);
+    let cacheHits = 0;
+    let cacheMisses = 0;
+    const getBot = async () => {
+      bot = bot || await loadBot(msg.modelUrl);
+      return bot;
+    };
     for (let i = 0; i < msg.moves.length; i++) {
       const position = positionAt(msg.moves, i, msg.config);
       positions.push(position);
       const terminal = terminalEntry(position);
-      stage = `local MCTS prefix ${i + 1}/${msg.moves.length}`;
-      const entry = terminal || analysisEntry(
-        JSON.parse(bot.best_move(JSON.stringify(position), msg.sims, msg.mActions, 0n)), position);
-      if (!terminal) {
+      stage = `local cache prefix ${i + 1}/${msg.moves.length}`;
+      let entry = terminal || await analysisCacheGet(msg, position);
+      if (!terminal) entry ? cacheHits++ : cacheMisses++;
+      if (!entry) {
+        bot = await getBot();
+        stage = `local MCTS prefix ${i + 1}/${msg.moves.length}`;
+        entry = analysisEntry(
+          JSON.parse(bot.best_move(JSON.stringify(position), msg.sims, msg.mActions, 0n)), position);
         stage = `local forcing prefix ${i + 1}/${msg.moves.length}`;
-        entry.forcing = solveForcing(api, position, settings.depth, settings.budget);
+        entry.forcing = settings.budget > 0n
+          ? solveForcing(api, position, settings.depth, settings.budget) : null;
+        await analysisCachePut(msg, position, entry);
       }
       trajectory.push(entry);
-      self.postMessage({type: "progress", requestId, done: i + 1, total: msg.moves.length});
+      const quality = await classifyCompletedTurn(
+        api, msg, settings, positions, trajectory, i, getBot);
+      if (quality) entry.quality = quality;
+      self.postMessage({type: "progress", requestId, done: i + 1, total: msg.moves.length,
+        cacheHits, cacheMisses});
       if (terminal) break;
     }
     annotateMissedWins(api, msg.moves, positions, trajectory);

@@ -17,7 +17,7 @@ function proofAttackerChoices(node) {
   if (node.kind !== "attacker_move") return [];
   const alternatives = node.alternatives == null ? [] : node.alternatives;
   if (!Array.isArray(alternatives)) {
-    throw new Error("An attacker node has malformed alternatives.");
+    throw new Error("The saved result contains an invalid list of winning moves.");
   }
   return [{action: node.action, child: node.child}, ...alternatives];
 }
@@ -43,12 +43,12 @@ function proofNodeChildren(node) {
 function buildProofModel(bundle) {
   const certificate = bundle && bundle.certificate;
   if (!certificate || !Array.isArray(certificate.nodes) || !certificate.nodes.length) {
-    throw new Error("This result does not contain a proof DAG.");
+    throw new Error("This result does not include the replies needed for exploration.");
   }
   const nodes = certificate.nodes;
   const root = Number(certificate.root);
   if (!Number.isInteger(root) || root < 0 || root >= nodes.length) {
-    throw new Error("The proof root is out of range.");
+    throw new Error("The saved result has an invalid starting position.");
   }
   const depths = new Array(nodes.length);
   const visiting = new Set();
@@ -65,7 +65,7 @@ function buildProofModel(bundle) {
     }
     for (const child of proofNodeChildren(nodes[id])) {
       if (!Number.isInteger(child) || child < 0 || child >= nodes.length) {
-        throw new Error(`Proof node ${id} has an invalid child.`);
+        throw new Error(`The saved result links position ${id} to a missing reply.`);
       }
       parents[child]++;
       edges++;
@@ -74,7 +74,7 @@ function buildProofModel(bundle) {
 
   function remaining(id) {
     if (depths[id] !== undefined) return depths[id];
-    if (visiting.has(id)) throw new Error("The proof contains a cycle.");
+    if (visiting.has(id)) throw new Error("The saved result contains a loop and cannot be shown.");
     visiting.add(id);
     const node = nodes[id];
     let depth;
@@ -84,14 +84,14 @@ function buildProofModel(bundle) {
       const bounds = proofAttackerChoices(node).map(choice => 1 + remaining(choice.child));
       for (let index = 1; index < bounds.length; index++) {
         if (bounds[index] < bounds[index - 1]) {
-          throw new Error(`Proof node ${id} has attacker choices that are not depth-ranked.`);
+          throw new Error(`The winning moves saved for position ${id} are not in the expected order.`);
         }
       }
       depth = bounds[0];
     } else if (node.kind === "defender_replies" && node.responses.length) {
       depth = Math.max(...node.responses.map(response => remaining(response.child)));
     } else {
-      throw new Error(`Proof node ${id} has an unknown or empty shape.`);
+      throw new Error(`Position ${id} in the saved result is incomplete.`);
     }
     visiting.delete(id);
     depths[id] = depth;
@@ -101,7 +101,7 @@ function buildProofModel(bundle) {
   const maxAttackerTurns = remaining(root);
   if (bundle.verification && bundle.verification.maxAttackerTurns != null
       && Number(bundle.verification.maxAttackerTurns) !== maxAttackerTurns) {
-    throw new Error("The downloaded proof summary does not match its DAG.");
+    throw new Error("The downloaded summary does not match its saved replies.");
   }
 
   function worstResponseIndex(node) {
@@ -146,17 +146,17 @@ function proofOptimizationDescription(bundle) {
   if (optimization.shortestCertified && lower + 1 === upper) {
     const dagDepth = Number(bundle.verification.maxAttackerTurns);
     return {
-      short: `shortest search: ${upper} turns`,
+      short: `shortest win: ${upper} turns`,
       full: dagDepth === upper
-        ? `The bounded PDS-PN search certified a shortest win in ${upper} attacker turns and excluded every win through ${lower}. This explorer independently replays its optimal ≤${upper}-turn strategy DAG. The lower-bound exclusion is a separate exhaustive search result, not an edge in the DAG.`
-        : `The originating bounded PDS-PN search certified a shortest win in ${upper} attacker turns and excluded every win through ${lower}. This explorer independently replays the separate ≤${dagDepth}-turn strategy DAG used as its upper bound; the lower-bound exclusion is not encoded in this DAG.`,
+        ? `The search proved that the winning side can force a win in ${upper} turns and cannot force one sooner. Every reply shown here was checked on this device.`
+        : `The search proved that the winning side can force a win in ${upper} turns and cannot force one sooner. The saved replies shown here prove a win within ${dagDepth} turns.`,
     };
   }
   return {
-    short: lower > 0 ? `shortest range: ${lower + 1}–${upper}` : `verified win ≤${upper}`,
+    short: lower > 0 ? `shortest win: ${lower + 1}–${upper} turns` : `win within ${upper} turns`,
     full: lower > 0
-      ? `The originating bounded PDS-PN search narrowed the shortest win to ${lower + 1}–${upper} attacker turns. This explorer independently replays the ≤${bundle.verification.maxAttackerTurns}-turn strategy DAG; the lower-bound search is not encoded in it.`
-      : `The originating shortest search retained a verified win within ${upper} attacker turns but did not establish a lower bound. This explorer independently replays that strategy DAG.`,
+      ? `The search proved that the shortest win takes between ${lower + 1} and ${upper} turns by the winning side. The saved replies shown here prove a win within ${bundle.verification.maxAttackerTurns} turns.`
+      : `The search proved a win within ${upper} turns by the winning side, but did not prove whether a faster win exists.`,
   };
 }
 
@@ -180,7 +180,7 @@ function buildProofSampleLine(bundle, rootStones, attacker) {
     entries.push({
       nodeId: Number(bundle.certificate.root), stones,
       attackerTurnsPlayed,
-      label: turn.player === attacker ? `A${attackerTurnsPlayed}` : `D${index / 2 + 0.5}`,
+      label: turn.player === attacker ? `Winning turn ${attackerTurnsPlayed}` : `Reply ${Math.ceil(index / 2)}`,
       lastAction: {action: turn.cells, player: turn.player},
       shownWin: index === turns.length - 1,
     });
@@ -190,16 +190,16 @@ function buildProofSampleLine(bundle, rootStones, attacker) {
 
 function applyProofAction(stones, action, player) {
   if (!Array.isArray(action) || action.length < 1 || action.length > 2) {
-    throw new Error("A proof action must contain one or two placements.");
+    throw new Error("Each saved move must place one or two hexes.");
   }
   const next = new Map(stones);
   for (const cell of action) {
     if (!Array.isArray(cell) || cell.length !== 2
         || !Number.isInteger(cell[0]) || !Number.isInteger(cell[1])) {
-      throw new Error("A proof placement has invalid coordinates.");
+      throw new Error("A saved move has invalid coordinates.");
     }
     const key = `${cell[0]},${cell[1]}`;
-    if (next.has(key)) throw new Error(`The proof tried to replay occupied cell ${key}.`);
+    if (next.has(key)) throw new Error(`A saved move tries to use the occupied hex ${key}.`);
     next.set(key, player);
   }
   return next;
@@ -227,7 +227,7 @@ function normalizeProofPosition(position) {
       },
     };
   }
-  throw new Error("The proof bundle has no replayable root position.");
+  throw new Error("The saved result does not include its starting position.");
 }
 
 function currentProofBundle() {
@@ -275,7 +275,7 @@ function openProofExplorerBundle(bundle, {savedUrl = null} = {}) {
       document.getElementById("proof-close-btn").focus();
     });
   } catch (error) {
-    setForcingStatus(`Could not open proof: ${error.message || error}`, "error");
+    setForcingStatus(`This result could not be opened: ${error.message || error}`, "error");
   }
 }
 
@@ -313,18 +313,18 @@ function verifySavedProof(bundle) {
       const message = event.data || {};
       if (message.requestId !== requestId) return;
       if (message.type === "error") {
-        finish(reject)(new Error(message.error || "Certificate verification failed."));
+        finish(reject)(new Error(message.error || "The saved replies could not be checked."));
         return;
       }
       if (message.type !== "verified") return;
       if (!verificationSummariesMatch(bundle.verification, message.summary)) {
-        finish(reject)(new Error("The saved proof summary does not match the verified certificate."));
+        finish(reject)(new Error("The saved summary does not match the replies checked in this browser."));
         return;
       }
       finish(resolve)(message.summary);
     };
     worker.onerror = event => finish(reject)(
-      new Error(event.message || "The proof-verification worker crashed."),
+      new Error(event.message || "This browser stopped while checking the saved replies."),
     );
     try {
       worker.postMessage({
@@ -340,27 +340,27 @@ function verifySavedProof(bundle) {
 }
 
 async function loadSavedProof(proofId) {
-  setForcingStatus("Loading the saved proof…");
+  setForcingStatus("Loading the saved result…");
   try {
     const response = await fetch(`${URL_PREFIX}/api/proofs/${encodeURIComponent(proofId)}`);
     if (!response.ok) {
       throw new Error(response.status === 404
-        ? "That saved proof does not exist on this server."
+        ? "That saved result is no longer available on this server."
         : `The server returned HTTP ${response.status}.`);
     }
     const bundle = await response.json();
-    setForcingStatus("Verifying every branch of the saved proof in your browser…");
+    setForcingStatus("Checking every saved reply in your browser…");
     const summary = await verifySavedProof(bundle);
     const optimization = proofOptimizationDescription(bundle);
     setForcingStatus(
-      `Verified saved proof: ${summary.dagNodes.toLocaleString()} nodes, `
-      + `worst-case ${summary.maxAttackerTurns} attacker turns.`
-      + (optimization ? ` Originating ${optimization.short}.` : ""),
+      `Saved result checked: ${summary.dagNodes.toLocaleString()} positions, `
+      + `with a win within ${summary.maxAttackerTurns} turns by the winning side.`
+      + (optimization ? ` ${optimization.short}.` : ""),
       "win",
     );
     openProofExplorerBundle(bundle, {savedUrl: location.href.split("#")[0]});
   } catch (error) {
-    setForcingStatus(`Could not open saved proof: ${error.message || error}`, "error");
+    setForcingStatus(`The saved result could not be opened: ${error.message || error}`, "error");
   }
 }
 
@@ -391,7 +391,7 @@ function setProofShareUi(message, state = "") {
   for (const id of ["analysis-share-certificate-btn", "proof-share-btn"]) {
     const button = document.getElementById(id);
     if (button) button.textContent = message === "Link copied" ? "Link copied"
-      : message === "Saving…" ? "Saving…" : "Share proof";
+      : message === "Saving…" ? "Saving…" : "Copy result link";
   }
 }
 
@@ -454,7 +454,7 @@ function proofChoiceHtml({letter, action, copy, bound, color, onclick, badge = "
   return `<button class="proof-choice" style="--choice-color:${color}" onclick="${onclick}">`
     + `<span class="proof-choice-letter">${letter}</span>`
     + `<span class="proof-choice-main"><b>${formatProofAction(action)}</b><small>${copy}</small></span>`
-    + `<span class="proof-choice-bound">win ≤${bound} turn${bound === 1 ? "" : "s"}`
+    + `<span class="proof-choice-bound">win within ${bound} turn${bound === 1 ? "" : "s"}`
     + (badge ? `<span class="proof-choice-badge ${badgeClass}">${badge}</span>` : "")
     + `</span></button>`;
 }
@@ -462,17 +462,13 @@ function proofChoiceHtml({letter, action, copy, bound, color, onclick, badge = "
 function proofStepTags(entry, node, remaining) {
   const model = proofExplorerState.model;
   const tags = [
-    `<span class="proof-step-tag strong">win within ≤${remaining} attacker turn${remaining === 1 ? "" : "s"}</span>`,
-    `<span class="proof-step-tag">node ${entry.nodeId.toLocaleString()}</span>`,
+    `<span class="proof-step-tag strong">win within ${remaining} turn${remaining === 1 ? "" : "s"} by the winning side</span>`,
   ];
-  if (model.parents[entry.nodeId] > 1) {
-    tags.push(`<span class="proof-step-tag">transposition · ${model.parents[entry.nodeId]} incoming paths</span>`);
-  }
   if (node.kind === "defender_replies") {
-    tags.push(`<span class="proof-step-tag">all ${node.responses.length} exact replies shown</span>`);
+    tags.push(`<span class="proof-step-tag">all ${node.responses.length} checked replies shown</span>`);
   } else if (node.kind === "attacker_move") {
     const count = model.attackerChoices(node).length;
-    tags.push(`<span class="proof-step-tag">${count} certified attack${count === 1 ? "" : "s"} retained</span>`);
+    tags.push(`<span class="proof-step-tag">${count} winning move${count === 1 ? "" : "s"} found</span>`);
   }
   return `<div class="proof-step-tags">${tags.join("")}</div>`;
 }
@@ -490,26 +486,25 @@ function renderProofExplorer() {
   const summary = document.getElementById("proof-explorer-summary");
   const optimization = proofOptimizationDescription(proofExplorerState.bundle);
   summary.textContent = (optimization ? `${optimization.short} · ` : "")
-    + `${model.nodes.length.toLocaleString()} nodes · `
-    + `${model.attackerAlternatives.toLocaleString()} alternatives at `
-    + `${model.alternativeAttackerNodes.toLocaleString()} attack nodes · `
-    + `≤${model.maxAttackerTurns} attacker turns`;
+    + `${model.nodes.length.toLocaleString()} positions checked · `
+    + `${model.attackerAlternatives.toLocaleString()} other winning moves · `
+    + `win within ${model.maxAttackerTurns} turns by the winning side`;
   const optimizationNote = document.getElementById("proof-optimization-note");
   optimizationNote.hidden = !optimization;
   optimizationNote.textContent = optimization ? optimization.full : "";
   document.getElementById("proof-attacker-swatch").style.background = attacker === "P1" ? "#f08a3c" : "#3fb6d9";
   document.getElementById("proof-defender-swatch").style.background = defender === "P1" ? "#f08a3c" : "#3fb6d9";
-  document.getElementById("proof-attacker-legend").textContent = `${attacker} attacker`;
-  document.getElementById("proof-defender-legend").textContent = `${defender} defender`;
+  document.getElementById("proof-attacker-legend").textContent = `${attacker} · winning side`;
+  document.getElementById("proof-defender-legend").textContent = `${defender} · defending side`;
   document.getElementById("proof-back-btn").disabled = history.length <= 1;
   document.getElementById("proof-node-label").textContent = entry.shownWin
-    ? "certified completion" : `node ${entry.nodeId.toLocaleString()} / ${model.nodes.length.toLocaleString()}`;
+    ? "win complete" : `position ${history.length}`;
   document.getElementById("proof-progress-label").textContent = entry.shownWin
-    ? `${entry.attackerTurnsPlayed} attacker turns · complete`
-    : `${entry.attackerTurnsPlayed} attacker turns played · ≤${remaining} remain`;
+    ? `${entry.attackerTurnsPlayed} turns by the winning side · complete`
+    : `${entry.attackerTurnsPlayed} turns by the winning side played · no more than ${remaining} remain`;
   const progress = entry.shownWin ? 100
     : Math.min(98, entry.attackerTurnsPlayed / model.maxAttackerTurns * 100);
-  document.getElementById("proof-progress-bar").style.width = `${progress}%`;
+  document.getElementById("proof-progress-bar").style.transform = `scaleX(${progress / 100})`;
 
   const card = document.getElementById("proof-step-card");
   const choices = document.getElementById("proof-choices");
@@ -520,7 +515,7 @@ function renderProofExplorer() {
   const sampleAttainsBound = proofExplorerState.sampleLine
     && proofExplorerState.sampleLine.entries.at(-1).attackerTurnsPlayed
       === Number(proofExplorerState.bundle.optimization.bestUpperDepth);
-  shortestButton.textContent = sampleAttainsBound ? "Max-delay line" : "Shortest-search sample";
+  shortestButton.textContent = sampleAttainsBound ? "Longest defence" : "Example winning line";
   let cardHtml = "";
   let choicesHtml = "";
   let accent = "var(--brass)";
@@ -529,44 +524,41 @@ function renderProofExplorer() {
   const nearestAlternatives = alternativesHere ? [] : model.nearestAlternativePath(entry.nodeId);
   alternativesButton.hidden = model.attackerAlternatives === 0;
   alternativesButton.disabled = alternativesHere || !nearestAlternatives;
-  alternativesButton.textContent = alternativesHere ? "Alternatives here"
-    : nearestAlternatives ? `Find alternatives (${model.alternativeAttackerNodes.toLocaleString()})`
-      : "No later alternatives";
+  alternativesButton.textContent = alternativesHere ? "Other winning moves shown"
+    : nearestAlternatives ? `Other winning moves (${model.alternativeAttackerNodes.toLocaleString()})`
+      : "No other moves later";
 
   if (entry.shownWin) {
     accent = "var(--good)";
-    cardHtml = `<div class="proof-step-kicker">Certificate complete</div>`
-      + `<div class="proof-step-title">Certified win</div>`
-      + `<div class="proof-step-copy">The highlighted completion makes six. Use Back to inspect another defense or Reset to return to the root.</div>`;
+    cardHtml = `<div class="proof-step-kicker">Win complete</div>`
+      + `<div class="proof-step-title">The winning line is complete</div>`
+      + `<div class="proof-step-copy">The highlighted move completes six in a row. Go back to try another reply, or start again from the first position.</div>`;
     worstButton.disabled = true;
-    worstButton.textContent = "Proof complete";
+    worstButton.textContent = "Win complete";
   } else if (node.kind === "attacker_move") {
     accent = attacker === "P1" ? "var(--p1)" : "var(--p2)";
     const attacks = model.attackerChoices(node);
     const hasAlternatives = attacks.length > 1;
-    cardHtml = `<div class="proof-step-kicker">Attacker · ${proofPlayerClass(attacker)}</div>`
-      + `<div class="proof-step-title">${hasAlternatives ? `${attacks.length} certified attacking moves` : "Certified attacking move"}</div>`
+    cardHtml = `<div class="proof-step-kicker">Winning side · ${proofPlayerClass(attacker)}</div>`
+      + `<div class="proof-step-title">${hasAlternatives ? `${attacks.length} winning moves found` : "Winning move found"}</div>`
       + (hasAlternatives
-        ? `<div class="proof-step-copy">The normal PDS-PN run retained these winning attacks. They are ranked by independently verified worst-case depth; other winning moves may still exist.</div>`
-        : `<div class="proof-step-copy">This run retained only one certified attack at this position. That does not mean it is the only winning move. Use Find alternatives to jump to a branching attacker position elsewhere in the proof.</div>`)
+        ? `<div class="proof-step-copy">Each move shown can force a win. Moves that guarantee a quicker win appear first. The search may not have saved every winning move.</div>`
+        : `<div class="proof-step-copy">The search saved one move that can force a win here. Other winning moves may exist.</div>`)
       + proofStepTags(entry, node, remaining);
     const attackBounds = attacks.map(choice => 1 + model.remaining(choice.child));
     choicesHtml = attacks.map((choice, index) => {
       const bound = attackBounds[index];
       const tiedShortest = index > 0 && bound === attackBounds[0];
-      const depthRank = 1 + new Set(
-        attackBounds.slice(0, index).filter(candidate => candidate < bound),
-      ).size;
       return proofChoiceHtml({
         letter: String(index + 1), action: choice.action,
         color: index === 0 ? (attacker === "P1" ? "#f08a3c" : "#3fb6d9")
           : PROOF_CHOICE_COLORS[index % PROOF_CHOICE_COLORS.length],
         copy: index === 0
-          ? "Recommended · shortest verified bound retained by this solve"
-          : tiedShortest ? "Certified alternative · tied for the shortest verified bound"
-            : `Certified alternative · verified depth rank ${depthRank}`,
+          ? "Recommended · guarantees the quickest win found"
+          : tiedShortest ? "Also guarantees the quickest win found"
+            : "Also wins · may take longer",
         bound,
-        badge: index === 0 ? "recommended" : tiedShortest ? "tied shortest" : "",
+        badge: index === 0 ? "recommended" : tiedShortest ? "equally quick" : "",
         badgeClass: "recommended",
         onclick: `proofExplorerPlayAttacker(${index})`,
       });
@@ -576,9 +568,9 @@ function renderProofExplorer() {
   } else if (node.kind === "defender_replies") {
     accent = defender === "P1" ? "var(--p1)" : "var(--p2)";
     const plural = node.responses.length === 1 ? "response" : "responses";
-    cardHtml = `<div class="proof-step-kicker">Defender · ${proofPlayerClass(defender)}</div>`
-      + `<div class="proof-step-title">Choose a defense</div>`
-      + `<div class="proof-step-copy">The verifier recomputed ${node.responses.length} exact non-losing ${plural}. Choose any reply to inspect how the certified attack continues.</div>`
+    cardHtml = `<div class="proof-step-kicker">Defending side · ${proofPlayerClass(defender)}</div>`
+      + `<div class="proof-step-title">Choose a reply</div>`
+      + `<div class="proof-step-copy">The search checked all ${node.responses.length} ${plural} shown here. Choose one to see how the winning side continues.</div>`
       + proofStepTags(entry, node, remaining);
     const worstIndex = model.worstResponseIndex(node);
     const worstBound = model.remaining(node.responses[worstIndex].child);
@@ -590,31 +582,31 @@ function renderProofExplorer() {
         letter: String.fromCharCode(65 + index), action: response.action,
         color: PROOF_CHOICE_COLORS[index % PROOF_CHOICE_COLORS.length],
         copy: isWorst
-          ? (worstTies > 1 ? "Ties for the largest remaining bound" : "This branch maximizes the remaining bound")
-          : "Also completely covered by the proof",
-        bound, badge: isWorst ? "longest defense" : "", badgeClass: "longest",
+          ? (worstTies > 1 ? "Also delays the win for the longest time" : "Delays the win for the longest time")
+          : "The winning side can answer this too",
+        bound, badge: isWorst ? "longest defence" : "", badgeClass: "longest",
         onclick: `proofExplorerChooseDefense(${index})`,
       });
     }).join("");
     worstButton.disabled = false;
-    worstButton.textContent = "Choose longest defense →";
+    worstButton.textContent = "Choose longest defence →";
   } else if (node.kind === "immediate_win") {
     accent = "var(--good)";
-    cardHtml = `<div class="proof-step-kicker">Attacker · ${proofPlayerClass(attacker)}</div>`
+    cardHtml = `<div class="proof-step-kicker">Winning side · ${proofPlayerClass(attacker)}</div>`
       + `<div class="proof-step-title">Complete the six</div>`
-      + `<div class="proof-step-copy">The verifier found a legal completion during the current attacker turn. Show it on the board to finish this branch.</div>`
+      + `<div class="proof-step-copy">The winning side can complete six in a row during this turn. Show the move on the board to finish this line.</div>`
       + proofStepTags(entry, node, remaining);
     choicesHtml = proofChoiceHtml({
-      letter: "✓", action: node.action, color: "#79cf9a", copy: "Show the certified winning completion",
+      letter: "✓", action: node.action, color: "#79cf9a", copy: "Show the move that completes the win",
       bound: 1, onclick: "proofExplorerPlayAttacker()",
     });
     worstButton.disabled = false;
     worstButton.textContent = "Show winning move →";
   } else if (node.kind === "unstoppable") {
     accent = "var(--good)";
-    cardHtml = `<div class="proof-step-kicker">Terminal proof node</div>`
-      + `<div class="proof-step-title">Unstoppable fork</div>`
-      + `<div class="proof-step-copy">There is no two-placement defense covering every winning completion. Whatever ${defender} plays, ${attacker} completes a six on the next attacker turn.</div>`
+    cardHtml = `<div class="proof-step-kicker">No reply can stop the win</div>`
+      + `<div class="proof-step-title">Two winning threats</div>`
+      + `<div class="proof-step-copy">${defender} cannot block every way to make six. Whatever ${defender} plays, ${attacker} can complete six on its next turn.</div>`
       + proofStepTags(entry, node, remaining);
     worstButton.disabled = true;
     worstButton.textContent = "No defense remains";
@@ -636,48 +628,48 @@ function renderShortestSampleLine() {
   const sampleAttackerTurns = sampleLine.entries[total].attackerTurnsPlayed;
   const attainsBound = sampleAttackerTurns === Number(optimization.bestUpperDepth);
   document.getElementById("proof-explorer-summary").textContent =
-    `shortest bound ${optimization.bestUpperDepth} · ${attainsBound ? "max-delay" : "sample"} ${sampleAttackerTurns} attacker turns · ${total} played turns`;
+    `shortest win ${optimization.bestUpperDepth} turns · ${attainsBound ? "longest defence" : "example"} uses ${sampleAttackerTurns} turns by the winning side · ${total} total turns`;
   const note = document.getElementById("proof-optimization-note");
   note.hidden = false;
   note.textContent = attainsBound
-    ? `This is the concrete minimax principal variation: the attacker follows a depth-optimal certified attack and the defender chooses a certified maximum-delay reply at every branch. It attains the ${optimization.bestUpperDepth}-attacker-turn bound.`
-    : `This is one legal principal variation recovered by the depth-${optimization.bestUpperDepth} search. It ends after ${sampleAttackerTurns} attacker turns because this particular defense does not postpone as long as possible; ${optimization.bestUpperDepth} is the optimal worst-case guarantee across every defense.`;
+    ? `This line shows the winning side choosing the quickest proved win while the other side always chooses the reply that delays it longest. The win still finishes in ${optimization.bestUpperDepth} turns by the winning side.`
+    : `This is one example winning line. It finishes after ${sampleAttackerTurns} turns by the winning side because these replies do not delay the win as long as possible. Against any reply, the win takes no more than ${optimization.bestUpperDepth} turns.`;
   document.getElementById("proof-attacker-swatch").style.background = attacker === "P1" ? "#f08a3c" : "#3fb6d9";
   document.getElementById("proof-defender-swatch").style.background = defender === "P1" ? "#f08a3c" : "#3fb6d9";
-  document.getElementById("proof-attacker-legend").textContent = `${attacker} attacker`;
-  document.getElementById("proof-defender-legend").textContent = `${defender} defender`;
+  document.getElementById("proof-attacker-legend").textContent = `${attacker} · winning side`;
+  document.getElementById("proof-defender-legend").textContent = `${defender} · defending side`;
   document.getElementById("proof-back-btn").disabled = lineIndex === 0;
-  document.getElementById("proof-node-label").textContent = `sample turn ${lineIndex} / ${total}`;
+  document.getElementById("proof-node-label").textContent = `turn ${lineIndex} of ${total}`;
   document.getElementById("proof-progress-label").textContent = next
-    ? `${entry.attackerTurnsPlayed} attacker turns played`
-    : `${sampleAttackerTurns} attacker turns · line complete`;
-  document.getElementById("proof-progress-bar").style.width = `${total ? lineIndex / total * 100 : 0}%`;
+    ? `${entry.attackerTurnsPlayed} turns by the winning side played`
+    : `${sampleAttackerTurns} turns by the winning side · line complete`;
+  document.getElementById("proof-progress-bar").style.transform = `scaleX(${total ? lineIndex / total : 0})`;
 
   const shortestButton = document.getElementById("proof-shortest-line-btn");
   shortestButton.hidden = false;
-  shortestButton.textContent = "Return to proof DAG";
+  shortestButton.textContent = "Return to all replies";
   const alternativesButton = document.getElementById("proof-alternatives-btn");
   alternativesButton.hidden = true;
   const worstButton = document.getElementById("proof-worst-btn");
   worstButton.disabled = !next;
-  worstButton.textContent = next ? "Next sample turn →" : "Sample complete";
+  worstButton.textContent = next ? "Next turn →" : "Line complete";
   const card = document.getElementById("proof-step-card");
   const choices = document.getElementById("proof-choices");
   if (next) {
     const role = next.player === attacker ? "Attacker" : "Defender";
     card.style.setProperty("--proof-accent", next.player === "P1" ? "var(--p1)" : "var(--p2)");
-    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Maximum-delay line" : "Shortest-search sample"} · ${role}</div>`
+    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Longest defence" : "Example winning line"} · ${role === "Attacker" ? "winning side" : "defending side"}</div>`
       + `<div class="proof-step-title">Play turn ${lineIndex + 1}</div>`
-      + `<div class="proof-step-copy">${attainsBound ? "The attacker minimizes the certified mate depth; the defender maximizes it." : "This is the solver's recovered principal variation, not a claim that this defense is the longest one."}</div>`;
+      + `<div class="proof-step-copy">${attainsBound ? "The winning side chooses its quickest proved win. The other side chooses the reply that delays it longest." : "This is one example. The defending side may have another reply that delays the win longer."}</div>`;
     choices.innerHTML = `<button class="proof-choice" style="--choice-color:${next.player === "P1" ? "#f08a3c" : "#3fb6d9"}" onclick="proofExplorerShortestNext()">`
       + `<span class="proof-choice-letter">${lineIndex + 1}</span>`
       + `<span class="proof-choice-main"><b>${formatProofAction(next.cells)}</b><small>${next.player} · ${role.toLowerCase()}</small></span>`
-      + `<span class="proof-choice-bound">sample turn ${lineIndex + 1}/${total}</span></button>`;
+      + `<span class="proof-choice-bound">turn ${lineIndex + 1} of ${total}</span></button>`;
   } else {
     card.style.setProperty("--proof-accent", "var(--good)");
-    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Maximum-delay line complete" : "Shortest-search sample complete"}</div>`
-      + `<div class="proof-step-title">${attainsBound ? "Mate bound attained" : "Winning sample line"}</div>`
-      + `<div class="proof-step-copy">The final highlighted move completes the win. Return to the proof DAG to explore every certified defense branch.</div>`;
+    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Longest defence complete" : "Example line complete"}</div>`
+      + `<div class="proof-step-title">Winning line complete</div>`
+      + `<div class="proof-step-copy">The final highlighted move completes the win. Return to all replies to try other defensive moves.</div>`;
     choices.innerHTML = "";
   }
   renderProofBreadcrumbs();
@@ -716,7 +708,7 @@ function proofAdvance(child, action, player, label, shownWin = false) {
     requestAnimationFrame(proofKeepHighlightVisible);
   } catch (error) {
     closeProofExplorer();
-    setForcingStatus(`Proof replay failed: ${error.message || error}`, "error");
+    setForcingStatus(`The saved moves could not be shown: ${error.message || error}`, "error");
   }
 }
 
@@ -729,7 +721,7 @@ function proofExplorerPlayAttacker(index = 0) {
     if (!choice) return;
     const turn = entry.attackerTurnsPlayed + 1;
     proofAdvance(choice.child, choice.action, proofExplorerState.attacker,
-      `A${turn} · #${index + 1}`);
+      `Winning turn ${turn} · move ${index + 1}`);
   } else if (node.kind === "immediate_win") {
     const turn = entry.attackerTurnsPlayed + 1;
     proofAdvance(null, node.action, proofExplorerState.attacker, `Win ${turn}`, true);
@@ -743,7 +735,7 @@ function proofExplorerChooseDefense(index) {
   if (node.kind !== "defender_replies" || !node.responses[index]) return;
   const response = node.responses[index];
   proofAdvance(response.child, response.action, proofExplorerState.defender,
-    `D${String.fromCharCode(65 + index)}`);
+    `Reply ${String.fromCharCode(65 + index)}`);
 }
 
 function proofExplorerWorstCase() {
@@ -780,8 +772,8 @@ function proofExplorerFindAlternatives() {
         stones,
         attackerTurnsPlayed,
         label: step.role === "attacker"
-          ? `A${attackerTurnsPlayed} · #${step.index + 1}`
-          : `D${String.fromCharCode(65 + step.index)}`,
+          ? `Winning turn ${attackerTurnsPlayed} · move ${step.index + 1}`
+          : `Reply ${String.fromCharCode(65 + step.index)}`,
         lastAction: {action: step.action, player},
         shownWin: false,
       });
@@ -790,7 +782,7 @@ function proofExplorerFindAlternatives() {
     requestAnimationFrame(proofFitBoard);
   } catch (error) {
     closeProofExplorer();
-    setForcingStatus(`Proof replay failed: ${error.message || error}`, "error");
+    setForcingStatus(`The saved moves could not be shown: ${error.message || error}`, "error");
   }
 }
 

@@ -47,6 +47,15 @@ const threat = solver.solve_threat(threatPos, limits);
 ok("solve_threat finds P1 threat", threat.kind === 0 /* Win for the flipped attacker P1 */);
 console.log(`  threat: kind=Win depth=${threat.depth} (P1 threatens from P2's shoes)`);
 
+// 3b. A threat is the opponent's NEXT fresh turn. Mid-turn P2 has only one
+// placement left, but P1 must still receive two in the flipped probe.
+const midturnThreatPos = new Position(4, 8, 300, Player.P2, 1,
+  [0,0,1, 1,0,1, 5,5,2]);
+const midturnThreat = solver.solve_threat_wide(midturnThreatPos, limits);
+ok("mid-turn threat uses a fresh opponent turn", midturnThreat.kind === 0);
+ok("mid-turn threat starts with two opponent placements", midturnThreat.pv[0].cells.length === 2);
+console.log(`  mid-turn threat: kind=Win first-turn placements=${midturnThreat.pv[0].cells.length}`);
+
 // 4. No forced win on a sparse, balanced position.
 const quietPos = new Position(6, 8, 300, Player.P1, 2, [0,0,1, 1,0,2]);
 const quiet = solver.solve(quietPos, new SolverLimits(4, 5000n, SolverEngineEnum.Idtt));
@@ -87,6 +96,21 @@ ok("defense threat has a pv", defense.threat.pv.length > 0);
 ok("defense found a refutation (killer or pair)", defense.killers.length > 0 || defense.pair_anchors.length > 0);
 ok("defense best_delay present", defense.best_delay !== null && defense.best_delay !== undefined);
 console.log(`  defense: kind=ThreatFound killers=${defense.killers.length} pair_anchors=${defense.pair_anchors.length} best_delay=${JSON.stringify([defense.best_delay.q, defense.best_delay.r])}`);
+
+// 8b. Observatory regression: this shared position is already lost for P2.
+// The cheap threat line alone looks blockable, but the defence pass proves
+// there is no refutation and identifies (-6,2) as the longest delay.
+const lostDefensePos = new Position(6, 8, 300, Player.P2, 2, [
+  0,0,1, 1,-1,2, 7,1,2, 7,0,1, -8,2,1, 5,2,2, 6,-6,2,
+  -10,2,1, -9,2,1, 6,8,2, -11,2,2, -7,2,1, -9,3,1,
+]);
+const lostDefense = solver.solve_defense_wide(
+  lostDefensePos, new SolverLimits(16, 20000n, SolverEngineEnum.Idtt));
+ok("shared position has an opponent threat", lostDefense.kind === 0);
+ok("shared position has no single defence", lostDefense.killers.length === 0);
+ok("shared position has no pair defence", lostDefense.pair_anchors.length === 0);
+ok("shared position exposes the longest delay", lostDefense.best_delay.q === -6 && lostDefense.best_delay.r === 2);
+console.log(`  shared position: unstoppable, best delay=(${-6}, ${2})`);
 
 // 9. CoordW getters: pv cells expose .q / .r (they're wasm-bindgen instances, not plain objects).
 ok("pv cell .q getter works", typeof win.pv[0].cells[0].q === "number");

@@ -409,6 +409,9 @@ impl StrixSolver {
             Player::P1 => Player::P2,
             Player::P2 => Player::P1,
         };
+        // A threat asks what the opponent could force on their next fresh
+        // turn. Do not inherit the current mover's mid-turn remainder.
+        flipped.moves_remaining = 2;
         Self::solve_inner(&flipped, limits, false)
     }
 
@@ -424,6 +427,7 @@ impl StrixSolver {
             Player::P1 => Player::P2,
             Player::P2 => Player::P1,
         };
+        flipped.moves_remaining = 2;
         Self::solve_inner(&flipped, limits, true)
     }
 
@@ -905,6 +909,33 @@ mod tests {
         // Threat (flip to P1): P1 has the forcing win.
         let threat = solver.solve_threat(&pos, &limits_idtt(6, 20_000)).unwrap();
         assert!(matches!(threat.kind, SolveKind::Win), "threat should be P1's win, got {:?}", threat.kind);
+    }
+
+    /// A mid-turn threat probe still gives the opponent a fresh two-placement
+    /// turn. Keeping the mover's one remaining placement here makes this open
+    /// pair disappear even though P1 can complete it immediately next turn.
+    #[test]
+    fn solve_threat_resets_midturn_moves_remaining() {
+        let solver = StrixSolver::new();
+        let pos = Position {
+            win_length: 4,
+            placement_radius: 8,
+            max_moves: 200,
+            to_move: Player::P2,
+            moves_remaining: 1,
+            stones: vec![
+                Stone { coord: CoordW { q: 0, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 1, r: 0 }, player: Player::P1 },
+                Stone { coord: CoordW { q: 5, r: 5 }, player: Player::P2 },
+            ],
+        };
+        let limits = limits_idtt(4, 20_000);
+        let threat = solver.solve_threat(&pos, &limits).unwrap();
+        assert!(matches!(threat.kind, SolveKind::Win));
+        assert_eq!(threat.pv[0].cells.len(), 2);
+        let wide = solver.solve_threat_wide(&pos, &limits).unwrap();
+        assert!(matches!(wide.kind, SolveKind::Win));
+        assert_eq!(wide.pv[0].cells.len(), 2);
     }
 
     /// `solve_wide` is a superset of `solve`: a solve win is never lost.

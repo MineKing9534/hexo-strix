@@ -1,0 +1,2 @@
+# Lit's parser intentionally embeds HTML whitespace characters in regex strings.
+hexo-a0/src/hexo_a0/serving/static/observatory-ui.js whitespace=-blank-at-eol

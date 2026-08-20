@@ -1,55 +1,46 @@
 // Analysis screen: HDS import, SSE loader, move tree, verdicts, eval bar,
 // analysis board, and the app entry point (DOMContentLoaded). Loaded last.
 
-let hdsConvertedHtttx = "";
+function openHdsImport() {
+  const dialog = document.getElementById("hds-import-dialog");
+  if (!dialog || dialog.open) return;
+  document.getElementById("hds-status").textContent = "";
+  dialog.showModal();
+  document.getElementById("hds-input").focus();
+}
+
+function closeHdsImport() {
+  const dialog = document.getElementById("hds-import-dialog");
+  if (dialog?.open) dialog.close();
+  document.getElementById("hds-import-trigger")?.focus();
+}
 
 async function convertHds() {
   const src = document.getElementById("hds-input").value.trim();
   const statusEl = document.getElementById("hds-status");
-  if (!src) { statusEl.textContent = "Enter a sandbox URL or code."; return; }
-  statusEl.textContent = "Converting…";
+  if (!src) { statusEl.textContent = "Paste a sandbox link or code."; return; }
+  const submit = document.querySelector("#hds-import-dialog button[type=submit]");
+  statusEl.textContent = "Importing position…";
+  if (submit) submit.disabled = true;
   try {
     const resp = await fetch(URL_PREFIX + "/convert_hds", {
       method: "POST", headers: {"Content-Type":"application/json"},
       body: JSON.stringify({src}),
     });
     const body = await resp.json();
-    if (!resp.ok) { statusEl.textContent = body.error || "Conversion failed"; return; }
-    hdsConvertedHtttx = body.htttx;
-    document.getElementById("hds-htttx").value = body.htttx;
-    document.getElementById("hds-name").textContent = body.name || "";
-    let note = `${body.move_count} stones`;
-    if (body.offset_applied) {
-      note += ` · recentered by (${body.offset_applied[0]}, ${body.offset_applied[1]})`;
-    }
-    if (body.colors_swapped) {
-      console.log("HDS colors swapped to match P1/P2 convention");
-    }
-    statusEl.textContent = note;
-    document.getElementById("hds-result").hidden = false;
-    document.getElementById("hds-analyze-btn").disabled = false;
+    if (!resp.ok) { statusEl.textContent = body.error || "We could not import that position. Check the link or code and try again."; return; }
+    document.getElementById("analysis-htttx").value = body.htttx;
+    closeHdsImport();
+    loadGame();
   } catch (e) {
-    statusEl.textContent = `Network error: ${e}`;
-  }
-}
-
-function openConvertedInAnalysis() {
-  if (!hdsConvertedHtttx) return;
-  document.getElementById("analysis-htttx").value = hdsConvertedHtttx;
-  loadGame();
-}
-
-async function copyHdsHtttx() {
-  const el = document.getElementById("hds-status");
-  try {
-    await navigator.clipboard.writeText(hdsConvertedHtttx);
-    el.textContent = "copied HTTTX to clipboard";
-  } catch (e) {
-    el.textContent = "copy failed: " + e;
+    statusEl.textContent = "We could not reach the server. Check your connection and try again.";
+  } finally {
+    if (submit) submit.disabled = false;
   }
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  restoreAnalysisPreferences();
   updateForcingSolverUi();
   // The path selects the screen; the hash carries the line/game. Old share links
   // were "/#c=<moves>" (analysis hash on the play path) — upgrade them in place to
@@ -115,6 +106,7 @@ const analysisCfg = window.__HEXO_CFG__ || {};
 const DEFAULT_ANALYSIS_FORCING_DEPTH = 12;
 const MAX_ANALYSIS_FORCING_DEPTH = 60;
 const ANALYSIS_STRENGTHS = {
+  network: {sims: 0, forcingDepth: 10, forcingBudget: "20000"},
   quick: {sims: 16, forcingDepth: 8, forcingBudget: "20000"},
   standard: {sims: 64, forcingDepth: 10, forcingBudget: "20000"},
   strong: {sims: 128, forcingDepth: 12, forcingBudget: "250000"},
@@ -123,23 +115,23 @@ const ANALYSIS_STRENGTHS = {
 const FORCING_ENGINE_INFO = {
   idtt: {
     label: "IDTT",
-    help: "IDTT searches for the shortest forced win through the selected attacker-turn depth. The completing turn counts; a mid-turn start still counts as one turn.",
+    help: "Finds the shortest win, up to the maximum number of turns you set. It counts only turns taken by the side trying to win.",
   },
   dfpn: {
     label: "DFPN",
-    help: "DFPN is driven by the work budget and is better suited to deep composition proofs. The depth setting only caps fallback proof-line recovery; it does not limit the main proof search.",
+    help: "Looks for any forced win. Search effort controls how long it tries. The turn limit affects only the example line shown after a win is found.",
   },
   pdspn: {
     label: "PDS-PN",
-    help: "PDS-PN combines a depth-first outer proof with a separately bounded PN search at each new frontier. The outer budget and reported nodes count only outer expansions; the PN leaf cap controls frontier guidance. The recovery cap does not limit the main proof search.",
+    help: "Looks for a forced win and saves the opponent's replies so you can explore them. Search effort controls how long it tries. The turn limit affects only the example line.",
   },
   "pdspn-shortest": {
     label: "PDS-PN shortest",
-    help: "First proves a forced win (or reuses this position's PDS-PN proof), then binary-searches attacker-turn horizons with depth-bounded PDS-PN. A shortest result is reported only after every win through the preceding depth is exhaustively excluded.",
+    help: "First finds a forced win, then checks whether the same player can force it sooner. It calls the result shortest only after ruling out every shorter win.",
   },
   pns: {
     label: "PNS",
-    help: "PNS is an independent, verdict-only cross-check: it can prove Win or No but does not return a line or depth. Its in-memory tree is capped at 1m nodes in the browser UI.",
+    help: "Provides a second yes-or-no check. It does not show a winning line or say how many turns the win takes.",
   },
 };
 let forcingUiEngine = "idtt";
@@ -151,8 +143,14 @@ let forcingRun = null;
 let forcingRequestSerial = 0;
 let analysisView = { x: 0, y: 0, scale: 1 };
 let analysisPanning = false, analysisPanStart = { x: 0, y: 0, vx: 0, vy: 0 };
+let analysisEvalHoverIdx = null;
+let analysisEvalScrubbing = false;
 function updateAnalysisHash() {
-  const line = analysisCurrent ? lineOf(analysisCurrent) : analysisMoves;
+  // Mainline navigation is view state, not a new game: keep the full loaded
+  // record in the URL while clicking or dragging through earlier positions.
+  // A played side line remains shareable as its own branch.
+  const onMainline = analysisCurrent && analysisMain[analysisCurrent.depth] === analysisCurrent;
+  const line = analysisCurrent && !onMainline ? lineOf(analysisCurrent) : analysisMoves;
   const newHash = `#c=${encodeMovesCompact(line || [[0, 0]])}`;
   if (location.hash !== newHash) {
     try { history.replaceState(null, "", newHash); } catch (_e) { location.hash = newHash; }
@@ -188,6 +186,52 @@ let analysisCancel = null;  // AbortController for an in-flight /analyze_game
 let inferenceWorker = null;
 let inferenceRequestSerial = 0;
 const inferencePending = new Map();
+let defenseHydrationTimer = null;
+let defenseHydrationSerial = 0;
+let qualityHydrationTimer = null;
+let qualityHydrationSerial = 0;
+
+function setProofLabOpen(open) {
+  const drawer = document.getElementById("proof-lab-drawer");
+  const proofTab = document.getElementById("proof-lab-launch");
+  const analysisTab = document.getElementById("analysis-mode-analysis");
+  const analysisBody = document.getElementById("analysis-controls-body");
+  const analysisInfo = document.getElementById("analysis-info");
+  if (!drawer || !proofTab || !analysisTab || !analysisBody) return;
+  drawer.hidden = !open;
+  analysisBody.hidden = open;
+  if (analysisInfo) analysisInfo.hidden = open;
+  proofTab.setAttribute("aria-selected", String(open));
+  analysisTab.setAttribute("aria-selected", String(!open));
+  document.getElementById("analysis-panel")?.classList.toggle("proof-lab-open", open);
+  if (open) {
+    updateProofLabPosition();
+    drawer.querySelector("select, input, button")?.focus();
+  }
+}
+
+function openProofLab() {
+  if (!analysisCurrent) return;
+  if (window.innerWidth <= 768) setAnalysisSheetOpen(true);
+  setProofLabOpen(true);
+}
+
+function closeProofLab() {
+  setProofLabOpen(false);
+  document.getElementById("analysis-mode-analysis")?.focus();
+}
+
+function updateProofLabPosition() {
+  const label = document.getElementById("proof-lab-position");
+  if (!label || !analysisCurrent) return;
+  const side = analysisCurrent.result?.current_player || "side to move";
+  label.textContent = `Position ${analysisCurrent.depth + 1} · ${side} to move`;
+}
+
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !document.getElementById("proof-lab-drawer")?.hidden)
+    closeProofLab();
+});
 
 function analysisStrength() {
   const select = document.getElementById("analysis-strength");
@@ -200,6 +244,69 @@ function analysisStrength() {
 function saveAnalysisStrength() {
   const selected = analysisStrength();
   localStorage.setItem("hexo_analysis_strength", selected.name);
+  updateAnalysisSettingsStatus();
+}
+
+function automaticAnalysisEnabled() {
+  return Boolean(document.getElementById("analysis-auto-branch")?.checked);
+}
+
+function saveAutomaticAnalysis() {
+  localStorage.setItem("hexo_analysis_auto_branch", String(automaticAnalysisEnabled()));
+  updateAnalysisSettingsStatus();
+}
+
+function automaticForcingEnabled() {
+  return Boolean(document.getElementById("analysis-auto-forcing")?.checked);
+}
+
+function saveAutomaticForcing() {
+  localStorage.setItem("hexo_analysis_auto_forcing", String(automaticForcingEnabled()));
+  if (automaticForcingEnabled()) scheduleThreatDefense(analysisCurrent);
+}
+
+function saveDisplayPreferences() {
+  const preferences = [
+    ["analysis-heatmap", "hexo_analysis_show_heatmap"],
+    ["analysis-forcing", "hexo_analysis_show_forcing"],
+    ["analysis-threats", "hexo_analysis_show_threats"],
+  ];
+  for (const [id, key] of preferences) {
+    const input = document.getElementById(id);
+    if (input) localStorage.setItem(key, String(input.checked));
+  }
+  rerenderCurrentAnalysis();
+}
+
+function updateAnalysisSettingsStatus() {
+  const status = document.getElementById("analysis-settings-status");
+  if (!status) return;
+  const option = document.getElementById("analysis-strength")?.selectedOptions?.[0];
+  const strength = option?.textContent?.split("·")[0]?.trim() || "Standard";
+  status.textContent = `${strength} · auto ${automaticAnalysisEnabled() ? "on" : "off"}`;
+}
+
+function restoreAnalysisPreferences() {
+  const savedStrength = localStorage.getItem("hexo_analysis_strength");
+  const select = document.getElementById("analysis-strength");
+  if (select && ANALYSIS_STRENGTHS[savedStrength]) select.value = savedStrength;
+  const savedForcing = localStorage.getItem("hexo_analysis_auto_forcing");
+  const toggle = document.getElementById("analysis-auto-forcing");
+  if (toggle && savedForcing !== null) toggle.checked = savedForcing !== "false";
+  const savedAutomatic = localStorage.getItem("hexo_analysis_auto_branch");
+  const automatic = document.getElementById("analysis-auto-branch");
+  if (automatic && savedAutomatic !== null) automatic.checked = savedAutomatic === "true";
+  const displayPreferences = [
+    ["analysis-heatmap", "hexo_analysis_show_heatmap"],
+    ["analysis-forcing", "hexo_analysis_show_forcing"],
+    ["analysis-threats", "hexo_analysis_show_threats"],
+  ];
+  for (const [id, key] of displayPreferences) {
+    const saved = localStorage.getItem(key);
+    const input = document.getElementById(id);
+    if (input && saved !== null) input.checked = saved === "true";
+  }
+  updateAnalysisSettingsStatus();
 }
 
 function inferenceWorkerUrl() {
@@ -215,11 +322,14 @@ function getInferenceWorker() {
     const pending = inferencePending.get(message.requestId);
     if (!pending) return;
     if (message.type === "progress") {
-      pending.progress?.(message.done, message.total);
+      pending.progress?.(message.done, message.total, message);
+    } else if (message.type === "estimate") {
+      pending.estimate?.(message.result);
     } else if (message.type === "error") {
       inferencePending.delete(message.requestId);
       pending.reject(new Error(message.error || "local inference failed"));
-    } else if (message.type === "game" || message.type === "position" || message.type === "bestMove") {
+    } else if (message.type === "game" || message.type === "position" ||
+               message.type === "bestMove" || message.type === "defense") {
       inferencePending.delete(message.requestId);
       pending.resolve(message.result);
     }
@@ -242,10 +352,10 @@ function cancelLocalInference() {
   inferencePending.clear();
 }
 
-function localInference(type, payload, progress) {
+function localInference(type, payload, progress, estimate) {
   const requestId = ++inferenceRequestSerial;
   return new Promise((resolve, reject) => {
-    inferencePending.set(requestId, {resolve, reject, progress});
+    inferencePending.set(requestId, {resolve, reject, progress, estimate});
     getInferenceWorker().postMessage({
       type, requestId, modelUrl: (window.__HEXO_CFG__ || {}).modelUrl,
       ...payload,
@@ -301,10 +411,9 @@ function updateForcingSolverUi() {
   document.getElementById("analysis-forcing-depth-row").hidden = isPns;
   document.getElementById("analysis-forcing-leaf-row").hidden = !isPds;
   document.getElementById("analysis-forcing-depth-label").textContent = isShortest
-    ? "Maximum attacker-turn depth"
-    : isIdtt ? "Attacker-turn depth cap" : "Proof-line recovery cap";
-  document.getElementById("analysis-forcing-budget-label").textContent = isPds
-    ? "Outer node budget" : "Work budget";
+    ? "Longest win to check"
+    : isIdtt ? "Maximum turns by the winning side" : "Maximum turns in the example line";
+  document.getElementById("analysis-forcing-budget-label").textContent = "Search effort";
   document.getElementById("analysis-solver-help").textContent = FORCING_ENGINE_INFO[next].help;
 
   // Best-first PNS retains its whole tree. Very large budgets can exhaust a
@@ -334,47 +443,41 @@ function restoreForcingStatusForNode(node) {
     if (button) button.hidden = !hasCertificate;
   }
   if (!search) {
-    setForcingStatus("Ready. The solver runs in a background worker and does not use server CPU.");
+    setForcingStatus("Ready. This search runs on your device.");
     return;
   }
   const engine = FORCING_ENGINE_INFO[search.engine];
   const label = engine ? engine.label : search.engine;
-  const width = search.width === "wide" ? "Wide" : "Tight";
+  const width = search.width === "wide" ? "Broad search" : "Direct-only search";
   const elapsed = formatSolverElapsed(search.elapsed_ms);
   const work = formatSolverNodes(search.nodes, search.engine);
   if (search.kind === "win") {
     if (search.engine === "pdspn-shortest" && search.shortest_certified) {
-      const certificate = search.certificate_summary;
-      const dagNote = certificate && certificate.maxAttackerTurns !== search.best_upper_depth
-        ? ` Explore proof opens the independently replayable ≤${certificate.maxAttackerTurns}-turn strategy DAG used as the upper bound.`
-        : "";
       setForcingStatus(
-        `Last run: certified shortest forced win in ${search.best_upper_depth} attacker turns; every win through ${search.excluded_through_depth} is excluded. ${width} · ${work} · ${Number(search.leaf_node_budget).toLocaleString()} PN leaf cap · ${Number(search.threshold_probes).toLocaleString()} horizon probes · ${elapsed}.${dagNote}`,
+        `Shortest forced win: ${search.best_upper_depth} turns by the winning side. The search ruled out every win in ${search.excluded_through_depth} turns or fewer. ${width} · ${work} · ${elapsed}.`,
         "win",
       );
       return;
     }
     const proof = search.proof_depth != null
       ? formatForcingLine(search.engine, search.proof_depth, search.line_placements)
-      : "verdict only";
-    const leaf = isPdsEngine(search.engine) && search.leaf_node_budget
-      ? ` · ${Number(search.leaf_node_budget).toLocaleString()} PN leaf cap` : "";
+      : "result only; no line shown";
     const certificate = search.certificate_summary;
     const certified = certificate
-      ? ` · verified all-defense DAG ${certificate.dagNodes.toLocaleString()} nodes, worst-case ${certificate.maxAttackerTurns} attacker turns`
+      ? ` · every saved reply checked; win within ${certificate.maxAttackerTurns} turns by the winning side`
       : "";
-    setForcingStatus(`Last run: proven forced win (${proof}). ${label} · ${width} · ${work}${leaf}${certified} · ${elapsed}.`, "win");
+    setForcingStatus(`Forced win proved (${proof}). ${label} · ${width} · ${work}${certified} · ${elapsed}.`, "win");
   } else if (search.kind === "no") {
-    setForcingStatus(`Last run: proven no forced win in the selected scope. ${label} · ${width} · ${work} · ${elapsed}.`, "no");
+    setForcingStatus(`No forced win exists within the selected settings. ${label} · ${width} · ${work} · ${elapsed}.`, "no");
   } else {
     if (search.engine === "pdspn-shortest" && search.best_upper_depth) {
       const lower = Number(search.excluded_through_depth || 0);
       const range = lower > 0
-        ? `shortest win lies between ${lower + 1} and ${search.best_upper_depth} attacker turns`
-        : `win within ${search.best_upper_depth} verified; lower bound still open`;
-      setForcingStatus(`Last run: shortest search stopped with certified bounds; ${range}. ${width} · ${work} · ${elapsed}.`, "budget");
+        ? `The shortest win takes between ${lower + 1} and ${search.best_upper_depth} turns by the winning side`
+        : `A win within ${search.best_upper_depth} turns is proved, but it may be possible sooner`;
+      setForcingStatus(`The search stopped before it could prove the exact shortest win. ${range}. ${width} · ${work} · ${elapsed}.`, "budget");
     } else {
-      setForcingStatus(`Last run: work budget exhausted; inconclusive. ${label} · ${width} · ${work} · ${elapsed}.`, "budget");
+      setForcingStatus(`The search used all the selected effort without reaching a conclusion. Choose more effort or another method. ${label} · ${width} · ${work} · ${elapsed}.`, "budget");
     }
   }
 }
@@ -399,9 +502,9 @@ function setForcingControlsRunning(running) {
 function forcingPosition(node) {
   const result = node && node.result;
   if (!result) throw new Error("Load a position first.");
-  if (result.terminal) throw new Error("The selected position is already terminal.");
+  if (result.terminal) throw new Error("The selected game is already over.");
   if (!result.current_player || !Array.isArray(result.stones)) {
-    throw new Error("This position has not finished loading yet.");
+    throw new Error("This position is still loading. Try again in a moment.");
   }
   const stonesFlat = [];
   for (const stone of result.stones) {
@@ -470,28 +573,25 @@ function isPdsEngine(engine) {
 }
 
 function formatSolverNodes(nodes, engine = "") {
-  if (!nodes || nodes === "0") return "node count unavailable";
-  const suffix = isPdsEngine(engine) ? " outer nodes" : " nodes";
-  try { return `${BigInt(nodes).toLocaleString()}${suffix}`; }
-  catch (_error) { return `${nodes}${suffix}`; }
+  if (!nodes || nodes === "0") return "search-step count unavailable";
+  try { return `${BigInt(nodes).toLocaleString()} search steps`; }
+  catch (_error) { return `${nodes} search steps`; }
 }
 
 function formatSolverBudget(engine, budget) {
-  return isPdsEngine(engine)
-    ? `${budget.toLocaleString()}-outer-node budget`
-    : `${budget.toLocaleString()}-node work budget`;
+  return `${budget.toLocaleString()} search steps`;
 }
 
 function formatForcingLine(engine, attackerTurns, placements) {
   const turns = Number(attackerTurns);
   const placementText = `${placements} placement${placements === 1 ? "" : "s"}`;
   if (engine === "pdspn-shortest") {
-    return `shortest bound ${turns} attacker turn${turns === 1 ? "" : "s"}, sample line ${placementText}`;
+    return `shortest win in ${turns} turn${turns === 1 ? "" : "s"} by the winning side; example uses ${placementText}`;
   }
   if (engine && engine !== "idtt") {
-    return `sample line ${turns} attacker turn${turns === 1 ? "" : "s"}, ${placementText}`;
+    return `example win in ${turns} turn${turns === 1 ? "" : "s"} by the winning side; ${placementText}`;
   }
-  return `depth ${turns} attacker turn${turns === 1 ? "" : "s"}, ${placementText}`;
+  return `${turns} turn${turns === 1 ? "" : "s"} by the winning side; ${placementText}`;
 }
 
 function settleForcingUi() {
@@ -514,7 +614,7 @@ function finishForcingSolve(result) {
   // actually returned to the browser after its serialized result arrives.
   releaseForcingWorker();
   const engineInfo = FORCING_ENGINE_INFO[run.engine];
-  const widthLabel = run.width === "wide" ? "Wide" : "Tight";
+  const widthLabel = run.width === "wide" ? "Broad search" : "Direct-only search";
   const elapsed = formatSolverElapsed(result.elapsedMs);
   const work = formatSolverNodes(result.nodes, run.engine);
   run.node.result.forcing_search = {
@@ -583,50 +683,45 @@ function finishForcingSolve(result) {
     };
     const proof = hasLine
       ? formatForcingLine(run.engine, result.depth, result.pv.length)
-      : "verdict only; no proof line";
-    const leaf = isPdsEngine(run.engine)
-      ? ` · ${run.leafBudget.toLocaleString()} PN leaf cap` : "";
+      : "result only; no line shown";
     const certificate = result.certificateSummary;
     const certified = certificate
-      ? ` · verified all-defense DAG ${certificate.dagNodes.toLocaleString()} nodes / ${certificate.proofEdges.toLocaleString()} edges · worst-case ${certificate.maxAttackerTurns} attacker turns`
+      ? ` · every saved reply checked; win within ${certificate.maxAttackerTurns} turns by the winning side`
       : "";
     if (run.engine === "pdspn-shortest" && result.shortestCertified) {
       const upper = result.bestUpperDepth;
       const lower = result.excludedThroughDepth;
-      const dagNote = certificate && certificate.maxAttackerTurns !== upper
-        ? ` The Explore proof DAG is the independently replayable ≤${certificate.maxAttackerTurns}-turn strategy used as the initial upper bound.`
-        : "";
       setForcingStatus(
-        `Certified shortest forced win for ${run.position.toMove}: ${upper} attacker turns; every win through ${lower} is excluded. ${widthLabel} · ${work}${leaf} · ${result.thresholdProbes.toLocaleString()} horizon probes · ${elapsed}.${dagNote}`,
+        `Shortest forced win for ${run.position.toMove}: ${upper} turns by that player. The search ruled out every win in ${lower} turns or fewer. ${widthLabel} · ${work} · ${elapsed}.`,
         "win",
       );
     } else {
       setForcingStatus(
-        `Proven forced win for ${run.position.toMove} (${proof}). ${engineInfo.label} · ${widthLabel} · ${work}${leaf}${certified} · ${elapsed}.`,
+        `Forced win proved for ${run.position.toMove} (${proof}). ${engineInfo.label} · ${widthLabel} · ${work}${certified} · ${elapsed}.`,
         "win",
       );
     }
   } else if (result.kind === "no") {
     const scope = run.engine === "idtt"
-      ? `through depth ${run.depth} attacker turns`
-      : `in the ${widthLabel.toLowerCase()} forcing search`;
+      ? `within ${run.depth} turns by that player`
+      : `within the selected settings`;
     setForcingStatus(
-      `Proven no forced win for ${run.position.toMove} ${scope}. ${engineInfo.label} · ${work} · ${elapsed}.`,
+      `No forced win exists for ${run.position.toMove} ${scope}. ${engineInfo.label} · ${work} · ${elapsed}.`,
       "no",
     );
   } else {
     if (run.engine === "pdspn-shortest" && result.bestUpperDepth) {
       const lower = Number(result.excludedThroughDepth || 0);
       const range = lower > 0
-        ? `The shortest win is between ${lower + 1} and ${result.bestUpperDepth} attacker turns.`
-        : `A win within ${result.bestUpperDepth} attacker turns is verified; the lower bound is still open.`;
+        ? `The shortest win takes between ${lower + 1} and ${result.bestUpperDepth} turns by the winning side.`
+        : `A win within ${result.bestUpperDepth} turns is proved, but it may be possible sooner.`;
       setForcingStatus(
-        `Shortest search stopped with certified bounds. ${range} ${widthLabel} · ${work} · ${result.thresholdProbes.toLocaleString()} horizon probes · ${elapsed}. Raise the outer budget to continue.`,
+        `The search stopped before it could prove the exact shortest win. ${range} ${widthLabel} · ${work} · ${elapsed}. Choose more search effort to continue.`,
         "budget",
       );
     } else {
       setForcingStatus(
-        `Inconclusive: ${engineInfo.label} exhausted the ${formatSolverBudget(run.engine, run.budget)}. ${widthLabel} · ${work} · ${elapsed}. Raise the budget or try another engine.`,
+        `The search used all ${formatSolverBudget(run.engine, run.budget)} without reaching a conclusion. Choose more effort or another method. ${engineInfo.label} · ${widthLabel} · ${elapsed}.`,
         "budget",
       );
     }
@@ -657,7 +752,7 @@ function failForcingSolve(error) {
   settleForcingUi();
   forcingRun = null;
   releaseForcingWorker();
-  setForcingStatus(`Solver error: ${error}`, "error");
+  setForcingStatus(`The search stopped because of an error: ${error}`, "error");
 }
 
 function cancelForcingSolve(message = "Search cancelled. No result was recorded.") {
@@ -671,7 +766,7 @@ function cancelForcingSolve(message = "Search cancelled. No result was recorded.
 
 function solveCurrentForcing() {
   if (!analysisCurrent || !analysisCurrent.result) {
-    setForcingStatus("Load a position first.", "error");
+    setForcingStatus("Load a position before starting the search.", "error");
     return;
   }
   if (forcingRun) return;
@@ -697,19 +792,18 @@ function solveCurrentForcing() {
     forcingRun.ticker = setInterval(() => {
       if (!forcingRun || forcingRun.id !== id) return;
       const seconds = Math.floor((performance.now() - forcingRun.started) / 1000);
-      const depthText = engine === "idtt" ? ` to depth ${depth}`
-        : engine === "pdspn-shortest" ? ` through a maximum depth of ${depth}` : "";
+      const depthText = engine === "idtt" ? ` for wins within ${depth} turns`
+        : engine === "pdspn-shortest" ? ` for wins within ${depth} turns` : "";
       setForcingStatus(
-        `${FORCING_ENGINE_INFO[engine].label} ${width} search${depthText}… ${seconds}s elapsed. It is using one CPU core on this device.`,
+        `Searching${depthText} with ${FORCING_ENGINE_INFO[engine].label}… ${seconds}s elapsed. This uses one processor core on your device.`,
       );
     }, 1000);
     setForcingControlsRunning(true);
-    const depthText = engine === "idtt" ? ` to depth ${depth} attacker turns`
-      : engine === "pdspn-shortest" ? ` up to ${depth} attacker turns` : "";
-    const leafText = isPdsEngine(engine) ? ` and ${leafBudget.toLocaleString()} PN expansions per frontier` : "";
-    const proofText = reusableCertificate ? " Reusing this position's verified proof as the upper bound." : "";
+    const depthText = engine === "idtt" || engine === "pdspn-shortest"
+      ? `, checking up to ${depth} turns by the winning side` : "";
+    const proofText = reusableCertificate ? " The search will reuse the winning replies already saved for this position." : "";
     setForcingStatus(
-      `Loading ${FORCING_ENGINE_INFO[engine].label}, then searching ${width}${depthText} with a ${formatSolverBudget(engine, budget)}${leafText}…${proofText}`,
+      `Starting ${FORCING_ENGINE_INFO[engine].label}: ${width === "wide" ? "broad" : "direct-only"} search${depthText}, with ${formatSolverBudget(engine, budget)}.${proofText}`,
     );
     worker.postMessage({
       type: "solve", requestId: id, position, engine, width,
@@ -821,16 +915,50 @@ function replayLoadedGame(moves) {
   const trajectory = [];
   for (let i = 0; i < moves.length; i++) {
     const key = `${moves[i][0]},${moves[i][1]}`;
-    if (seen.has(key)) throw new Error(`duplicate placement ${key} at move ${i + 1}`);
+    if (seen.has(key)) throw new Error(`Move ${i + 1} repeats the occupied hex ${key}.`);
     seen.add(key);
     if (trajectory.length && trajectory[trajectory.length - 1].terminal)
-      throw new Error(`moves continue after the game ended at move ${i}`);
+      throw new Error(`The record contains moves after the game ended at move ${i}.`);
     trajectory.push(replayEntryAt(moves, i, config));
   }
   return trajectory;
 }
 
 let analysisRunActive = false;
+let positionAnalysisSequence = 0;
+function setAnalysisLoadedUi(loaded) {
+  const navigation = document.getElementById("analysis-navigation");
+  const emptyState = document.getElementById("analysis-empty-state");
+  const proofLabLaunch = document.getElementById("proof-lab-launch");
+  const setup = document.getElementById("analysis-setup");
+  const sourceSummary = document.getElementById("analysis-source-summary");
+  const sourceMeta = document.getElementById("analysis-source-meta");
+  const sourceCancel = document.getElementById("analysis-source-cancel");
+  if (navigation) navigation.hidden = !loaded;
+  if (emptyState) emptyState.hidden = loaded;
+  if (proofLabLaunch) proofLabLaunch.disabled = !loaded;
+  if (setup) setup.hidden = loaded;
+  if (sourceSummary) sourceSummary.hidden = !loaded;
+  if (sourceMeta && loaded) sourceMeta.textContent = `${analysisMain.length} positions`;
+  if (sourceCancel) sourceCancel.hidden = !loaded;
+  if (!loaded) setProofLabOpen(false);
+}
+
+function editAnalysisSource() {
+  document.getElementById("analysis-source-summary")?.setAttribute("hidden", "");
+  document.getElementById("analysis-setup")?.removeAttribute("hidden");
+  const cancel = document.getElementById("analysis-source-cancel");
+  if (cancel) cancel.hidden = !analysisTree;
+  document.getElementById("analysis-htttx")?.focus();
+}
+
+function cancelAnalysisSourceEdit() {
+  if (!analysisTree) return;
+  document.getElementById("analysis-setup")?.setAttribute("hidden", "");
+  document.getElementById("analysis-source-summary")?.removeAttribute("hidden");
+  setAnalysisActionButtons(true, analysisRunActive);
+}
+
 function setAnalysisActionButtons(enabled, running = false) {
   analysisRunActive = running;
   const position = document.getElementById("analysis-position-btn");
@@ -849,7 +977,7 @@ function loadGame() {
   const text = document.getElementById("analysis-htttx").value;
   const moves = parseHtttx(text);
   if (moves.length === 0) {
-    document.getElementById("analysis-info").textContent = "No moves parsed.";
+    document.getElementById("analysis-info").textContent = "No moves found. Check that the game record is in HTTTX format.";
     return;
   }
   analysisMoves = [[0, 0], ...moves];
@@ -865,6 +993,7 @@ function loadGame() {
     analysisMain = [];
     analysisCurrent = null;
     analysisTrajectory = null;
+    setAnalysisLoadedUi(false);
     setAnalysisActionButtons(false);
     document.getElementById("analysis-info").textContent = `Could not load game: ${error.message || error}`;
   }
@@ -874,7 +1003,7 @@ async function analyzeWholeGame() {
   const text = document.getElementById("analysis-htttx").value;
   const moves = parseHtttx(text);
   if (moves.length === 0) {
-    document.getElementById("analysis-info").textContent = "No moves parsed.";
+    document.getElementById("analysis-info").textContent = "No moves found. Check that the game record is in HTTTX format.";
     return;
   }
   analysisMoves = [[0, 0], ...moves];
@@ -885,32 +1014,47 @@ async function analyzeWholeGame() {
     return;
   }
   if (analysisCancel) analysisCancel.abort();
+  // A full-game run owns the shared progress surface from this point onward.
+  // Any automatic position request already in flight may still populate its
+  // node, but must not hide or overwrite this run's progress UI.
+  positionAnalysisSequence++;
   cancelLocalInference();
   const myCancel = new AbortController();
   analysisCancel = myCancel;
   setAnalysisActionButtons(true, true);
   let localProgress = false;
-  showProgress(true, "Loading local analysis engine…", 0, analysisMoves.length, null);
+  showProgress(true, "Preparing analysis on your device…", 0, analysisMoves.length, null);
   try {
     const strength = analysisStrength();
     const result = await localInference("analyzeGame", {
       moves: analysisMoves,
       config: {win_length: analysisCfg.winLength, placement_radius: analysisCfg.placementRadius, max_moves: analysisCfg.maxMoves},
-      sims: strength.sims, mActions: 16, strength,
-    }, (done, total) => {
+      sims: strength.sims, mActions: 16, strength, autoForcing: automaticForcingEnabled(),
+    }, (done, total, progress) => {
       localProgress = true;
-      showProgress(true, `Analyzing locally (${strength.name})…`, done, total, null);
+      const saved = Number(progress?.cacheHits || 0);
+      const searched = Number(progress?.cacheMisses || 0);
+      const message = searched === 0
+        ? "Loading saved analysis…"
+        : saved > 0
+          ? `Analyzing and rating on your device (${strength.name}) · ${saved} saved…`
+          : `Analyzing and rating on your device (${strength.name})…`;
+      showProgress(true, message, done, total, null);
     });
     // A newer analysis may have started while we awaited; if so, this
     // result is stale — discard it so it can't overwrite the newer tree.
     if (analysisCancel !== myCancel) return;
-    showProgress(false);
-    setAnalysisActionButtons(true);
     if (!result) {
-      document.getElementById("analysis-info").textContent = "Analysis returned no result.";
+      showProgress(false);
+      setAnalysisActionButtons(true);
+      document.getElementById("analysis-info").textContent = "Analysis finished without a result. Try again or choose a lower effort setting.";
       return;
     }
     buildTreeFromTrajectory(result);
+    await rateMainlineTurns(myCancel);
+    if (analysisCancel !== myCancel) return;
+    showProgress(false);
+    setAnalysisActionButtons(true);
   } catch (e) {
     if (e.name === "AbortError") return;
     // Compatibility path for browsers that cannot instantiate this WASM build.
@@ -920,56 +1064,109 @@ async function analyzeWholeGame() {
       showProgress(false);
       setAnalysisActionButtons(true);
       document.getElementById("analysis-info").textContent =
-        `Local analysis stopped after ${analysisMoves.length ? "partial progress" : "startup"}: ${e.message || e}`;
+        `Analysis stopped on this device: ${e.message || e}. Try again or choose a lower effort setting.`;
       return;
     }
-    showProgress(true, "Local engine unavailable; using server fallback…", 0, 0, null);
+    showProgress(true, "This browser could not run the analysis. Trying the server…", 0, 0, null);
     try {
       let result = null;
       await streamSSE(URL_PREFIX + "/analyze_game", {moves: analysisMoves}, (ev, data) => {
-        if (ev === "queued") showProgress(true, "Queued on compatibility server…", 0, 0, null);
-        else if (ev === "progress") showProgress(true, "Analyzing on server…", data.done, data.total, data.eta_seconds);
+        if (ev === "queued") showProgress(true, "Waiting for server analysis…", 0, 0, null);
+        else if (ev === "progress") showProgress(true, "Analyzing on the server…", data.done, data.total, data.eta_seconds);
         else if (ev === "result") result = data;
       }, myCancel.signal);
       if (analysisCancel !== myCancel) return;
-      showProgress(false);
-      setAnalysisActionButtons(true);
-      if (result) buildTreeFromTrajectory(result);
+      if (result) {
+        buildTreeFromTrajectory(result);
+        await rateMainlineTurns(myCancel);
+        if (analysisCancel !== myCancel) return;
+        showProgress(false);
+        setAnalysisActionButtons(true);
+      }
       else throw e;
     } catch (fallbackError) {
       showProgress(false);
       setAnalysisActionButtons(true);
       if (fallbackError.name !== "AbortError")
-        document.getElementById("analysis-info").textContent = `Analysis error: ${fallbackError.message || fallbackError}`;
+        document.getElementById("analysis-info").textContent = `Analysis could not finish: ${fallbackError.message || fallbackError}`;
     }
   }
 }
 
-async function analyzeCurrentPosition() {
-  const node = analysisCurrent;
+async function analyzeNode(node, automatic = false) {
   if (!node?.result || node.result.terminal) return;
-  setAnalysisActionButtons(true, true);
+  const sequence = ++positionAnalysisSequence;
+  if (!automatic) setAnalysisActionButtons(true, true);
   const strength = analysisStrength();
-  showProgress(true, `Analyzing this position locally (${strength.name})…`, 0, 0, null);
+  showPositionThinking(true, automatic ? "Thinking about your move…" : "Checking this position…");
+  showProgress(true,
+    automatic
+      ? `Analyzing the new move on your device (${strength.name})…`
+      : `Analyzing this position on your device (${strength.name})…`,
+    0, 0, null);
   try {
-    const result = await analyzePosition(lineOf(node));
+    const result = await analyzePosition(lineOf(node), estimate => {
+      if (sequence !== positionAnalysisSequence || !estimate) return;
+      const hasValue = Number.isFinite(estimate.value);
+      const hasForcing = Object.prototype.hasOwnProperty.call(estimate, "forcing");
+      if (!hasValue && !hasForcing) return;
+      const provisional = {
+        ...node.result,
+        ...(hasValue ? {value: estimate.value} : {}),
+        ...(hasForcing ? {forcing: estimate.forcing} : {}),
+        current_player: estimate.current_player || node.result.current_player,
+        estimate_pending: true,
+      };
+      node.result = provisional;
+      if (analysisTrajectory && analysisMain[node.depth] === node)
+        analysisTrajectory.trajectory[node.depth] = provisional;
+      if (analysisCurrent === node) renderNode(node);
+      renderEvalBar();
+      const nextStep = hasForcing && strength.sims > 0
+        ? "Forced-win check ready · searching moves…"
+        : strength.sims > 0
+          ? "Estimate ready · checking forced wins…"
+        : automaticForcingEnabled()
+          ? "Estimate ready · checking forced wins…"
+          : "Estimate ready";
+      showPositionThinking(true, nextStep);
+    });
     if (!result) throw new Error("analysis returned no result");
     result.analyzed = true;
     node.result = result;
     if (analysisTrajectory && analysisMain[node.depth] === node)
       analysisTrajectory.trajectory[node.depth] = result;
+    // An explicit position check is one operation from the user's point of
+    // view. Finish its turn verdict before dismissing the thinking state;
+    // otherwise the lazy navigation pass can make the rating appear only
+    // after another click. Automatic analysis follows the same rule whenever
+    // the newly placed hex completes a turn.
+    if (isTurnEnd(node) && !node.result.quality) {
+      showPositionThinking(true, "Rating this turn…");
+      await attachSideLineVerdict(node);
+    }
     if (analysisCurrent === node) setCurrent(node);
+    else renderMoveTree();
   } catch (error) {
-    if (analysisCurrent === node)
-      document.getElementById("analysis-info").textContent = `Position analysis error: ${error.message || error}`;
+    if (analysisCurrent === node && sequence === positionAnalysisSequence)
+      document.getElementById("analysis-info").textContent = `${automatic ? "Automatic analysis" : "Analysis"} could not finish: ${error.message || error}`;
   } finally {
-    showProgress(false);
-    setAnalysisActionButtons(Boolean(analysisTree));
+    if (sequence === positionAnalysisSequence) {
+      showProgress(false);
+      showPositionThinking(false);
+    }
+    if (!automatic) setAnalysisActionButtons(Boolean(analysisTree));
   }
 }
 
+async function analyzeCurrentPosition() {
+  return analyzeNode(analysisCurrent);
+}
+
 function buildTreeFromTrajectory(result, analyzed = true) {
-  analysisTrajectory = analyzed ? result : null; // only analyzed games drive the eval bar
+  // Every loaded game drives the position timeline. Entries without inference
+  // stay on the neutral midline; analysis can fill them in later.
+  analysisTrajectory = result;
   const tr = result.trajectory || [];
   // Build the mainline spine. trajectory[i] is the position AFTER applying
   // analysisMoves[0..i]; node i's move is analysisMoves[i] (null for the seed).
@@ -983,8 +1180,7 @@ function buildTreeFromTrajectory(result, analyzed = true) {
     analysisMain.push(node);
     parent = node;
   }
-  const slider = document.getElementById("analysis-slider");
-  slider.max = Math.max(0, analysisMain.length - 1);
+  setAnalysisLoadedUi(true);
   setCurrent(analysisMain[analysisMain.length - 1]);
   renderEvalBar();
   renderMoveTree();
@@ -995,6 +1191,11 @@ function setCurrent(node) {
     cancelForcingSolve("Search cancelled because the selected position changed.");
   }
   analysisCurrent = node;
+  const previousButton = document.getElementById("analysis-previous-position");
+  const latestButton = document.getElementById("analysis-latest-mainline");
+  if (previousButton) previousButton.disabled = !node?.parent;
+  if (latestButton) latestButton.disabled = analysisMain[analysisMain.length - 1] === node;
+  updateProofLabPosition();
   if (node?.result?.analyzed === false && node.result.legal === null) {
     const stones = node.result.stones.map(s => ({
       q: s[0][0], r: s[0][1], player: s[1] === "P1" ? 1 : 2,
@@ -1002,19 +1203,113 @@ function setCurrent(node) {
     node.result.legal = replayLegalMoves(stones, analysisCfg.placementRadius);
   }
   setAnalysisActionButtons(Boolean(analysisTree), analysisRunActive);
-  // Any ordinary navigation (slider, undo, board click, a plain move link)
+  // Any ordinary navigation (timeline, undo, board click, a plain move link)
   // dismisses a selected missed-win callout; showMissedWin re-selects it
   // AFTER calling this, once its own navigation has landed.
   missedWinSelected = null;
-  const slider = document.getElementById("analysis-slider");
-  // Sync the slider to the depth IF the node is on the mainline.
-  if (node && analysisMain[node.depth] === node) slider.value = node.depth;
   renderNode(node);
   renderEvalBar();
   renderMoveTree();
   renderMissedWinCallout();
   if (!forcingRun) restoreForcingStatusForNode(node);
   updateAnalysisHash();
+  scheduleThreatDefense(node);
+  scheduleTurnQuality(node);
+}
+
+function positionForMoves(moves) {
+  return {
+    config: {win_length: analysisCfg.winLength, placement_radius: analysisCfg.placementRadius, max_moves: analysisCfg.maxMoves},
+    stones: moves.map((move, i) => ({
+      q: move[0], r: move[1],
+      player: i === 0 ? 1 : (Math.floor((i - 1) / 2) % 2 === 0 ? 2 : 1),
+    })),
+    to_move: Math.floor(Math.max(0, moves.length - 1) / 2) % 2 === 0 ? 2 : 1,
+    moves_remaining: Math.max(0, moves.length - 1) % 2 === 0 ? 2 : 1,
+  };
+}
+
+// Whole-game analysis deliberately uses a small, threat-only forcing pass so
+// loading a long game stays fast. Complete the selected threat after scrubbing
+// stops, then cache that richer result. This gives the board real defences (or
+// the longest-delay move) without multiplying the cost across every prefix.
+async function completeThreatDefense(node) {
+  const forcing = node?.result?.forcing;
+  if (!forcing || forcing.attacker_is_mover || forcing.defense || forcing.defense_status)
+    return forcing;
+  if (node._defensePromise) return node._defensePromise;
+  node._defenseHydrating = true;
+  node._defensePromise = (async () => {
+    const strength = analysisStrength();
+    const result = await localInference("analyzeDefense", {
+      position: positionForMoves(lineOf(node)), strength,
+      sims: strength.sims, mActions: 16, autoForcing: true, forcing,
+    });
+    if (result.status === "budget" && result.forcing)
+      result.forcing.defense_status = "budget";
+    node.result.forcing = result.forcing;
+    if (analysisTrajectory && analysisMain[node.depth] === node)
+      analysisTrajectory.trajectory[node.depth].forcing = result.forcing;
+    return result.forcing;
+  })();
+  try {
+    return await node._defensePromise;
+  } finally {
+    node._defenseHydrating = false;
+    node._defensePromise = null;
+  }
+}
+
+function scheduleThreatDefense(node) {
+  clearTimeout(defenseHydrationTimer);
+  defenseHydrationTimer = null;
+  const forcing = node?.result?.forcing;
+  if (!automaticForcingEnabled() || analysisRunActive || !forcing ||
+      forcing.attacker_is_mover || forcing.defense || forcing.defense_status ||
+      node._defenseHydrating) return;
+  const serial = ++defenseHydrationSerial;
+  defenseHydrationTimer = setTimeout(async () => {
+    if (serial !== defenseHydrationSerial || analysisCurrent !== node) return;
+    showPositionThinking(true, "Checking possible defences…");
+    try {
+      await completeThreatDefense(node);
+      if (analysisCurrent === node) {
+        renderNode(node);
+        renderEvalBar();
+      }
+    } catch (_error) {
+      // The already-proven threat remains useful if this optional pass fails.
+    } finally {
+      if (serial === defenseHydrationSerial) showPositionThinking(false);
+    }
+  }, 260);
+}
+
+// A loaded game or single-position analysis rates the selected turn lazily.
+// Explicit whole-game analysis calls rateMainlineTurns instead, so every
+// completed turn has a verdict before the operation reports that it is done.
+function scheduleTurnQuality(node) {
+  clearTimeout(qualityHydrationTimer);
+  qualityHydrationTimer = null;
+  if (analysisRunActive || !node?.result || node.result.quality || node.result.analyzed === false ||
+      !isTurnEnd(node) || node._qualityHydrating) return;
+  const serial = ++qualityHydrationSerial;
+  qualityHydrationTimer = setTimeout(async () => {
+    if (serial !== qualityHydrationSerial || analysisCurrent !== node) return;
+    node._qualityHydrating = true;
+    showPositionThinking(true, "Rating this turn…");
+    try {
+      await attachSideLineVerdict(node);
+      if (analysisCurrent === node) {
+        renderNode(node);
+        renderMoveTree();
+      }
+    } finally {
+      node._qualityHydrating = false;
+      if (serial === qualityHydrationSerial && !node._defenseHydrating)
+        showPositionThinking(false);
+    }
+  }, 180);
 }
 
 function showProgress(on, msg, done, total, eta) {
@@ -1028,13 +1323,21 @@ function showProgress(on, msg, done, total, eta) {
   wrap.style.display = on ? "block" : "none";
   if (!on) return;
   const pct = total > 0 ? Math.round(100 * done / total) : 0;
-  if (bar) bar.style.width = pct + "%";
+  if (bar) bar.style.transform = `scaleX(${pct / 100})`;
   let etaStr = "";
   if (eta !== null && eta !== undefined && total > 0) {
     etaStr = eta >= 60 ? ` · ETA ${Math.round(eta / 60)}m${String(Math.round(eta % 60)).padStart(2,"0")}s`
                        : ` · ETA ${Math.round(eta)}s`;
   }
   if (lbl) lbl.textContent = total > 0 ? `${msg} ${done}/${total}${etaStr}` : msg;
+}
+
+function showPositionThinking(on, message = "Checking position…") {
+  const indicator = document.getElementById("analysis-thinking");
+  const label = document.getElementById("analysis-thinking-label");
+  if (!indicator) return;
+  indicator.hidden = !on;
+  if (on && label) label.textContent = message;
 }
 
 function returnToMainline() {
@@ -1046,8 +1349,18 @@ function analysisUndo() {
   if (analysisCurrent && analysisCurrent.parent) setCurrent(analysisCurrent.parent);
 }
 
+function forcingIsUnstoppable(forcing) {
+  const d = forcing?.defense;
+  return Boolean(d && !(d.killers?.length || d.pair_anchors?.length) && d.best_delay);
+}
+
+function forcingIsCertain(forcing) {
+  return Boolean(forcing?.attacker_is_mover || forcingIsUnstoppable(forcing));
+}
+
 // Effective P1-perspective eval for a trajectory entry's `result`: a PROVEN
-// forced win (forcing.attacker_is_mover — the side to move wins for certain) or
+// forced win (for the mover, or an opponent threat whose defense check found
+// no refutation) or
 // a terminal result pins the eval to ±1.0, overriding the value head, which
 // routinely under-rates a forced win it hasn't been trained to recognise. A
 // mere threat (attacker_is_mover false) is NOT certain — the mover may defend
@@ -1057,23 +1370,31 @@ function effectiveP1Eval(entry) {
   if (!entry) return 0;
   if (entry.terminal && entry.winner) return entry.winner === "P1" ? 1.0 : -1.0;
   const f = entry.forcing;
-  if (f && f.attacker_is_mover && f.winner) return f.winner === "P1" ? 1.0 : -1.0;
-  return p1Perspective(entry.value, entry.current_player);
+  if (f && forcingIsCertain(f) && f.winner) return f.winner === "P1" ? 1.0 : -1.0;
+  return Number.isFinite(entry.value) ? p1Perspective(entry.value, entry.current_player) : 0;
+}
+
+function entryHasEvaluation(entry) {
+  return Boolean(entry && (Number.isFinite(entry.value) || entry.terminal ||
+    (forcingIsCertain(entry.forcing) && entry.forcing?.winner)));
 }
 
 function renderEvalBar() {
+  const wrap = document.getElementById("analysis-eval-wrap");
   const canvas = document.getElementById("analysis-eval-bar");
+  if (!canvas || !wrap) return;
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#0a0c0b";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   const hasTrajectory = Boolean(analysisTrajectory?.trajectory?.length);
-  canvas.hidden = !hasTrajectory;
+  wrap.hidden = !hasTrajectory;
   if (!hasTrajectory) return;
   const tr = analysisTrajectory.trajectory;
   const boundaries = new Set(analysisTrajectory.boundary_indices || []);
   const W = canvas.width, H = canvas.height;
   const pad = 4;
   const n = tr.length;
+  const hasAnyEvaluation = tr.some(entryHasEvaluation);
   if (n < 1) return;
   const midY = H / 2;
   // Midline (P1/P2 even).
@@ -1099,8 +1420,9 @@ function renderEvalBar() {
   ctx.lineTo(xAt(n - 1), midY); ctx.closePath(); ctx.fill();
   ctx.restore();
   // The eval line itself (P1 perspective — no per-ply oscillation).
-  ctx.strokeStyle = "#ece6da";
+  ctx.strokeStyle = hasAnyEvaluation ? "#ece6da" : "#646a64";
   ctx.lineWidth = 1.5;
+  if (!hasAnyEvaluation) ctx.setLineDash([4, 4]);
   ctx.beginPath();
   for (let i = 0; i < n; i++) {
     const x = xAt(i);
@@ -1109,6 +1431,7 @@ function renderEvalBar() {
     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
   ctx.stroke();
+  ctx.setLineDash([]);
   // Turn-boundary dots, coloured by P1 advantage.
   for (let i = 0; i < n; i++) {
     if (!boundaries.has(i)) continue;
@@ -1117,25 +1440,112 @@ function renderEvalBar() {
     const y = yAt(v);
     ctx.beginPath();
     ctx.arc(x, y, 3, 0, 2 * Math.PI);
-    ctx.fillStyle = v > 0.05 ? "#79cf9a" : v < -0.05 ? "#e25c5c" : "#f2b65a";
+    ctx.fillStyle = !entryHasEvaluation(tr[i]) ? "#646a64"
+      : v > 0.05 ? "#79cf9a" : v < -0.05 ? "#e25c5c" : "#f2b65a";
     ctx.fill();
   }
-  // Slider position marker.
-  const slider = document.getElementById("analysis-slider");
-  const si = parseInt(slider.value);
+  const si = analysisCurrent && analysisMain[analysisCurrent.depth] === analysisCurrent
+    ? analysisCurrent.depth : -1;
   if (si >= 0 && si < n) {
     const v = effectiveP1Eval(tr[si]);
     ctx.strokeStyle = "#c9a35e";
     ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(xAt(si), pad); ctx.lineTo(xAt(si), H - pad); ctx.stroke();
   }
+  if (analysisEvalHoverIdx !== null && analysisEvalHoverIdx >= 0 && analysisEvalHoverIdx < n) {
+    const hi = analysisEvalHoverIdx;
+    const v = effectiveP1Eval(tr[hi]);
+    ctx.strokeStyle = "#ece6da99";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(xAt(hi), pad); ctx.lineTo(xAt(hi), H - pad); ctx.stroke();
+    ctx.beginPath(); ctx.arc(xAt(hi), yAt(v), 3, 0, 2 * Math.PI);
+    ctx.fillStyle = "#ece6da"; ctx.fill();
+  }
+  canvas.setAttribute("aria-valuemax", String(n));
+  canvas.setAttribute("aria-valuenow", String(Math.max(0, si) + 1));
+  if (si >= 0) {
+    const entry = tr[si];
+    const value = effectiveP1Eval(entry);
+    canvas.setAttribute("aria-valuetext", entryHasEvaluation(entry)
+      ? `Position ${si + 1}, P1 ${value >= 0 ? "+" : ""}${value.toFixed(2)}`
+      : `Position ${si + 1}, not analyzed`);
+  }
 }
 
-// Slider scrubs the MAINLINE (pure-client, no server call — every mainline
-// position already has its full /analyze_game result cached in the tree node).
-function onAnalysisSlider() {
-  const idx = parseInt(document.getElementById("analysis-slider").value);
-  if (analysisMain[idx]) setCurrent(analysisMain[idx]);
+function analysisEvalIndexAt(clientX) {
+  const canvas = document.getElementById("analysis-eval-bar");
+  const count = analysisTrajectory?.trajectory?.length || 0;
+  if (!canvas || !count) return -1;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width) return -1;
+  const internalX = (clientX - rect.left) * canvas.width / rect.width;
+  const fraction = Math.max(0, Math.min(1, (internalX - 4) / (canvas.width - 8)));
+  return Math.round(fraction * (count - 1));
+}
+
+function updateAnalysisEvalPreview(index) {
+  const preview = document.getElementById("analysis-eval-preview");
+  const entry = analysisTrajectory?.trajectory?.[index];
+  if (!preview || !entry) {
+    if (preview) preview.hidden = true;
+    return;
+  }
+  const value = effectiveP1Eval(entry);
+  preview.textContent = entryHasEvaluation(entry)
+    ? `Position ${index + 1} · P1 ${value >= 0 ? "+" : ""}${value.toFixed(2)}`
+    : `Position ${index + 1} · not analyzed`;
+  preview.hidden = false;
+}
+
+function onAnalysisEvalPointerMove(event) {
+  analysisEvalHoverIdx = analysisEvalIndexAt(event.clientX);
+  updateAnalysisEvalPreview(analysisEvalHoverIdx);
+  if (analysisEvalScrubbing && analysisMain[analysisEvalHoverIdx])
+    setCurrent(analysisMain[analysisEvalHoverIdx]);
+  renderEvalBar();
+}
+
+function onAnalysisEvalPointerDown(event) {
+  if (event.button !== 0) return;
+  analysisEvalScrubbing = true;
+  try { event.currentTarget?.setPointerCapture?.(event.pointerId); } catch (_error) {}
+  const index = analysisEvalIndexAt(event.clientX);
+  analysisEvalHoverIdx = index;
+  updateAnalysisEvalPreview(index);
+  if (analysisMain[index]) setCurrent(analysisMain[index]);
+}
+
+function onAnalysisEvalPointerUp(event) {
+  analysisEvalScrubbing = false;
+  try {
+    if (event.currentTarget?.hasPointerCapture?.(event.pointerId))
+      event.currentTarget.releasePointerCapture(event.pointerId);
+  } catch (_error) {}
+}
+
+function onAnalysisEvalPointerLeave() {
+  if (analysisEvalScrubbing) return;
+  analysisEvalHoverIdx = null;
+  updateAnalysisEvalPreview(-1);
+  renderEvalBar();
+}
+
+function onAnalysisEvalClick(event) {
+  const index = analysisEvalIndexAt(event.clientX);
+  if (analysisMain[index]) setCurrent(analysisMain[index]);
+}
+
+function onAnalysisEvalKeydown(event) {
+  if (!analysisMain.length) return;
+  let index = analysisCurrent && analysisMain[analysisCurrent.depth] === analysisCurrent
+    ? analysisCurrent.depth : analysisMain.length - 1;
+  if (event.key === "ArrowLeft") index--;
+  else if (event.key === "ArrowRight") index++;
+  else if (event.key === "Home") index = 0;
+  else if (event.key === "End") index = analysisMain.length - 1;
+  else return;
+  event.preventDefault();
+  setCurrent(analysisMain[Math.max(0, Math.min(analysisMain.length - 1, index))]);
 }
 
 function currentAnalysisIdx() {
@@ -1173,9 +1583,9 @@ function turnStartDepth(node) {
   return node.depth - (single ? 1 : 2);
 }
 
-const _QUAL_ICON = {best: "★", good: "✓", mistake: "?", blunder: "✗"};
+const _QUAL_ICON = {best: "★", winning: "◆", good: "✓", mistake: "?", blunder: "✗", forced: "◇"};
 // Match server QUALITY_COLORS: gold best, green good, amber mistake, crimson blunder.
-const _QUAL_COLOR = {best: "#f2c14e", good: "#79cf9a", mistake: "#e0a23a", blunder: "#e25c5c"};
+const _QUAL_COLOR = {best: "#f2c14e", winning: "#79cf9a", good: "#79cf9a", mistake: "#e0a23a", blunder: "#e25c5c", forced: "#aeb8b1"};
 
 // Client-side port of classify_turn_quality (analysis.py) so that turns played
 // out in a SIDE LINE get the same best/good/mistake/blunder verdict the server
@@ -1212,19 +1622,14 @@ function labelFromLoss(matched, loss) {
 }
 
 // POST a line to /analyze; returns the position result (JSON) or null.
-async function analyzePosition(moves) {
+async function analyzePosition(moves, onEstimate = null) {
   try {
     const strength = analysisStrength();
-    const position = {
-      config: {win_length: analysisCfg.winLength, placement_radius: analysisCfg.placementRadius, max_moves: analysisCfg.maxMoves},
-      stones: moves.map((move, i) => ({
-        q: move[0], r: move[1],
-        player: i === 0 ? 1 : (Math.floor((i - 1) / 2) % 2 === 0 ? 2 : 1),
-      })),
-      to_move: Math.floor(Math.max(0, moves.length - 1) / 2) % 2 === 0 ? 2 : 1,
-      moves_remaining: Math.max(0, moves.length - 1) % 2 === 0 ? 2 : 1,
-    };
-    return await localInference("analyzePosition", {position, sims: strength.sims, mActions: 16, strength});
+    const position = positionForMoves(moves);
+    return await localInference("analyzePosition", {
+      position, sims: strength.sims, mActions: 16, strength,
+      autoForcing: automaticForcingEnabled(), previewValue: true,
+    }, null, onEstimate);
   } catch (_e) {
     try {
       const resp = await fetch(URL_PREFIX + "/analyze", {
@@ -1291,25 +1696,60 @@ async function computeTurnQuality(node) {
   // solver catches. `node` is the turn-end position (opponent to move).
   const mover = start.result && start.result.current_player;
   const opp = mover === "P1" ? "P2" : (mover === "P2" ? "P1" : null);
+  let forcedBeforeTurn = false;
+  if (opp) {
+    let startForcing = start.result.forcing;
+    if (automaticForcingEnabled() && startForcing && !startForcing.attacker_is_mover &&
+        !startForcing.defense && !startForcing.defense_status) {
+      try { startForcing = await completeThreatDefense(start); } catch (_error) { /* keep the known threat */ }
+    }
+    forcedBeforeTurn = Boolean(
+      startForcing && forcingIsCertain(startForcing) && startForcing.winner === opp);
+  }
   let forcedLoss = false;
   if (opp && node.result) {
     const r = node.result;
     if (r.terminal) {
       forcedLoss = r.winner === opp;
-    } else if (r.forcing && r.forcing.attacker_is_mover && r.forcing.winner === opp) {
+    } else if (r.forcing && forcingIsCertain(r.forcing) && r.forcing.winner === opp) {
       forcedLoss = true;
     }
   }
   if (forcedLoss) {
-    playerEndQ = -1.0;
-    loss = engineEndQ != null ? Math.max(0, engineEndQ - playerEndQ) : 1.0;
-    label = "blunder";
+    if (forcedBeforeTurn) {
+      label = "forced";
+      loss = 0;
+    } else {
+      playerEndQ = -1.0;
+      loss = engineEndQ != null ? Math.max(0, engineEndQ - playerEndQ) : 1.0;
+      label = "blunder";
+    }
+  }
+  // Proven results outrank the network's approximate score. If the mover ends
+  // the turn with a verified forced win, a lower q estimate or a slower line
+  // must never turn that winning move into a mistake/blunder.
+  let endForcing = node.result && node.result.forcing;
+  if (endForcing && !endForcing.attacker_is_mover &&
+      !endForcing.defense && !endForcing.defense_status) {
+    try { endForcing = await completeThreatDefense(node); } catch (_error) { /* an unverified threat is not proof */ }
+  }
+  const provenWin = Boolean(opp && node.result && (
+    (node.result.terminal && node.result.winner === mover) ||
+    (endForcing && forcingIsCertain(endForcing) && endForcing.winner === mover)));
+  const startForcing = start.result && start.result.forcing;
+  const winBeforeTurn = Boolean(startForcing && forcingIsCertain(startForcing) &&
+    startForcing.winner === mover);
+  if (provenWin && !matched) {
+    label = "winning";
+    loss = 0;
   }
   return {
     label, icon: _QUAL_ICON[label], color: _QUAL_COLOR[label],
     matched, engine_pair: engineLine, played_pair: played,
     loss, player_end_q: playerEndQ, engine_end_q: engineEndQ,
-    forced_loss: forcedLoss, turn_start_depth: a,
+    forced_loss: forcedLoss, forced_before_turn: forcedBeforeTurn,
+    proven_win: provenWin, win_before_turn: winBeforeTurn,
+    turn_start_depth: a,
   };
 }
 
@@ -1322,6 +1762,33 @@ async function attachSideLineVerdict(node) {
   if (q) node.result.quality = q;
 }
 
+// Rate the mainline as a second phase of explicit whole-game analysis. A Hexo
+// turn can contain two placements, so the verdict belongs to the completed
+// turn rather than either placement in isolation. Existing server/cache
+// verdicts are retained and only missing ones are computed.
+async function rateMainlineTurns(owner = null) {
+  const pending = analysisMain.filter(node =>
+    node?.result && !node.result.quality && isTurnEnd(node));
+  if (!pending.length) return;
+
+  for (let i = 0; i < pending.length; i++) {
+    if ((owner && analysisCancel !== owner) || owner?.signal.aborted)
+      throw new DOMException("Cancelled", "AbortError");
+    const node = pending[i];
+    showProgress(true, "Rating completed turns on your device…", i, pending.length, null);
+    node._qualityHydrating = true;
+    try {
+      await attachSideLineVerdict(node);
+    } finally {
+      node._qualityHydrating = false;
+    }
+    showProgress(true, "Rating completed turns on your device…", i + 1, pending.length, null);
+  }
+
+  if (analysisCurrent) renderNode(analysisCurrent);
+  renderMoveTree();
+}
+
 // Render the position for a tree node: info line, board, heatmap, quality marks.
 // The verdict card is ORDER-INDEPENDENT: a turn is judged by its resulting board
 // (its placed-set) vs the engine's best placed-set, so a reversed in-turn order
@@ -1332,8 +1799,8 @@ function renderNode(node) {
   const result = node.result;
   const info = document.getElementById("analysis-info");
   const cp = result.current_player || "?";
-  const analyzed = result.analyzed !== false && Number.isFinite(result.value);
-  const v1 = analyzed || (result.terminal && result.winner) ? effectiveP1Eval(result) : null;
+  const hasValue = Number.isFinite(result.value);
+  const v1 = hasValue || (result.terminal && result.winner) ? effectiveP1Eval(result) : null;
   const evalStr = v1 == null ? null : (v1 >= 0 ? `+${v1.toFixed(2)}` : v1.toFixed(2));
   const q = qualityOf(node);
 
@@ -1364,36 +1831,52 @@ function renderNode(node) {
     let board, pickTier = "", metric = "";
     const opp = turnPlayer === "P1" ? "P2" : "P1";
     const forcedLoss = q.forced_loss === true;
-    if (forcedLoss) {
+    const forcedBeforeTurn = q.forced_before_turn === true;
+    const provenWin = q.proven_win === true;
+    if (forcedBeforeTurn) {
+      board = `${opp} had a <b>forced win</b> before this turn. No ${who} move could stop it. `;
+      if (q.matched) {
+        board += `${who} played the computer's preferred line <b class="mvc">${fmt(playedMoves)}</b>.`;
+      } else {
+        board += `${who} played <b class="mvc">${fmt(playedMoves)}</b>.`;
+        if (enginePair.length)
+          board += ` The computer preferred <b class="mvc">${fmt(enginePair)}</b>, but that line also loses.`;
+      }
+    } else if (forcedLoss) {
       // The turn handed the opponent a PROVEN forced win — that overrides the
       // q-hat loss (the value head often hasn't noticed a forced loss), so it's
       // always a blunder and the swing reflects the full -1.0 effective eval.
       if (q.matched) {
-        board = `${who} played <b class="mvc">${fmt(playedMoves)}</b> and handed ${opp} a <b>forced win</b>. The engine's line reaches the same lost position.`;
+        board = `${who} played <b class="mvc">${fmt(playedMoves)}</b> and gave ${opp} a <b>forced win</b>. The computer's suggested line reaches the same lost position.`;
       } else if (enginePair.length) {
-        board = `${who} played <b class="mvc">${fmt(playedMoves)}</b> and handed ${opp} a <b>forced win</b>. The engine preferred <b class="mvc">${fmt(enginePair)}</b>, which keeps the game alive.`;
+        board = `${who} played <b class="mvc">${fmt(playedMoves)}</b> and gave ${opp} a <b>forced win</b>. The computer preferred <b class="mvc">${fmt(enginePair)}</b>, which keeps the game alive.`;
         if (startNode && startNode.result) {
-          pickTier = `<div class="vc-sec"><div class="h">engine's line here</div>`
-                   + `<p>${renderTopMovesHtml(startNode.result, startNode.depth)}</p></div>`;
+          pickTier = `<div class="vc-sec"><div class="h">Suggested line from here</div>`
+                   + `${renderTopMovesHtml(startNode.result, startNode.depth)}</div>`;
         }
       } else {
         board = `${who} played <b class="mvc">${fmt(playedMoves)}</b> and handed ${opp} a <b>forced win</b>.`;
       }
+    } else if (provenWin) {
+      board = `${who} played <b class="mvc">${fmt(playedMoves)}</b> and `
+            + `${q.win_before_turn ? "kept" : "created"} a <b>verified forced win</b>.`;
+      if (enginePair.length && !q.matched)
+        board += ` The computer preferred <b class="mvc">${fmt(enginePair)}</b>, but both outcomes force a win.`;
     } else if (q.matched) {
       // Same resulting position as the engine's line. Flag a reversed order so the
       // "why isn't this a mistake?" question answers itself.
       const reordered = enginePair.length === playedMoves.length && fmt(enginePair) !== fmt(playedMoves);
-      board = `${who} matched the engine's line <b class="mvc">${fmt(playedMoves)}</b>`
+      board = `${who} matched the computer's suggested line <b class="mvc">${fmt(playedMoves)}</b>`
             + (reordered ? ` <span class="ro-note">(same position, reversed order)</span>` : "") + ".";
     } else if (enginePair.length) {
-      board = `${who} played <b class="mvc">${fmt(playedMoves)}</b>. The engine `
+      board = `${who} played <b class="mvc">${fmt(playedMoves)}</b>. The computer `
             + `${lost ? "preferred" : "also liked"} <b class="mvc">${fmt(enginePair)}</b>`
             + (lost ? `, which reaches a stronger position` : "") + ".";
       // Explore the engine's line from the turn-start position (chips branch from
       // that node; ranked by policy — the engine's choice).
       if (startNode && startNode.result) {
-        pickTier = `<div class="vc-sec"><div class="h">engine's line here</div>`
-                 + `<p>${renderTopMovesHtml(startNode.result, startNode.depth)}</p></div>`;
+        pickTier = `<div class="vc-sec"><div class="h">Suggested line from here</div>`
+                 + `${renderTopMovesHtml(startNode.result, startNode.depth)}</div>`;
       }
     } else {
       board = `${who} played <b class="mvc">${fmt(playedMoves)}</b>.`;
@@ -1401,25 +1884,27 @@ function renderNode(node) {
     // Metric compares the two full TURNS at their end positions (comparable q̂).
     // Shown whenever there's a real comparison — including a forced-loss turn
     // that "matched" the engine's own losing line (the -1.0 swing is the point).
-    if (q.player_end_q != null && q.engine_end_q != null && (forcedLoss || !q.matched))
-      metric = `<div class="vc-metric"><span>your turn <b>${sgn(q.player_end_q)}</b></span><span class="sep">·</span>`
-             + `<span>engine's <b>${sgn(q.engine_end_q)}</b></span><span class="sep">·</span>`
-             + `<span>swing <b>${sgn(q.player_end_q - q.engine_end_q)}</b></span></div>`;
+    if (!forcedBeforeTurn && !provenWin && q.player_end_q != null && q.engine_end_q != null && (forcedLoss || !q.matched))
+      metric = `<div class="vc-metric"><span>played line <b>${sgn(q.player_end_q)}</b></span><span class="sep">·</span>`
+             + `<span>suggested line <b>${sgn(q.engine_end_q)}</b></span><span class="sep">·</span>`
+             + `<span>difference <b>${sgn(q.player_end_q - q.engine_end_q)}</b></span></div>`;
 
     html =
       `<div class="vc-head"><div class="vc-glyph">${q.icon}</div>`
-      + `<div class="vc-label">${q.label}<small>turn ${Math.ceil(node.depth / 2)} · ${turnPlayer}</small></div></div>`
+      + `<div class="vc-label">${q.label === "forced" ? "No saving move" : q.label === "winning" ? "Winning move" : q.label[0].toUpperCase() + q.label.slice(1)}<small>Turn ${Math.ceil(node.depth / 2)} · ${turnPlayer}</small></div></div>`
       + metric
-      + `<div class="vc-sec"><div class="h">on the board</div><p>${board}</p></div>`
+      + `<div class="vc-sec"><div class="h">What happened</div><p>${board}</p></div>`
       + pickTier
-      + `<div class="vc-prov">Turns are judged by the resulting position, not the move order; the engine's choice is its policy (what it plays), not the raw value.</div>`;
+      + (provenWin || forcedBeforeTurn ? "" : `<div class="vc-prov">The rating is based on the position left at the end of the turn. Playing the same two hexes in the opposite order receives the same rating.</div>`);
   } else {
     info.classList.remove("vc");
     info.style.removeProperty("--c");
-    html = `<span class="ro-pos">Position ${node.depth + 1}/${lineOf(node).length} · to move <b>${cp}</b></span>`
+    const positionTotal = analysisMain[node.depth] === node ? analysisMain.length : lineOf(node).length;
+    html = `<div class="position-readout"><span class="position-turn"><b>${cp}</b> to move</span>`
          + (evalStr == null
-           ? `<span class="ro-eval ro-unanalysed"> · not analyzed</span>`
-           : `<span class="ro-eval"> · eval (P1) <b>${evalStr}</b></span>`)
+           ? `<span class="ro-eval ro-unanalysed">Not analyzed</span>`
+           : `<span class="ro-eval"><small>P1 ${result.estimate_pending ? "estimate" : "score"}</small><b>${evalStr}</b></span>`)
+         + `<span class="ro-pos" title="Position ${node.depth + 1} of ${positionTotal}">${node.depth + 1}/${positionTotal}</span></div>`
          + renderTopMovesHtml(result);
   }
   info.innerHTML = html;
@@ -1436,9 +1921,10 @@ function updateGauge(v1, cp) {
   if (v1 === null || v1 === undefined || isNaN(v1)) { wrap.hidden = true; if (legend) legend.hidden = true; return; }
   wrap.hidden = false; if (legend) legend.hidden = false;
   const clamped = Math.max(-1, Math.min(1, v1));
-  // Tug-of-war: P1 is the left pole, so a P1 advantage (v1 > 0) pulls the needle
-  // LEFT toward P1, and a P2 advantage pulls it right. (v1 is P1-perspective.)
-  document.getElementById("gauge-needle").style.left = `${((1 - clamped) / 2 * 100).toFixed(1)}%`;
+  // P1 is the upper pole, so a P1 advantage pulls the marker upward.
+  const needle = document.getElementById("gauge-needle");
+  needle.style.left = "";
+  needle.style.top = `${((1 - clamped) / 2 * 100).toFixed(1)}%`;
   const s = (x) => (x >= 0 ? "+" : "−") + Math.abs(x).toFixed(2);
   const p1El = document.getElementById("gauge-v1"), p2El = document.getElementById("gauge-v2");
   p1El.textContent = s(v1);        // each pole reads positive when THAT player is ahead
@@ -1461,16 +1947,16 @@ function renderTopMovesHtml(result, branchDepth) {
   const top = idx.slice(0, 5);
   if (!top.length) return "";
   const useDepth = branchDepth !== undefined && branchDepth !== null;
-  let s = `<br><span style="font-size:11px;color:#8b8f88">Engine likes: </span>`;
+  let s = `<div class="analysis-suggestions"><span class="analysis-suggestions-label">Suggested next moves</span><div class="analysis-suggestion-list">`;
   for (const i of top) {
     const mv = result.legal[i];
     const qv = qh ? (qh[i] >= 0 ? "+" : "") + qh[i].toFixed(2) : "";
     const onclick = useDepth ? `analysisBranchAtDepth(${branchDepth},${mv[0]},${mv[1]})`
                              : `analysisCellClick(${mv[0]},${mv[1]})`;
     s += `<span class="topmove" onclick="${onclick}" `
-       + `title="explore this line">[${mv[0]},${mv[1]}]<span style="color:#5f635d">${qv}</span></span> `;
+       + `title="Try this move"><span>[${mv[0]},${mv[1]}]</span><small>${qv}</small></span>`;
   }
-  return s;
+  return s + `</div></div>`;
 }
 
 // boardResult drives the stones + cell layout (the position you're looking at).
@@ -1585,11 +2071,13 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
   // (attacker_is_mover false — a perspective-flipped solve that pretends the
   // mover skips their turn, so it's often defensible; default OFF because
   // routinely showing them muddies the analysis).
-  const isProven = boardResult.forcing && boardResult.forcing.attacker_is_mover === true;
-  const showThis = boardResult.forcing && (isProven
+  const missedForcing = selectedMissedWinForcing();
+  const boardForcing = missedForcing || boardResult.forcing;
+  const isProven = forcingIsCertain(boardForcing);
+  const showThis = boardForcing && (missedForcing || (isProven
     ? document.getElementById("analysis-forcing").checked
-    : document.getElementById("analysis-threats").checked);
-  const forcing = showThis ? boardResult.forcing : null;
+    : document.getElementById("analysis-threats").checked));
+  const forcing = showThis ? boardForcing : null;
   if (forcing && forcing.pv && forcing.pv.length) {
     const f = forcing;
     const attackerColor = f.winner === "P2" ? "#3fb6d9" : "#f08a3c";
@@ -1652,7 +2140,7 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
       body += badge(a, true, "1", 0.95, "Pair defense: play this first — it only refutes together with the linked follow-up");
       body += badge(b, true, "2", 0.6, "Pair defense follow-up (re-checked after the first placement)");
     } else if (d.best_delay) {
-      body += badge(d.best_delay, true, "…", 0.75, "No refutation found at analysis budgets — this placement delays the threat longest");
+      body += badge(d.best_delay, true, "…", 0.75, "The search did not prove a move that stops the threat. This move delays it longest.");
     }
   }
   // Move-quality icon: mark EVERY placement of the verdict's turn (not just the
@@ -1699,19 +2187,22 @@ function updateForcingBanner(forcing) {
     ? forcing.line_placements : forcing.pv_len;
   const hasLine = forcing.pv && forcing.pv.length > 0;
   const depthText = forcing.depth != null
-    ? (forcing.engine && forcing.engine !== "idtt"
-      ? `sample line ${forcing.depth} attacker turn${forcing.depth === 1 ? "" : "s"}`
-      : `depth ${forcing.depth} attacker turn${forcing.depth === 1 ? "" : "s"}`)
-    : "forced-win depth unavailable";
+    ? `example takes ${forcing.depth} turn${forcing.depth === 1 ? "" : "s"} by the winning side`
+    : "number of turns unavailable";
   const proofText = forcing.verdict_only || !hasLine
-    ? "verdict only · proof line unavailable"
+    ? "win proved; moves not available"
     : `${depthText} · ${placements} placement${placements === 1 ? "" : "s"}`;
   const certified = forcing.certificate_summary
-    ? ` · certified worst-case ${forcing.certificate_summary.maxAttackerTurns} attacker turns`
+    ? ` · every saved reply checked; win within ${forcing.certificate_summary.maxAttackerTurns} turns by the winning side`
     : "";
+  const d = forcing.defense;
+  const hasCheckedDefense = Boolean(d && (d.killers.length || d.pair_anchors.length));
+  const isUnstoppable = forcingIsUnstoppable(forcing);
   banner.textContent = forcing.attacker_is_mover
     ? `${forcing.winner} has a forced win (${proofText}${certified})`
-    : `${forcing.winner} threatens a forced win (${proofText}) — ${defender} must answer`;
+    : isUnstoppable
+      ? `${forcing.winner} has an unstoppable forced win (${proofText}) — ${defender} can only delay it`
+      : `${forcing.winner} threatens a forced win (${proofText}) — ${defender} must answer`;
   if (forcing.engine) {
     const tag = document.createElement("span");
     tag.className = "forcing-engine-tag";
@@ -1725,15 +2216,14 @@ function updateForcingBanner(forcing) {
     // extension predating the wide kwarg, or on old cached analyses.
     const tag = document.createElement("span");
     tag.className = "forcing-wide-tag";
-    tag.textContent = "wide";
-    tag.title = "Found by the wide solver: the winning line includes quiet build placements, not just direct threats";
+    tag.textContent = "broad search";
+    tag.title = "The search considered every legal move, including moves that build towards a later threat.";
     banner.appendChild(tag);
   }
   // Threat banners from single-position analysis may carry the defense
   // read-out: which placements refute the threat. Advisory (verified at
   // analysis budgets, time-boxed) — absent on wins, old extensions, or when
   // the defense sub-analysis had trouble.
-  const d = forcing.defense;
   if (d && (d.killers.length || d.pair_anchors.length || d.best_delay)) {
     // The cells themselves are marked on the board (rings in the defender's
     // colour — see drawAnalysisBoard's defense overlay); the banner only
@@ -1747,17 +2237,22 @@ function updateForcingBanner(forcing) {
       text = "defense needs a pair — play 1, then 2 (best pair marked on the board)"
         + (d.pair_anchors.length > 1 ? ` — ${d.pair_anchors.length - 1} alternative${d.pair_anchors.length > 2 ? "s" : ""} exist` : "");
     } else {
-      text = "no refutation found — the longest-delay placement is marked … on the board";
+      text = "No defense stops the win. The move that delays it longest is marked … on the board.";
     }
     const line = document.createElement("div");
     line.className = "forcing-defense-line";
     line.textContent = text;
-    line.title = "Defense candidates verified at analysis budgets (advisory, time-boxed)";
+    line.title = "These defensive moves were checked with the selected effort. A longer search may find more.";
+    banner.appendChild(line);
+  } else if (forcing.defense_status === "budget") {
+    const line = document.createElement("div");
+    line.className = "forcing-defense-line";
+    line.textContent = "The threat is proved, but this effort level did not identify the best reply.";
     banner.appendChild(line);
   }
   // "win"/"threat" classes carry the colour (observatory.css).
-  banner.classList.toggle("win", forcing.attacker_is_mover);
-  banner.classList.toggle("threat", !forcing.attacker_is_mover);
+  banner.classList.toggle("win", forcingIsCertain(forcing));
+  banner.classList.toggle("threat", !forcingIsCertain(forcing));
 }
 
 function updateAnalysisTransform() {
@@ -1803,6 +2298,8 @@ function branchFrom(node, q, r) {
   child = _newNode([q, r], playerAtDepth(node.depth + 1), node, result);
   node.children.push(child);
   setCurrent(child);
+  if (automaticAnalysisEnabled() && !analysisRunActive && !result.terminal)
+    void analyzeNode(child, true);
 }
 
 // A failed /analyze must not leave `child` in the tree: branchFrom's
@@ -1823,14 +2320,15 @@ function discardSideLine(parent, child, message) {
 // --- PGN-style move tree rendering -----------------------------------------
 function _moveLink(node) {
   const active = node === analysisCurrent ? " move-active" : "";
-  // missed_win is per-PLACEMENT (server-computed, analyze_game_full only —
-  // side-line nodes from /analyze never carry it), so it's checked here
+  // missed_win is per placement (computed after a whole-game analysis), so
+  // side-line nodes from a single-position analysis do not carry it. Check it
+  // here
   // rather than once per turn: whichever of the turn's (up to 2) move links
   // squandered the win gets the badge, not necessarily the turn-end one.
   const mw = node.result && node.result.missed_win;
   const badge = mw
     ? ` <span class="missed-win-badge" onclick="showMissedWin(${node._id})" `
-    + `title="A forced win existed one placement earlier">&#9889; Missed win!</span>`
+    + `title="This move gave up a forced win. Show the winning line.">&#9889; Win missed</span>`
     : "";
   return `<span class="move-link${active}" onclick="scrubToNodeId(${node._id})">`
        + `[${node.move[0]},${node.move[1]}]</span>${badge}`;
@@ -1839,6 +2337,17 @@ function _moveLink(node) {
 // Selected missed-win callout: the {by, at_prefix, first_move, pv, pv_len,
 // pv_owners} dict from the badge that's currently pinned open, or null.
 let missedWinSelected = null;
+
+function selectedMissedWinForcing() {
+  const mw = missedWinSelected;
+  if (!mw || analysisCurrent?.depth !== mw.at_prefix) return null;
+  return {
+    winner: mw.by, attacker_is_mover: true, first_move: mw.first_move,
+    depth: mw.depth, pv: mw.pv || [], pv_owners: mw.pv_owners || null,
+    line_placements: mw.line_placements, pv_len: mw.pv_len,
+    wide: true, defense: null,
+  };
+}
 
 // Click a "Missed win!" badge: navigate the board to `at_prefix` (the
 // position where the win still existed — Task 2's forcing-pv overlay
@@ -1852,16 +2361,12 @@ function showMissedWin(nodeId) {
   const target = analysisMain[mw.at_prefix];
   if (target) setCurrent(target);   // clears missedWinSelected + navigates
   missedWinSelected = mw;
+  if (target) renderNode(target);
   renderMissedWinCallout();
 }
 
-// Compact callout panel for the selected missed-win badge: proof depth in
-// attacker turns plus the squandered PV as numbered coordinate chips, attacker
-// placements emphasized and defender replies muted per `pv_owners` (falling
-// back to "every cell is attacker" if the server's replay couldn't determine
-// ownership — mirrors drawAnalysisBoard's forcing-pv overlay fallback).
-// Created on first use, like updateForcingBanner, so no static markup needs
-// to change.
+// Compact explanation for a selected missed win. The detailed line belongs on
+// the board; repeating every coordinate here makes the sidebar harder to scan.
 function renderMissedWinCallout() {
   const movetree = document.getElementById("analysis-movetree");
   if (!movetree) return;
@@ -1875,21 +2380,14 @@ function renderMissedWinCallout() {
   const mw = missedWinSelected;
   if (!mw) { panel.hidden = true; panel.innerHTML = ""; return; }
   panel.hidden = false;
-  // Defender chips take the defender's own stone colour (matches the board
-  // overlay's defender colouring); attacker chips keep the phosphor emphasis.
-  const mwDefColor = mw.by === "P2" ? "var(--p1)" : "var(--p2)";
-  const chips = mw.pv.map((c, i) => {
-    const isAttacker = mw.pv_owners ? mw.pv_owners[i] === mw.by : true;
-    const cls = `pv-chip ${isAttacker ? "pv-chip-attacker" : "pv-chip-defender"}`;
-    const style = isAttacker ? "" : ` style="color:${mwDefColor}"`;
-    return `<span class="${cls}"${style}>${i + 1}. [${c[0]},${c[1]}]</span>`;
-  }).join("");
   const placements = mw.line_placements != null ? mw.line_placements : mw.pv_len;
   const depth = mw.depth != null
-    ? `depth ${mw.depth} attacker turn${mw.depth === 1 ? "" : "s"}`
-    : "forced-win depth unavailable";
-  panel.innerHTML = `<div class="mwc-head">${mw.by} had a forced win (${depth} · ${placements} placement${placements === 1 ? "" : "s"})</div>`
-                   + `<div class="mwc-pv">${chips}</div>`;
+    ? `${mw.depth} turn${mw.depth === 1 ? "" : "s"} by the winning side`
+    : "number of turns unavailable";
+  const first = mw.first_move ? `[${mw.first_move[0]},${mw.first_move[1]}]` : "shown on the board";
+  panel.innerHTML = `<div class="mwc-head">Forced win missed</div>`
+                   + `<p><strong>${mw.by}</strong> had a forced win here. The selected move gave it up; the winning line is now shown on the board.</p>`
+                   + `<div class="mwc-meta">Start with <span>${first}</span> · ${depth} · ${placements} placement${placements === 1 ? "" : "s"}</div>`;
 }
 
 // Assign ids so onclick can find nodes. Re-runs on every render: clears the
@@ -1958,19 +2456,20 @@ function renderMoveTree() {
 
   // Variations: a side line starts at a node whose parent's mainline child is a
   // different node. Render each as an indented block of its own mini move list.
-  function variationRows(startNode, depthIndent) {
+  function variationRows(startNode, nesting) {
     // Build the side line's own spine (following first-child).
     const nodes = [];
     let n = startNode;
     while (n && n.move) { nodes.push(n); n = n.children[0]; }
     const vturns = _turnsOf(nodes);
-    let cells = vturns.map(t => {
-      const lbl = (t.player === "P1" ? "P1 " : "P2 ");
-      return `<span class="var-side">${lbl}</span>${_turnCellHtml(t)}`;
-    }).join(" ");
-    let html = `<div class="variation" style="margin-left:${depthIndent}px">(${cells})</div>`;
+    const turnsHtml = vturns.map(t =>
+      `<div class="variation-turn"><span class="var-side">${t.player}</span><span>${_turnCellHtml(t)}</span></div>`
+    ).join("");
+    const branchPosition = (startNode.parent?.depth || 0) + 1;
+    let html = `<div class="variation" style="--variation-indent:${Math.min(nesting, 3) * 8}px">` +
+      `<div class="variation-heading">Alternative from position ${branchPosition}</div>${turnsHtml}</div>`;
     // nested variations off any node in this side line
-    for (const nd of nodes) for (const c of nd.children.slice(1)) html += variationRows(c, depthIndent + 12);
+    for (const nd of nodes) for (const c of nd.children.slice(1)) html += variationRows(c, nesting + 1);
     return html;
   }
   // Collect variation HTML keyed by the mainline depth they branch from, so we
@@ -1980,7 +2479,7 @@ function renderMoveTree() {
     const mainChild = analysisMain[parentNode.depth + 1];
     for (const c of parentNode.children) {
       if (c !== mainChild && c.move) {
-        (varByDepth[parentNode.depth] = varByDepth[parentNode.depth] || []).push(variationRows(c, 8));
+        (varByDepth[parentNode.depth] = varByDepth[parentNode.depth] || []).push(variationRows(c, 0));
       }
     }
   };
@@ -2138,10 +2637,13 @@ window.addEventListener("hexo:view-changed", (e) => {
 // `#analysis-info` element (populated by renderNode once data arrives) via
 // MutationObserver rather than wrapping renderNode itself.
 const _infoEl = document.getElementById("analysis-info");
+let _lastAutoCollapsedAnalysisTree = null;
 if (_infoEl) {
   new MutationObserver(() => {
     const info = document.getElementById("analysis-info");
-    if (info && info.textContent.trim() && analysisTree && window.innerWidth <= 768) {
+    if (info && info.textContent.trim() && analysisTree &&
+        analysisTree !== _lastAutoCollapsedAnalysisTree && window.innerWidth <= 768) {
+      _lastAutoCollapsedAnalysisTree = analysisTree;
       setAnalysisSheetOpen(false);
     }
   }).observe(_infoEl, { childList: true, characterData: true, subtree: true });

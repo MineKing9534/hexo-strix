@@ -23,7 +23,7 @@ def _manager() -> GameManager:
         m_actions=16,
         checkpoint_path="browser-test.safetensors",
         model_label="browser-test",
-        difficulty_sims={"quick": 16, "standard": 64},
+        difficulty_sims={"casual": 16, "easy": 32, "standard": 64, "strong": 128},
         default_difficulty="standard",
         idle_ttl_seconds=3600,
         max_games=10,

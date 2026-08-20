@@ -1,16 +1,23 @@
 {
-  "name": "hexo-strix-browser-tests",
+  "name": "hexo-strix-web",
   "private": true,
   "scripts": {
-    "test:browser": "playwright test",
+    "build:frontend": "esbuild hexo-a0/src/hexo_a0/serving/frontend/observatory-ui.ts --bundle --format=iife --target=es2022 --minify --outfile=hexo-a0/src/hexo_a0/serving/static/observatory-ui.js",
+    "test:browser": "npm run build:frontend && playwright test",
     "test:browser:webkit": "PLAYWRIGHT_WEBKIT=1 playwright test --project=phone-webkit --project=tablet-webkit",
     "test:browser:headed": "playwright test --headed",
     "test:browser:report": "playwright show-report",
+    "typecheck": "npm run typecheck:frontend && npm run typecheck:browser",
+    "typecheck:frontend": "tsc -p hexo-a0/src/hexo_a0/serving/frontend/tsconfig.json --noEmit",
     "typecheck:browser": "tsc -p hexo-a0/tests/browser/tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.2.0",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "lit": "^3.3.3"
   }
 }

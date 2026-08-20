@@ -609,10 +609,12 @@ def end_of_turn_indices(current_players: list[str]) -> list[int]:
 # both from the mover's perspective). See classify_turn_quality.
 QUALITY_BLUNDER = 0.40
 QUALITY_MISTAKE = 0.15
-QUALITY_LABELS = {"best": "★", "good": "✓", "mistake": "?", "blunder": "✗"}
+QUALITY_LABELS = {"best": "★", "winning": "◆", "good": "✓", "mistake": "?", "blunder": "✗",
+                  "forced": "◇"}
 # Observatory palette: gold best, green good, amber mistake, crimson blunder.
-QUALITY_COLORS = {"best": "#f2c14e", "good": "#79cf9a",
-                  "mistake": "#e0a23a", "blunder": "#e25c5c"}
+QUALITY_COLORS = {"best": "#f2c14e", "winning": "#79cf9a", "good": "#79cf9a",
+                  "mistake": "#e0a23a", "blunder": "#e25c5c",
+                  "forced": "#aeb8b1"}
 
 
 def _p1_perspective(value, current_player):
@@ -664,7 +666,27 @@ def _opponent_forced_loss(end_entry, mover):
     if end_entry.get("terminal"):
         return end_entry.get("winner") == opp
     f = end_entry.get("forcing")
-    return bool(f and f.get("attacker_is_mover") and f.get("winner") == opp)
+    return bool(_forcing_is_certain(f) and f.get("winner") == opp)
+
+
+def _mover_forced_win(end_entry, mover):
+    """True iff the position proves that ``mover`` wins despite the side to move."""
+    if end_entry.get("terminal"):
+        return end_entry.get("winner") == mover
+    f = end_entry.get("forcing")
+    return bool(_forcing_is_certain(f) and f.get("winner") == mover)
+
+
+def _forcing_is_certain(forcing):
+    """Whether a forcing result proves the winner regardless of whose turn it is."""
+    if not forcing:
+        return False
+    if forcing.get("attacker_is_mover"):
+        return True
+    defense = forcing.get("defense")
+    return bool(defense and not defense.get("killers")
+                and not defense.get("pair_anchors")
+                and defense.get("best_delay") is not None)
 
 
 def classify_turn_quality(trajectory, boundary_indices, moves, *,
@@ -701,7 +723,7 @@ def classify_turn_quality(trajectory, boundary_indices, moves, *,
     Returns a quality dict (see below) or None if it can't be classified. The
     dict carries enough for the frontend to render order-independently:
     ``{"label", "icon", "color", "matched", "engine_pair", "played_pair",
-       "loss", "player_end_q", "engine_end_q", "forced_loss",
+       "loss", "player_end_q", "engine_end_q", "forced_loss", "forced_before_turn",
        "turn_start_depth"}``.
     """
     if turn_end_idx <= 0 or turn_end_idx not in boundary_indices:
@@ -785,11 +807,25 @@ def classify_turn_quality(trajectory, boundary_indices, moves, *,
     # than the value head's optimistic q_hat. (Missing the mover's OWN forced
     # win is different — that's the missed-win walk's job, not a forced loss.)
     forced_loss = _opponent_forced_loss(trajectory[b], mover)
+    forced_before_turn = _opponent_forced_loss(trajectory[a], mover)
     if forced_loss:
-        player_end_q = -1.0
-        loss = (max(0.0, engine_end_q - player_end_q)
-                if engine_end_q is not None else 1.0)
-        label = "blunder"
+        if forced_before_turn:
+            label = "forced"
+            loss = 0.0
+        else:
+            player_end_q = -1.0
+            loss = (max(0.0, engine_end_q - player_end_q)
+                    if engine_end_q is not None else 1.0)
+            label = "blunder"
+
+    # A verified win is stronger evidence than the approximate value head. A
+    # move which preserves or creates a forced win can be slower than the
+    # engine's favourite line, but it cannot be a mistake or blunder.
+    proven_win = _mover_forced_win(trajectory[b], mover)
+    win_before_turn = _mover_forced_win(trajectory[a], mover)
+    if proven_win and not matched:
+        label = "winning"
+        loss = 0.0
 
     return {
         "label": label, "icon": QUALITY_LABELS[label], "color": QUALITY_COLORS[label],
@@ -799,6 +835,9 @@ def classify_turn_quality(trajectory, boundary_indices, moves, *,
         "loss": _finite(loss),
         "player_end_q": player_end_q, "engine_end_q": engine_end_q,
         "forced_loss": forced_loss,
+        "forced_before_turn": forced_before_turn,
+        "proven_win": proven_win,
+        "win_before_turn": win_before_turn,
         "turn_start_depth": a,
     }
 

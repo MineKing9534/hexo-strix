@@ -21,8 +21,8 @@ from hexo_a0.serving.model import make_graph_fn
 logger = logging.getLogger(__name__)
 
 
-# Difficulty tiers. Labels are stable (UI-visible); sim counts are tunable via
-# --difficulty-sims at startup. See
+# Search-effort tiers. Keys are stable API and storage values; display names
+# live in the frontend. Sim counts are tunable via --difficulty-sims at startup. See
 # docs/research/2026-05-14-sim-count-strength-curve.md for the Elo gaps.
 DIFFICULTY_ORDER = ("casual", "easy", "standard", "strong")
 DEFAULT_DIFFICULTY_SIMS: dict[str, int] = {

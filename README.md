@@ -79,8 +79,9 @@ cargo run --bin play -p hexo-engine --features tui
 cargo test -p hexo-mcts                             # Rust
 uv run --no-sync pytest hexo-a0/tests/ --tb=short   # Python
 npm install && npx playwright install chromium      # one-time browser setup
+npm run build:frontend                              # bundle Lit + TypeScript UI
 npm run test:browser                                # responsive Chromium matrix
-npm run typecheck:browser                           # Playwright TypeScript
+npm run typecheck                                   # frontend + Playwright TypeScript
 # Optional where Playwright WebKit host libraries are available:
 npx playwright install webkit
 npm run test:browser:webkit

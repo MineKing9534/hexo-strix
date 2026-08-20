@@ -111,6 +111,9 @@ def test_static_serves_css_and_js():
         assert etag and "max-age" in (cache or "") and len(body) > 0
         s2, ctype2, _, _, _ = _get(port, "/static/play.js")
         assert s2 == 200 and ctype2 == "text/javascript; charset=utf-8"
+        ui, ui_type, _, _, ui_js = _get(port, "/static/observatory-ui.js")
+        assert ui == 200 and ui_type == "text/javascript; charset=utf-8"
+        assert b"hexo-observatory-app" in ui_js
         s3, _, _, _, analysis_js = _get(port, "/static/analysis.js")
         assert s3 == 200
         assert b"new Worker" in analysis_js
@@ -121,6 +124,8 @@ def test_static_serves_css_and_js():
         iw, iw_type, _, _, inference_js = _get(port, "/static/inference-worker.js")
         assert iw == 200 and iw_type == "text/javascript; charset=utf-8"
         assert b"StrixBot" in inference_js and b"analyzeGame" in inference_js
+        assert (b"solve_defense_wide" in inference_js and b"analyzeDefense" in inference_js
+                and b"indexedDB" in inference_js)
         pe, pe_type, _, _, proof_js = _get(port, "/static/proof-explorer.js")
         assert pe == 200 and pe_type == "text/javascript; charset=utf-8"
         assert b"buildProofModel" in proof_js and b"proofExplorerWorstCase" in proof_js
@@ -137,20 +142,21 @@ def test_html_exposes_authoritative_rules_to_worker_client():
         assert b"winLength: 6" in body
         assert b"placementRadius: 8" in body
         assert b"maxMoves: 400" in body
-        assert b'id="analysis-strength"' in body
-        assert b'id="analysis-load-btn"' in body and b"Load game" in body
-        assert b'id="analysis-position-btn"' in body and b"Analyze position" in body
-        assert b'id="analysis-game-btn"' in body and b"Analyze full game" in body
-        assert b"Deep &#183; 256 sims" in body or b"Deep" in body
-        assert b'<details id="hds-import"' in body
-        assert b'<details id="analysis-forcing-depth-control"' in body
-        assert b"analysis-display-options" in body
         assert b"modelUrl:" in body and b"/model.safetensors?v=" in body
-        assert b"DFPN" in body and b"PDS-PN" in body and b"PNS" in body
-        assert b"analysis-download-certificate-btn" in body
-        assert b"analysis-explore-certificate-btn" in body
-        assert b'id="proof-explorer"' in body
-        assert b"PN leaf cap" in body
+        assert b"hexo-observatory-app" in body
+        _, _, _, _, ui = _get(port, "/static/observatory-ui.js")
+        assert b"analysis-strength" in ui
+        assert b"analysis-load-btn" in ui and b"Load game" in ui
+        assert b"analysis-position-btn" in ui and b"Analyze position" in ui
+        assert b"analysis-game-btn" in ui and b"Analyze full game" in ui
+        assert b"hds-import" in ui
+        assert b"analysis-forcing-depth-control" in ui
+        assert b"analysis-display-options" in ui
+        assert b"DFPN" in ui and b"PDS-PN" in ui and b"PNS" in ui
+        assert b"analysis-download-certificate-btn" in ui
+        assert b"analysis-explore-certificate-btn" in ui
+        assert b"proof-explorer" in ui
+        assert b"Extra search for each branch" in ui
         csp = _response_header(port, "/analysis", "Content-Security-Policy")
         assert "worker-src 'self'" in csp
         assert "'wasm-unsafe-eval'" in csp

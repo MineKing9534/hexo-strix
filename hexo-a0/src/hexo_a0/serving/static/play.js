@@ -13,7 +13,13 @@ const DEFAULT_DIFFICULTY = (window.__HEXO_CFG__ || {}).defaultDifficulty || "";
 let selectedDifficulty = DEFAULT_DIFFICULTY;
 
 const DIFFICULTY_LABELS = {
-  casual: "Casual", easy: "Easy", standard: "Standard", strong: "Strong",
+  casual: "Quick", easy: "Standard", standard: "Strong", strong: "Deep",
+};
+const DIFFICULTY_DESCRIPTIONS = {
+  casual: "Responds fastest",
+  easy: "Balances speed and search",
+  standard: "Searches further",
+  strong: "Searches furthest",
 };
 
 function renderDifficultyRow() {
@@ -26,13 +32,13 @@ function renderDifficultyRow() {
   row.hidden = false; lbl.hidden = false;
   const buttons = [];
   for (const key of Object.keys(DIFFICULTY_SIMS)) {
-    const sims = DIFFICULTY_SIMS[key];
     const label = DIFFICULTY_LABELS[key] || key;
+    const description = DIFFICULTY_DESCRIPTIONS[key] || "Computer opponent";
     const sel = key === selectedDifficulty ? " selected" : "";
     buttons.push(
       `<button class="diff-btn${sel}" data-diff="${key}" `
       + `onclick="selectDifficulty('${key}')">${label}`
-      + `<span class="sims">${sims} sims</span></button>`
+      + `<span class="sims">${description}</span></button>`
     );
   }
   row.innerHTML = buttons.join("");
@@ -120,10 +126,10 @@ async function onCellClick(q, r) {
     if (resp.ok) {
       applyState(body.state);
     } else {
-      setStatus(`Server: ${body.error || resp.statusText}`, true);
+      setStatus(`That move could not be played: ${body.error || resp.statusText}`, true);
     }
   } catch (e) {
-    setStatus(`Network error: ${e}`, true);
+    setStatus("We could not reach the server. Check your connection and try the move again.", true);
   } finally {
     inFlight = false;
     document.getElementById("board").classList.remove("disabled");
@@ -182,7 +188,7 @@ async function runLocalBotTurn() {
       if (!resp.ok) throw new Error(body.error || resp.statusText);
       applyState(body.state);
     } catch (fallbackError) {
-      setStatus(`Bot error: ${fallbackError.message || fallbackError}`, true);
+      setStatus(`The computer could not choose a move: ${fallbackError.message || fallbackError}`, true);
     }
   } finally {
     localBotInFlight = false;
@@ -241,12 +247,12 @@ async function analyzeThisGame() {
       body: JSON.stringify({game_id: gameState.game_id}),
     });
     const body = await resp.json();
-    if (!resp.ok) { setStatus(body.error || "Analysis load failed", true); return; }
+    if (!resp.ok) { setStatus(body.error || "The game could not be opened for analysis.", true); return; }
     document.getElementById("analysis-htttx").value = body.htttx;
     goToView("analysis");
     analyzeWholeGame();
   } catch (e) {
-    setStatus(`Network error: ${e}`, true);
+    setStatus("We could not reach the server. Check your connection and try again.", true);
   }
 }
 
@@ -388,28 +394,28 @@ async function loadBotStats() {
 
 const TIER_TAGS = {
   casual: {
-    hi:  "Casual mode and I'm still winning? Pretend I tried.",
-    mid: "I'm pulling punches and you're still feeling them. Nice.",
-    lo:  "Casual was meant to be the gentle one. So much for that.",
-    vlo: "You're trouncing me on the easiest setting. I'll be over here.",
+    hi:  "Quick search and I'm still finding the lines.",
+    mid: "Quick search, close games. Want to give me more time to think?",
+    lo:  "You're staying ahead of my fastest search.",
+    vlo: "You're making quick work of Quick. Nicely done.",
   },
   easy: {
-    hi:  "Easy tier and I'm finding the lines. Maybe try a real fight?",
-    mid: "Easy fight, but it's a fight. Want to make me work?",
-    lo:  "If I'm losing on Easy, my Casual self is in trouble.",
-    vlo: "This is humbling. Pick a harder tier and put me out of my misery.",
+    hi:  "Standard gives me enough time to find plenty of lines.",
+    mid: "Standard is producing close games. Best kind of fight.",
+    lo:  "You're staying ahead of my Standard search.",
+    vlo: "Standard isn't slowing you down. Try giving me more search time.",
   },
   standard: {
-    hi:  "Standard is my comfort zone. Care to make me sweat?",
-    mid: "Standard tier and we're trading punches. Best kind of fight.",
-    lo:  "I'm slipping at Standard. The next loss is going on the fridge.",
-    vlo: "You keep outplaying me at Standard. I'll go read the policy paper.",
+    hi:  "Strong search is finding its share of wins.",
+    mid: "Strong search and we're trading punches.",
+    lo:  "You're finding the gaps in my Strong search.",
+    vlo: "You keep outplaying my Strong search. Nicely done.",
   },
   strong: {
-    hi:  "Strong is where I bring everything. Brave of you to take it on.",
-    mid: "At Strong, I'm holding the line. Mostly.",
-    lo:  "Strong, and you keep finding the seams. Annoying.",
-    vlo: "On Strong? You're playing above me. That's rare.",
+    hi:  "Deep gives me the most time to search, and I'm using it.",
+    mid: "At Deep, I'm holding the line. Mostly.",
+    lo:  "Deep search, and you keep finding the gaps.",
+    vlo: "You're outplaying my deepest search. That's rare.",
   },
 };
 const NEUTRAL_TAGS = {
@@ -456,7 +462,7 @@ function renderBotStats(s) {
   // label already encodes it (auto labels are run@step).
   const step = (s.step !== null && s.step !== undefined) ? s.step : null;
   let label = s.model_label || "this version";
-  if (step != null && !String(label).includes("@" + step)) label += ` · step ${step}`;
+  if (step != null && !String(label).includes("@" + step)) label += ` · version ${step}`;
   const a = s.all_time || {total: 0, bot_wins: 0, human_wins: 0, draws: 0};
 
   const tierLabel = DIFFICULTY_LABELS[selectedDifficulty] || "this strength";
@@ -483,7 +489,7 @@ function renderBotStats(s) {
   cur.innerHTML = body;
 
   if (a.total > 0) {
-    at.textContent = `Lifetime across every difficulty and checkpoint: ` +
+    at.textContent = `Across all versions and search-effort settings: ` +
                      `${a.bot_wins}W–${a.human_wins}L–${a.draws}D from ${a.total} games.`;
   } else {
     at.textContent = "";
@@ -514,7 +520,7 @@ async function startGame() {
       }),
     });
     if (!resp.ok) {
-      setStatus(`Failed to start: ${resp.statusText}`, true);
+      setStatus(`The game could not start: ${resp.statusText}`, true);
       return;
     }
     const body = await resp.json();
@@ -523,13 +529,13 @@ async function startGame() {
     location.hash = `#g=${body.game_id}`;
     closeModal();
   } catch (e) {
-    setStatus(`Network error: ${e}`, true);
+    setStatus("We could not reach the server. Check your connection and try again.", true);
   }
 }
 
 async function resign() {
   if (!gameState || gameState.terminal) return;
-  if (!confirm("Resign this game?")) return;
+  if (!confirm("Resign this game? The computer will be recorded as the winner.")) return;
   inFlight = true;
   try {
     const resp = await fetch(URL_PREFIX + "/resign", {
@@ -538,9 +544,9 @@ async function resign() {
     });
     const body = await resp.json();
     if (resp.ok) applyState(body.state);
-    else setStatus(`Resign failed: ${body.error || resp.statusText}`, true);
+    else setStatus(`The game could not be resigned: ${body.error || resp.statusText}`, true);
   } catch (e) {
-    setStatus(`Network error: ${e}`, true);
+    setStatus("We could not reach the server. Check your connection and try again.", true);
   } finally {
     inFlight = false;
   }
@@ -550,8 +556,8 @@ async function copyHtttx() {
   if (!gameState || !gameState.htttx) return;
   try {
     await navigator.clipboard.writeText(gameState.htttx);
-    setStatus("HTTTX copied to clipboard.");
+    setStatus("Game record copied.");
   } catch (e) {
-    setStatus(`Copy failed: ${e}`, true);
+    setStatus("The game record could not be copied. Check your browser's clipboard permission.", true);
   }
 }
