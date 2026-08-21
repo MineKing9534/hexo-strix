@@ -45,7 +45,6 @@ interface AppActions {
     proofExplorerReset(): void;
     proofExplorerToggleShortestLine(): void;
     proofExplorerWorstCase(): void;
-    proofExplorerFindAlternatives(): void;
     proofFitBoard(): void;
     closeProofExplorer(): void;
     proofZoom(factor: number): void;
@@ -363,49 +362,52 @@ const analysisPanel = (): TemplateResult => html`
 
 const proofExplorer = (): TemplateResult => html`
   <div id="proof-explorer" role="dialog" aria-modal="true" aria-labelledby="proof-explorer-title" hidden>
-    <header class="proof-explorer-header">
-      <div class="proof-explorer-heading">
-        <span class="proof-explorer-kicker">Checked winning strategy</span>
-        <h2 id="proof-explorer-title">Explore the win</h2>
-        <span id="proof-explorer-summary"></span>
+    <section id="proof-board-container" aria-label="Proof position board">
+      <svg id="proof-board" aria-label="HeXO proof board"></svg>
+      <div class="proof-explorer-actions" aria-label="Proof explorer actions">
+        <button id="proof-share-btn" @click=${() => invoke("shareForcingCertificate")}
+          title="Save this result and copy its link">Copy link</button>
+        <button @click=${() => invoke("downloadForcingCertificate")}>Download</button>
+        <button id="proof-close-btn" class="proof-close" @click=${() => invoke("closeProofExplorer")}
+          aria-label="Close proof explorer">Close</button>
       </div>
-      <div class="proof-explorer-actions">
-        <button id="proof-back-btn" @click=${() => invoke("proofExplorerBack")} title="Go back one step">&larr; Back</button>
-        <button @click=${() => invoke("proofExplorerReset")} title="Return to the first position">Start again</button>
-        <button id="proof-shortest-line-btn" @click=${() => invoke("proofExplorerToggleShortestLine")} hidden>Longest defence</button>
-        <button id="proof-worst-btn" class="proof-primary" @click=${() => invoke("proofExplorerWorstCase")} title="Follow the reply that delays the win longest">Show longest defence &rarr;</button>
-        <button id="proof-alternatives-btn" @click=${() => invoke("proofExplorerFindAlternatives")} title="Find another position with more than one winning move">Other winning moves</button>
-        <button @click=${() => invoke("proofFitBoard")} title="Fit the current proof position on screen">Fit board</button>
-        <button id="proof-share-btn" @click=${() => invoke("shareForcingCertificate")} title="Save this result and copy its link">Copy link</button>
-        <button @click=${() => invoke("downloadForcingCertificate")}>Download result</button>
-        <button id="proof-close-btn" class="proof-close" @click=${() => invoke("closeProofExplorer")} aria-label="Close proof explorer">Close</button>
+      <div class="proof-board-tools" aria-label="Board zoom controls">
+        <button @click=${() => invoke("proofZoom", 1.25)} aria-label="Zoom in">+</button>
+        <button @click=${() => invoke("proofZoom", 0.8)} aria-label="Zoom out">−</button>
+        <button @click=${() => invoke("proofFitBoard")}>Fit</button>
       </div>
-    </header>
-    <div class="proof-explorer-body">
-      <section id="proof-board-container" aria-label="Proof position board">
-        <svg id="proof-board" aria-label="HeXO proof board"></svg>
-        <div class="proof-board-tools" aria-label="Board zoom controls">
-          <button @click=${() => invoke("proofZoom", 1.25)} aria-label="Zoom in">+</button>
-          <button @click=${() => invoke("proofZoom", 0.8)} aria-label="Zoom out">−</button>
-          <button @click=${() => invoke("proofFitBoard")}>Fit</button>
-        </div>
-        <div class="proof-board-legend">
-          <span><i id="proof-attacker-swatch" class="proof-sw"></i><span id="proof-attacker-legend">winning side</span></span>
-          <span><i id="proof-defender-swatch" class="proof-sw"></i><span id="proof-defender-legend">defending side</span></span>
-          <span><i class="proof-sw proof-sw-choice"></i>move you can choose</span>
-        </div>
-      </section>
-      <aside class="proof-explorer-panel">
+      <div class="proof-board-legend">
+        <span><i id="proof-attacker-swatch" class="proof-sw"></i><span id="proof-attacker-legend">winning side</span></span>
+        <span><i id="proof-defender-swatch" class="proof-sw"></i><span id="proof-defender-legend">defending side</span></span>
+        <span><i class="proof-sw proof-sw-choice"></i>previewed move</span>
+      </div>
+      <aside class="proof-explorer-panel" aria-label="Proof navigation">
+        <header class="proof-explorer-heading">
+          <span class="proof-explorer-kicker">Checked winning strategy</span>
+          <h2 id="proof-explorer-title">Explore the win</h2>
+          <span id="proof-explorer-summary"></span>
+        </header>
+        <nav class="proof-history-actions" aria-label="Proof history">
+          <button id="proof-back-btn" @click=${() => invoke("proofExplorerBack")} title="Go back one step">&larr; Back</button>
+          <button @click=${() => invoke("proofExplorerReset")} title="Return to the first position">Start again</button>
+        </nav>
         <div class="proof-progress-copy"><span id="proof-progress-label"></span><span id="proof-node-label"></span></div>
         <div class="proof-progress-track"><div id="proof-progress-bar"></div></div>
         <div id="proof-optimization-note" class="proof-optimization-note" hidden></div>
         <div id="proof-step-card"></div>
-        <div id="proof-choices" class="proof-choices"></div>
-        <div class="proof-path-heading"><span>Moves you have explored</span><small>choose a step to go back</small></div>
-        <div id="proof-breadcrumbs" class="proof-breadcrumbs"></div>
-        <div class="proof-explorer-note">On the winning side's turn, the choices are moves this search proved will win. On the other side's turn, every reply covered by the result is shown. “Longest defence” chooses the reply that delays the win for the most checked turns.</div>
+        <div class="proof-path-heading"><span>Proof path</span><small><span class="proof-hover-hint">hover to preview · </span>choose to follow</small></div>
+        <div id="proof-tree" class="proof-tree" role="tree" aria-label="Positions and available branches"></div>
+        <div class="proof-panel-actions">
+          <button id="proof-shortest-line-btn" @click=${() => invoke("proofExplorerToggleShortestLine")} hidden>Longest defence</button>
+          <button id="proof-worst-btn" class="proof-primary" @click=${() => invoke("proofExplorerWorstCase")}
+            title="Follow the reply that delays the win longest">Choose longest defence &rarr;</button>
+        </div>
+        <details class="proof-explorer-note">
+          <summary>How to read this proof</summary>
+          <p>On the winning side's turn, each branch shown is a move that this search proved will win. On the other side's turn, every checked reply is shown. “Longest defence” follows the reply that delays the win for the most turns.</p>
+        </details>
       </aside>
-    </div>
+    </section>
   </div>
 `;
 

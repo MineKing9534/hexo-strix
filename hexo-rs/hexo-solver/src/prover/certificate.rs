@@ -46,7 +46,12 @@ pub enum ProofNode {
     DefenderReplies { responses: Vec<ProofResponse> },
     /// The attacker has a threat family with transversal number at least three;
     /// no two defender placements can stop the completion next attacker turn.
-    Unstoppable,
+    Unstoppable {
+        /// Inclusion-minimal next-turn completions whose minimum cover needs at
+        /// least three placements. Empty only in legacy version-1 certificates.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        threats: Vec<Vec<Coord>>,
+    },
 }
 
 /// Self-describing proof graph. The root position is supplied separately so a
@@ -233,7 +238,17 @@ impl ProofBuilder<'_> {
                 return Err("proved AND node has no future attacker turn".to_string());
             }
             Node::And => match self.k.and_eval() {
-                AndEval::AttackerWin => (ProofNode::Unstoppable, 1),
+                AndEval::AttackerWin => (
+                    ProofNode::Unstoppable {
+                        threats: self
+                            .k
+                            .unstoppable_witness()
+                            .into_iter()
+                            .map(|completion| completion.cells().to_vec())
+                            .collect(),
+                    },
+                    1,
+                ),
                 AndEval::Loss => return Err("proved AND node re-evaluated as a loss".to_string()),
                 AndEval::Covers(covers) => {
                     let mut responses = Vec::with_capacity(covers.len());
@@ -293,7 +308,7 @@ pub(crate) fn worst_case_pv(
             .get(id as usize)
             .ok_or_else(|| format!("proof node {id} is out of range"))?;
         let value = match node {
-            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable => 1,
+            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } => 1,
             ProofNode::AttackerMove { child, .. } => {
                 1u32.saturating_add(depth(certificate, *child, memo)?)
             }
@@ -349,7 +364,7 @@ pub(crate) fn worst_case_pv(
                 pv.extend_from_slice(cells.cells());
                 id = response.child;
             }
-            ProofNode::Unstoppable => {
+            ProofNode::Unstoppable { .. } => {
                 let defense = k.futile_pair();
                 k.place_defender(&defense);
                 pv.extend_from_slice(defense.cells());
@@ -617,8 +632,22 @@ impl ProofVerifier<'_> {
                 }
                 max_depth
             }
-            (Node::And, ProofNode::Unstoppable) => match self.k.and_eval() {
-                AndEval::AttackerWin => 1,
+            (Node::And, ProofNode::Unstoppable { threats }) => match self.k.and_eval() {
+                AndEval::AttackerWin => {
+                    if !threats.is_empty() {
+                        let supplied = threats
+                            .iter()
+                            .map(|action| parse_action(action))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let actual = self.k.unstoppable_witness();
+                        if supplied != actual {
+                            return Err(format!(
+                                "node {id}: unstoppable threat witness does not match the position"
+                            ));
+                        }
+                    }
+                    1
+                }
                 _ => return Err(format!("node {id}: unstoppable-fork claim is false")),
             },
             (Node::Or { .. }, _) => {
@@ -663,7 +692,7 @@ fn primary_reachable(certificate: &ProofCertificate) -> FxHashSet<u32> {
             ProofNode::DefenderReplies { responses } => {
                 pending.extend(responses.iter().map(|response| response.child));
             }
-            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable => {}
+            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } => {}
         }
     }
     reached
@@ -690,6 +719,16 @@ mod tests {
                 .expect("legacy version-1 attacker node must deserialize");
         match node {
             ProofNode::AttackerMove { alternatives, .. } => assert!(alternatives.is_empty()),
+            _ => panic!("wrong proof-node shape"),
+        }
+    }
+
+    #[test]
+    fn legacy_unstoppable_node_defaults_to_no_threat_witness() {
+        let node: ProofNode = serde_json::from_str(r#"{"kind":"unstoppable"}"#)
+            .expect("legacy version-1 unstoppable node must deserialize");
+        match node {
+            ProofNode::Unstoppable { threats } => assert!(threats.is_empty()),
             _ => panic!("wrong proof-node shape"),
         }
     }

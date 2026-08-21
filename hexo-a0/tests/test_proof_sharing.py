@@ -103,6 +103,24 @@ def test_store_rejects_structural_summary_mismatch():
         raise AssertionError("malformed proof was accepted")
 
 
+def test_store_accepts_optional_unstoppable_threat_witness():
+    store = ProofStore(":memory:")
+    bundle = _bundle()
+    bundle["certificate"]["nodes"][0]["threats"] = [
+        [[1, 0]], [[0, 1]], [[-1, 1]],
+    ]
+    assert store.put(bundle)
+
+    duplicate = json.loads(json.dumps(bundle))
+    duplicate["certificate"]["nodes"][0]["threats"].append([[1, 0]])
+    try:
+        store.put(duplicate)
+    except ProofValidationError as error:
+        assert "duplicate winning threat" in str(error)
+    else:
+        raise AssertionError("duplicate winning threat was accepted")
+
+
 def test_store_accepts_and_counts_ranked_attacker_alternatives():
     store = ProofStore(":memory:")
     bundle = _bundle()
@@ -174,7 +192,8 @@ def test_http_save_direct_page_and_bundle_round_trip_with_prefix():
 
         status, content_type, raw = _request(port, "GET", saved["url"])
         assert status == 200 and content_type.startswith("text/html")
-        assert b'id="proof-explorer"' in raw
+        assert b"<hexo-observatory-app>" in raw
+        assert b'/hexo/static/proof-explorer.js?' in raw
 
 
 def test_http_rejects_malformed_proof_and_unknown_id():

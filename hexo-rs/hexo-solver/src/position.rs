@@ -636,7 +636,9 @@ mod tests {
         // The verifier recomputes node shape instead of trusting the JSON. A
         // defender-shaped terminal at the attacker root must be rejected.
         let mut tampered = certificate.clone();
-        tampered.nodes[tampered.root as usize] = prover::certificate::ProofNode::Unstoppable;
+        tampered.nodes[tampered.root as usize] = prover::certificate::ProofNode::Unstoppable {
+            threats: Vec::new(),
+        };
         assert!(
             prover::certificate::verify(&pos.to_prover_position(), &tampered).is_err(),
             "tampered root must not verify"

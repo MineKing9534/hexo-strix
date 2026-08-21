@@ -8,6 +8,7 @@ let proofExplorerState = null;
 let proofPreviousFocus = null;
 let proofBoardBounds = null;
 let proofHighlightCenter = null;
+let proofPreviewHighlight = null;
 let proofView = {x: 0, y: 0, scale: 1};
 let proofPan = null;
 const proofSavedUrls = new WeakMap();
@@ -54,15 +55,8 @@ function buildProofModel(bundle) {
   const visiting = new Set();
   const parents = new Uint32Array(nodes.length);
   let edges = 0;
-  let alternativeAttackerNodes = 0;
-  let attackerAlternatives = 0;
 
   for (let id = 0; id < nodes.length; id++) {
-    if (nodes[id].kind === "attacker_move") {
-      const alternatives = proofAttackerChoices(nodes[id]).length - 1;
-      if (alternatives > 0) alternativeAttackerNodes++;
-      attackerAlternatives += alternatives;
-    }
     for (const child of proofNodeChildren(nodes[id])) {
       if (!Number.isInteger(child) || child < 0 || child >= nodes.length) {
         throw new Error(`The saved result links position ${id} to a missing reply.`);
@@ -112,28 +106,9 @@ function buildProofModel(bundle) {
     return best;
   }
 
-  function nearestAlternativePath(start) {
-    const queue = [{id: start, path: []}];
-    const seen = new Set([start]);
-    for (let cursor = 0; cursor < queue.length; cursor++) {
-      const current = queue[cursor];
-      if (nodes[current.id].kind === "attacker_move"
-          && proofAttackerChoices(nodes[current.id]).length > 1) {
-        return current.path;
-      }
-      for (const edge of proofNodeEdges(nodes[current.id])) {
-        if (seen.has(edge.child)) continue;
-        seen.add(edge.child);
-        queue.push({id: edge.child, path: [...current.path, edge]});
-      }
-    }
-    return null;
-  }
-
   return {
     certificate, nodes, root, parents, edges, remaining, worstResponseIndex,
-    attackerChoices: proofAttackerChoices, nearestAlternativePath,
-    alternativeAttackerNodes, attackerAlternatives, maxAttackerTurns,
+    attackerChoices: proofAttackerChoices, maxAttackerTurns,
   };
 }
 
@@ -430,6 +405,7 @@ function closeProofExplorer() {
   if (explorer) explorer.hidden = true;
   document.body.classList.remove("proof-explorer-open");
   proofExplorerState = null;
+  proofPreviewHighlight = null;
   proofPan = null;
   if (proofPreviousFocus && typeof proofPreviousFocus.focus === "function") proofPreviousFocus.focus();
   proofPreviousFocus = null;
@@ -450,13 +426,100 @@ function proofPlayerClass(player) {
   return player === "P1" ? "P1 · orange" : "P2 · blue";
 }
 
-function proofChoiceHtml({letter, action, copy, bound, color, onclick, badge = "", badgeClass = ""}) {
-  return `<button class="proof-choice" style="--choice-color:${color}" onclick="${onclick}">`
-    + `<span class="proof-choice-letter">${letter}</span>`
-    + `<span class="proof-choice-main"><b>${formatProofAction(action)}</b><small>${copy}</small></span>`
-    + `<span class="proof-choice-bound">win within ${bound} turn${bound === 1 ? "" : "s"}`
-    + (badge ? `<span class="proof-choice-badge ${badgeClass}">${badge}</span>` : "")
+function proofActionsMatch(left, right) {
+  return Array.isArray(left) && Array.isArray(right)
+    && left.length === right.length
+    && left.every((cell, index) => cell[0] === right[index][0] && cell[1] === right[index][1]);
+}
+
+function proofTreeBranchHtml({letter, action, copy, bound, color, onclick, badge = "", badgeClass = ""}) {
+  const preview = `proofPreviewAction(${JSON.stringify(action)},'${color}')`;
+  return `<button class="proof-tree-node future" role="treeitem" style="--choice-color:${color}" onclick="${onclick}"`
+    + ` onpointerenter="${preview}" onpointerleave="proofClearPreview()"`
+    + ` onfocus="${preview}" onblur="proofClearPreview()">`
+    + `<span class="proof-tree-marker"><span>${letter}</span></span>`
+    + `<span class="proof-tree-copy"><b>${formatProofAction(action)}</b><small>${copy}</small></span>`
+    + `<span class="proof-tree-bound">within ${bound} turn${bound === 1 ? "" : "s"}`
+    + (badge ? `<span class="proof-tree-badge ${badgeClass}">${badge}</span>` : "")
     + `</span></button>`;
+}
+
+function proofTreePathNodeHtml(entry, index, currentIndex, allowFuture) {
+  const current = index === currentIndex;
+  const future = index > currentIndex;
+  const label = index === 0 ? "Starting position" : entry.label;
+  const action = entry.lastAction ? formatProofAction(entry.lastAction.action) : "Proof begins here";
+  const onclick = current ? "" : ` onclick="proofExplorerJump(${index})"`;
+  return `<button class="proof-tree-node ${current ? "current" : future ? "future" : "past"}" role="treeitem"`
+    + ` aria-level="${index + 1}"${current ? ` aria-current="step" data-proof-selected disabled` : ""}`
+    + ((!future || allowFuture) ? onclick : " disabled") + `>`
+    + `<span class="proof-tree-marker"><span>${current ? "●" : index + 1}</span></span>`
+    + `<span class="proof-tree-copy"><b>${label}</b><small>${action}</small></span>`
+    + `<span class="proof-tree-bound">${current ? "current" : future ? "later" : "return"}</span>`
+    + `</button>`;
+}
+
+function proofTreeSiblingHtml(parentIndex, selectedEntry) {
+  const state = proofExplorerState;
+  const parent = state.history[parentIndex];
+  const node = state.model.nodes[parent.nodeId];
+  const edges = proofNodeEdges(node);
+  const alternatives = edges.filter(edge => !(
+    edge.child === selectedEntry.nodeId
+    && selectedEntry.lastAction
+    && proofActionsMatch(edge.action, selectedEntry.lastAction.action)
+  ));
+  if (!alternatives.length) return "";
+  const noun = alternatives.length === 1 ? "branch" : "branches";
+  const buttons = alternatives.map(edge => `<button class="proof-tree-sibling" role="treeitem"`
+    + ` onclick="proofExplorerChooseSibling(${parentIndex},${edge.index})">`
+    + `${formatProofAction(edge.action)}</button>`).join("");
+  return `<details class="proof-tree-siblings" ontoggle="proofTreeDetailsToggled()">`
+    + `<summary>${alternatives.length} other ${noun} here</summary>`
+    + `<div class="proof-tree-sibling-list">${buttons}</div></details>`;
+}
+
+function centerSelectedProofNode(behavior = "auto") {
+  const tree = document.getElementById("proof-tree");
+  const selected = tree && tree.querySelector("[data-proof-selected]");
+  if (!tree || !selected) return;
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const treeRect = tree.getBoundingClientRect();
+  const selectedRect = selected.getBoundingClientRect();
+  const top = tree.scrollTop + selectedRect.top - treeRect.top
+    - (tree.clientHeight - selectedRect.height) / 2;
+  if (typeof tree.scrollTo === "function") {
+    tree.scrollTo({top: Math.max(0, top), behavior: reduceMotion ? "auto" : behavior});
+  } else {
+    tree.scrollTop = Math.max(0, top);
+  }
+}
+
+function proofTreeDetailsToggled() {
+  requestAnimationFrame(() => centerSelectedProofNode("auto"));
+}
+
+function renderProofTree(branches = []) {
+  const state = proofExplorerState;
+  const tree = document.getElementById("proof-tree");
+  proofPreviewHighlight = null;
+  if (state.mode === "shortest") {
+    const entries = state.sampleLine.entries;
+    tree.innerHTML = `<div class="proof-tree-inner"><div class="proof-tree-trunk">`
+      + entries.map((entry, index) => proofTreePathNodeHtml(entry, index, state.lineIndex, true)).join("")
+      + `</div></div>`;
+  } else {
+    const history = state.history;
+    const path = history.map((entry, index) => {
+      const siblings = index + 1 < history.length
+        ? proofTreeSiblingHtml(index, history[index + 1]) : "";
+      return proofTreePathNodeHtml(entry, index, history.length - 1, false) + siblings;
+    }).join("");
+    tree.innerHTML = `<div class="proof-tree-inner"><div class="proof-tree-trunk">${path}</div>`
+      + (branches.length ? `<div class="proof-tree-children">${branches.map(proofTreeBranchHtml).join("")}</div>` : "")
+      + `</div>`;
+  }
+  requestAnimationFrame(() => centerSelectedProofNode());
 }
 
 function proofStepTags(entry, node, remaining) {
@@ -487,7 +550,6 @@ function renderProofExplorer() {
   const optimization = proofOptimizationDescription(proofExplorerState.bundle);
   summary.textContent = (optimization ? `${optimization.short} · ` : "")
     + `${model.nodes.length.toLocaleString()} positions checked · `
-    + `${model.attackerAlternatives.toLocaleString()} other winning moves · `
     + `win within ${model.maxAttackerTurns} turns by the winning side`;
   const optimizationNote = document.getElementById("proof-optimization-note");
   optimizationNote.hidden = !optimization;
@@ -498,18 +560,16 @@ function renderProofExplorer() {
   document.getElementById("proof-defender-legend").textContent = `${defender} · defending side`;
   document.getElementById("proof-back-btn").disabled = history.length <= 1;
   document.getElementById("proof-node-label").textContent = entry.shownWin
-    ? "win complete" : `position ${history.length}`;
+    ? "win complete" : `step ${history.length}`;
   document.getElementById("proof-progress-label").textContent = entry.shownWin
-    ? `${entry.attackerTurnsPlayed} turns by the winning side · complete`
-    : `${entry.attackerTurnsPlayed} turns by the winning side played · no more than ${remaining} remain`;
+    ? `${entry.attackerTurnsPlayed} winning turn${entry.attackerTurnsPlayed === 1 ? "" : "s"} · complete`
+    : `${entry.attackerTurnsPlayed} winning turn${entry.attackerTurnsPlayed === 1 ? "" : "s"} played · ${remaining} remain`;
   const progress = entry.shownWin ? 100
     : Math.min(98, entry.attackerTurnsPlayed / model.maxAttackerTurns * 100);
   document.getElementById("proof-progress-bar").style.transform = `scaleX(${progress / 100})`;
 
   const card = document.getElementById("proof-step-card");
-  const choices = document.getElementById("proof-choices");
   const worstButton = document.getElementById("proof-worst-btn");
-  const alternativesButton = document.getElementById("proof-alternatives-btn");
   const shortestButton = document.getElementById("proof-shortest-line-btn");
   shortestButton.hidden = !proofExplorerState.sampleLine;
   const sampleAttainsBound = proofExplorerState.sampleLine
@@ -517,16 +577,8 @@ function renderProofExplorer() {
       === Number(proofExplorerState.bundle.optimization.bestUpperDepth);
   shortestButton.textContent = sampleAttainsBound ? "Longest defence" : "Example winning line";
   let cardHtml = "";
-  let choicesHtml = "";
+  let branches = [];
   let accent = "var(--brass)";
-  const alternativesHere = !entry.shownWin && node.kind === "attacker_move"
-    && model.attackerChoices(node).length > 1;
-  const nearestAlternatives = alternativesHere ? [] : model.nearestAlternativePath(entry.nodeId);
-  alternativesButton.hidden = model.attackerAlternatives === 0;
-  alternativesButton.disabled = alternativesHere || !nearestAlternatives;
-  alternativesButton.textContent = alternativesHere ? "Other winning moves shown"
-    : nearestAlternatives ? `Other winning moves (${model.alternativeAttackerNodes.toLocaleString()})`
-      : "No other moves later";
 
   if (entry.shownWin) {
     accent = "var(--good)";
@@ -546,10 +598,10 @@ function renderProofExplorer() {
         : `<div class="proof-step-copy">The search saved one move that can force a win here. Other winning moves may exist.</div>`)
       + proofStepTags(entry, node, remaining);
     const attackBounds = attacks.map(choice => 1 + model.remaining(choice.child));
-    choicesHtml = attacks.map((choice, index) => {
+    branches = attacks.map((choice, index) => {
       const bound = attackBounds[index];
       const tiedShortest = index > 0 && bound === attackBounds[0];
-      return proofChoiceHtml({
+      return {
         letter: String(index + 1), action: choice.action,
         color: index === 0 ? (attacker === "P1" ? "#f08a3c" : "#3fb6d9")
           : PROOF_CHOICE_COLORS[index % PROOF_CHOICE_COLORS.length],
@@ -561,8 +613,8 @@ function renderProofExplorer() {
         badge: index === 0 ? "recommended" : tiedShortest ? "equally quick" : "",
         badgeClass: "recommended",
         onclick: `proofExplorerPlayAttacker(${index})`,
-      });
-    }).join("");
+      };
+    });
     worstButton.disabled = false;
     worstButton.textContent = "Play recommended move →";
   } else if (node.kind === "defender_replies") {
@@ -575,10 +627,10 @@ function renderProofExplorer() {
     const worstIndex = model.worstResponseIndex(node);
     const worstBound = model.remaining(node.responses[worstIndex].child);
     const worstTies = node.responses.filter(response => model.remaining(response.child) === worstBound).length;
-    choicesHtml = node.responses.map((response, index) => {
+    branches = node.responses.map((response, index) => {
       const bound = model.remaining(response.child);
       const isWorst = bound === worstBound;
-      return proofChoiceHtml({
+      return {
         letter: String.fromCharCode(65 + index), action: response.action,
         color: PROOF_CHOICE_COLORS[index % PROOF_CHOICE_COLORS.length],
         copy: isWorst
@@ -586,8 +638,8 @@ function renderProofExplorer() {
           : "The winning side can answer this too",
         bound, badge: isWorst ? "longest defence" : "", badgeClass: "longest",
         onclick: `proofExplorerChooseDefense(${index})`,
-      });
-    }).join("");
+      };
+    });
     worstButton.disabled = false;
     worstButton.textContent = "Choose longest defence →";
   } else if (node.kind === "immediate_win") {
@@ -596,25 +648,31 @@ function renderProofExplorer() {
       + `<div class="proof-step-title">Complete the six</div>`
       + `<div class="proof-step-copy">The winning side can complete six in a row during this turn. Show the move on the board to finish this line.</div>`
       + proofStepTags(entry, node, remaining);
-    choicesHtml = proofChoiceHtml({
+    branches = [{
       letter: "✓", action: node.action, color: "#79cf9a", copy: "Show the move that completes the win",
       bound: 1, onclick: "proofExplorerPlayAttacker()",
-    });
+    }];
     worstButton.disabled = false;
     worstButton.textContent = "Show winning move →";
   } else if (node.kind === "unstoppable") {
     accent = "var(--good)";
+    const threats = Array.isArray(node.threats) ? node.threats : [];
+    const title = threats.length
+      ? `${threats.length} winning threat${threats.length === 1 ? "" : "s"}`
+      : "Win cannot be blocked";
+    const copy = threats.length
+      ? `The marked shapes show checked ways for ${attacker} to complete six. Stopping all of them needs at least three placements, but ${defender} has two.`
+      : `${defender} cannot block every way for ${attacker} to make six on its next turn.`;
     cardHtml = `<div class="proof-step-kicker">No reply can stop the win</div>`
-      + `<div class="proof-step-title">Two winning threats</div>`
-      + `<div class="proof-step-copy">${defender} cannot block every way to make six. Whatever ${defender} plays, ${attacker} can complete six on its next turn.</div>`
+      + `<div class="proof-step-title">${title}</div>`
+      + `<div class="proof-step-copy">${copy}</div>`
       + proofStepTags(entry, node, remaining);
     worstButton.disabled = true;
     worstButton.textContent = "No defense remains";
   }
   card.style.setProperty("--proof-accent", accent);
   card.innerHTML = cardHtml;
-  choices.innerHTML = choicesHtml;
-  renderProofBreadcrumbs();
+  renderProofTree(branches);
   drawProofBoard();
 }
 
@@ -641,38 +699,30 @@ function renderShortestSampleLine() {
   document.getElementById("proof-back-btn").disabled = lineIndex === 0;
   document.getElementById("proof-node-label").textContent = `turn ${lineIndex} of ${total}`;
   document.getElementById("proof-progress-label").textContent = next
-    ? `${entry.attackerTurnsPlayed} turns by the winning side played`
-    : `${sampleAttackerTurns} turns by the winning side · line complete`;
+    ? `${entry.attackerTurnsPlayed} winning turn${entry.attackerTurnsPlayed === 1 ? "" : "s"} played`
+    : `${sampleAttackerTurns} winning turn${sampleAttackerTurns === 1 ? "" : "s"} · line complete`;
   document.getElementById("proof-progress-bar").style.transform = `scaleX(${total ? lineIndex / total : 0})`;
 
   const shortestButton = document.getElementById("proof-shortest-line-btn");
   shortestButton.hidden = false;
   shortestButton.textContent = "Return to all replies";
-  const alternativesButton = document.getElementById("proof-alternatives-btn");
-  alternativesButton.hidden = true;
   const worstButton = document.getElementById("proof-worst-btn");
   worstButton.disabled = !next;
   worstButton.textContent = next ? "Next turn →" : "Line complete";
   const card = document.getElementById("proof-step-card");
-  const choices = document.getElementById("proof-choices");
   if (next) {
     const role = next.player === attacker ? "Attacker" : "Defender";
     card.style.setProperty("--proof-accent", next.player === "P1" ? "var(--p1)" : "var(--p2)");
     card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Longest defence" : "Example winning line"} · ${role === "Attacker" ? "winning side" : "defending side"}</div>`
       + `<div class="proof-step-title">Play turn ${lineIndex + 1}</div>`
       + `<div class="proof-step-copy">${attainsBound ? "The winning side chooses its quickest proved win. The other side chooses the reply that delays it longest." : "This is one example. The defending side may have another reply that delays the win longer."}</div>`;
-    choices.innerHTML = `<button class="proof-choice" style="--choice-color:${next.player === "P1" ? "#f08a3c" : "#3fb6d9"}" onclick="proofExplorerShortestNext()">`
-      + `<span class="proof-choice-letter">${lineIndex + 1}</span>`
-      + `<span class="proof-choice-main"><b>${formatProofAction(next.cells)}</b><small>${next.player} · ${role.toLowerCase()}</small></span>`
-      + `<span class="proof-choice-bound">turn ${lineIndex + 1} of ${total}</span></button>`;
   } else {
     card.style.setProperty("--proof-accent", "var(--good)");
     card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Longest defence complete" : "Example line complete"}</div>`
       + `<div class="proof-step-title">Winning line complete</div>`
       + `<div class="proof-step-copy">The final highlighted move completes the win. Return to all replies to try other defensive moves.</div>`;
-    choices.innerHTML = "";
   }
-  renderProofBreadcrumbs();
+  renderProofTree();
   drawProofBoard();
 }
 
@@ -754,38 +804,6 @@ function proofExplorerWorstCase() {
   }
 }
 
-function proofExplorerFindAlternatives() {
-  if (!proofExplorerState) return;
-  const state = proofExplorerState;
-  const entry = currentProofEntry();
-  const path = state.model.nearestAlternativePath(entry.nodeId);
-  if (!path) return;
-  let stones = entry.stones;
-  let attackerTurnsPlayed = entry.attackerTurnsPlayed;
-  try {
-    for (const step of path) {
-      const player = step.role === "attacker" ? state.attacker : state.defender;
-      stones = applyProofAction(stones, step.action, player);
-      if (step.role === "attacker") attackerTurnsPlayed++;
-      state.history.push({
-        nodeId: step.child,
-        stones,
-        attackerTurnsPlayed,
-        label: step.role === "attacker"
-          ? `Winning turn ${attackerTurnsPlayed} · move ${step.index + 1}`
-          : `Reply ${String.fromCharCode(65 + step.index)}`,
-        lastAction: {action: step.action, player},
-        shownWin: false,
-      });
-    }
-    renderProofExplorer();
-    requestAnimationFrame(proofFitBoard);
-  } catch (error) {
-    closeProofExplorer();
-    setForcingStatus(`The saved moves could not be shown: ${error.message || error}`, "error");
-  }
-}
-
 function proofExplorerBack() {
   if (!proofExplorerState) return;
   if (proofExplorerState.mode === "shortest") {
@@ -813,9 +831,11 @@ function proofExplorerReset() {
 
 function proofExplorerJump(index) {
   if (proofExplorerState && proofExplorerState.mode === "shortest") {
-    if (index < 0 || index >= proofExplorerState.lineIndex) return;
+    if (index < 0 || index >= proofExplorerState.sampleLine.entries.length
+        || index === proofExplorerState.lineIndex) return;
     proofExplorerState.lineIndex = index;
     renderProofExplorer();
+    requestAnimationFrame(proofKeepHighlightVisible);
     return;
   }
   if (!proofExplorerState || index < 0 || index >= proofExplorerState.history.length - 1) return;
@@ -823,27 +843,28 @@ function proofExplorerJump(index) {
   renderProofExplorer();
 }
 
-function renderProofBreadcrumbs() {
-  if (proofExplorerState.mode === "shortest") {
-    const entries = proofExplorerState.sampleLine.entries.slice(0, proofExplorerState.lineIndex + 1);
-    document.getElementById("proof-breadcrumbs").innerHTML = entries.map((entry, index) => {
-      const current = index === proofExplorerState.lineIndex;
-      return `<button class="proof-crumb${current ? " current" : ""}"`
-        + (current ? " disabled" : ` onclick="proofExplorerJump(${index})"`)
-        + `>${entry.label}</button>`;
-    }).join("");
-    return;
-  }
-  const history = proofExplorerState.history;
-  document.getElementById("proof-breadcrumbs").innerHTML = history.map((entry, index) => {
-    const current = index === history.length - 1;
-    return `<button class="proof-crumb${current ? " current" : ""}"`
-      + (current ? " disabled" : ` onclick="proofExplorerJump(${index})"`)
-      + `>${entry.label}</button>`;
-  }).join("");
+function proofExplorerChooseSibling(parentIndex, edgeIndex) {
+  const state = proofExplorerState;
+  if (!state || state.mode !== "proof" || parentIndex < 0 || parentIndex >= state.history.length) return;
+  state.history.splice(parentIndex + 1);
+  const node = state.model.nodes[currentProofEntry().nodeId];
+  if (node.kind === "attacker_move") proofExplorerPlayAttacker(edgeIndex);
+  else if (node.kind === "defender_replies") proofExplorerChooseDefense(edgeIndex);
 }
 
-function proofPendingHighlights(node, entry) {
+function proofPreviewAction(action, color) {
+  if (!proofExplorerState || proofExplorerState.mode !== "proof") return;
+  proofPreviewHighlight = {action, color};
+  drawProofBoard();
+}
+
+function proofClearPreview() {
+  if (!proofExplorerState || !proofPreviewHighlight) return;
+  proofPreviewHighlight = null;
+  drawProofBoard();
+}
+
+function proofAvailableHighlights(node, entry) {
   if (entry.shownWin) return [];
   if (node.kind === "attacker_move") {
     return proofExplorerState.model.attackerChoices(node).map((choice, index) => ({
@@ -851,18 +872,19 @@ function proofPendingHighlights(node, entry) {
       color: index === 0
         ? (proofExplorerState.attacker === "P1" ? "#f08a3c" : "#3fb6d9")
         : PROOF_CHOICE_COLORS[index % PROOF_CHOICE_COLORS.length],
-      label: String(index + 1),
     }));
   }
   if (node.kind === "immediate_win") {
-    return [{action: node.action, color: proofExplorerState.attacker === "P1" ? "#f08a3c" : "#3fb6d9", label: ""}];
+    return [{action: node.action, color: proofExplorerState.attacker === "P1" ? "#f08a3c" : "#3fb6d9"}];
   }
   if (node.kind === "defender_replies") {
     return node.responses.map((response, index) => ({
       action: response.action,
       color: PROOF_CHOICE_COLORS[index % PROOF_CHOICE_COLORS.length],
-      label: String.fromCharCode(65 + index),
     }));
+  }
+  if (node.kind === "unstoppable" && Array.isArray(node.threats)) {
+    return node.threats.map(action => ({action, color: "#79cf9a", terminal: true}));
   }
   return [];
 }
@@ -897,16 +919,21 @@ function drawProofBoard() {
   const node = proofExplorerState.model.nodes[entry.nodeId];
   const lineTurn = proofExplorerState.mode === "shortest"
     ? proofExplorerState.sampleLine.turns[proofExplorerState.lineIndex] : null;
+  const terminalHighlights = proofExplorerState.mode === "proof" && node.kind === "unstoppable"
+    ? proofAvailableHighlights(node, entry) : [];
   const highlights = lineTurn
-    ? [{action: lineTurn.cells, color: lineTurn.player === "P1" ? "#f08a3c" : "#3fb6d9", label: ""}]
-    : proofExplorerState.mode === "shortest" ? [] : proofPendingHighlights(node, entry);
+    ? [{action: lineTurn.cells, color: lineTurn.player === "P1" ? "#f08a3c" : "#3fb6d9"}]
+    : proofExplorerState.mode === "shortest" ? []
+      : proofPreviewHighlight ? [proofPreviewHighlight] : terminalHighlights;
+  const availableHighlights = proofExplorerState.mode === "proof"
+    ? proofAvailableHighlights(node, entry) : highlights;
   const cellSet = new Set();
   const seeds = [];
   for (const key of entry.stones.keys()) {
     const [q, r] = key.split(",").map(Number);
     seeds.push([q, r]);
   }
-  for (const highlight of highlights) seeds.push(...highlight.action);
+  for (const highlight of availableHighlights) seeds.push(...highlight.action);
   if (!seeds.length) seeds.push([0, 0]);
   const contextRadius = 3;
   for (const [q, r] of seeds) {
@@ -941,19 +968,22 @@ function drawProofBoard() {
     }
   }
 
-  const focusPoints = [];
+  const focusPoints = availableHighlights.flatMap(highlight => highlight.action.map(([q, r]) => axialToPixel(q, r)));
+  const drawnMarkers = new Set();
   for (const highlight of highlights) {
     if (highlight.action.length === 2) {
       const a = axialToPixel(highlight.action[0][0], highlight.action[0][1]);
       const b = axialToPixel(highlight.action[1][0], highlight.action[1][1]);
       body += `<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${highlight.color}" stroke-width="${S * .09}" stroke-dasharray="${S * .18} ${S * .13}" opacity=".7" pointer-events="none"/>`;
     }
-    highlight.action.forEach(([q, r], cellIndex) => {
+    highlight.action.forEach(([q, r]) => {
+      const markerKey = `${q},${r}`;
+      if (drawnMarkers.has(markerKey)) return;
+      drawnMarkers.add(markerKey);
       const point = axialToPixel(q, r);
-      focusPoints.push(point);
-      const label = highlight.label ? `${highlight.label}${cellIndex + 1}` : `${cellIndex + 1}`;
-      body += `<circle cx="${point.x}" cy="${point.y}" r="${S * .46}" fill="#0d0f0e" fill-opacity=".82" stroke="${highlight.color}" stroke-width="2.8" pointer-events="none"/>`;
-      body += `<text x="${point.x}" y="${point.y + 1}" fill="${highlight.color}" font-family="ui-monospace,monospace" font-size="${Math.round(S * .36)}" font-weight="700" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${label}</text>`;
+      const title = highlight.terminal ? `<title>Winning threat at [${q},${r}]</title>` : "";
+      body += `<polygon class="proof-preview-hex${highlight.terminal ? " proof-terminal-threat" : ""}" points="${hexCorners(point.x, point.y, .56)}" fill="#0d0f0e" fill-opacity=".82" stroke="${highlight.color}" stroke-width="2.8" pointer-events="none">${title}</polygon>`;
+      body += `<circle class="proof-preview-dot" cx="${point.x}" cy="${point.y}" r="${S * .085}" fill="${highlight.color}" pointer-events="none"/>`;
     });
   }
   if (entry.shownWin) {

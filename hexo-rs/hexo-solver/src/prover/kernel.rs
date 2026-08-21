@@ -269,6 +269,23 @@ impl KernelCtx {
         }
     }
 
+    /// A deterministic inclusion-minimal set of attacker completions that still
+    /// needs at least three defender placements to cover. This is display data
+    /// for a verified `Unstoppable` certificate leaf, not a new proof rule.
+    pub(crate) fn unstoppable_witness(&mut self) -> Vec<CellSet2> {
+        let comps = self.node_comps();
+        let mut witness = comps.0.clone();
+        let mut index = witness.len();
+        while index > 0 {
+            index -= 1;
+            let removed = witness.remove(index);
+            if min_covers2(&witness).0 < 3 {
+                witness.insert(index, removed);
+            }
+        }
+        witness
+    }
+
     /// The greedy cosmetic 2-cell defender reply for a `B ≥ 3` PV step (reuses the
     /// production `extract_pv` helper so proof-search PVs read identically).
     pub(crate) fn futile_pair(&mut self) -> CellSet2 {
@@ -321,5 +338,32 @@ impl KernelCtx {
             max_moves,
         };
         GameState::from_state(&self.board.stones, self.atk, placements, cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AndEval, KernelCtx};
+    use crate::forcing::min_covers2;
+    use hexo_engine::types::Player;
+
+    #[test]
+    fn unstoppable_witness_still_needs_three_blocks() {
+        let stones = [
+            ((0, 0), Player::P1),
+            ((1, 0), Player::P1),
+            ((0, 1), Player::P1),
+        ];
+        let mut kernel = KernelCtx::new_wide(&stones, Player::P1, 3, 8, true).unwrap();
+        assert!(matches!(kernel.and_eval(), AndEval::AttackerWin));
+        let witness = kernel.unstoppable_witness();
+        assert!(!witness.is_empty());
+        assert_eq!(min_covers2(&witness).0, 3);
+
+        for index in 0..witness.len() {
+            let mut smaller = witness.clone();
+            smaller.remove(index);
+            assert!(min_covers2(&smaller).0 < 3, "witness must be minimal");
+        }
     }
 }

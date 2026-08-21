@@ -151,7 +151,21 @@ def validate_proof_bundle(bundle: dict) -> None:
                            f"certificate node {node_id} response {response_id} child",
                            0, len(nodes) - 1)
                 edges += 1
-        elif kind != "unstoppable":
+        elif kind == "unstoppable":
+            threats = node.get("threats", [])
+            if not isinstance(threats, list):
+                raise ProofValidationError(
+                    f"certificate node {node_id} threats must be an array")
+            supplied = set()
+            for threat_id, threat in enumerate(threats):
+                action = _action(
+                    threat,
+                    f"certificate node {node_id} threat {threat_id}")
+                if action in supplied:
+                    raise ProofValidationError(
+                        f"certificate node {node_id} has a duplicate winning threat")
+                supplied.add(action)
+        else:
             raise ProofValidationError(f"certificate node {node_id} has an unknown kind")
 
     verification = bundle.get("verification")
