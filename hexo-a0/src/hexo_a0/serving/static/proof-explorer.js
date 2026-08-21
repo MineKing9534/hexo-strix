@@ -4,6 +4,26 @@
 // defender response.
 
 const PROOF_CHOICE_COLORS = ["#3fb6d9", "#a58ae8", "#e0a23a", "#79cf9a"];
+// Mirror of analysis.js positionNumber(); stand-alone so the proof explorer
+// works even when analysis.js is not loaded (e.g. /proof/{id} shared link).
+function proofPositionNumber(depth) {
+  // Mirrors analysis.js positionNumber(); the proof explorer's "depth" is the
+  // cell index within the SAMPLE LINE (a flat list of placements across the
+  // captured PV turns), not an analysisMain placement index. Under standard
+  // HeXO rules every turn places 2 stones, so round 1 = 4 placements and the
+  // formula (depth+3)/4 round-numbers each placement correctly. The previous
+  // (depth+1)/4 + 1 made round 1 only 3 placements wide, which contradicts the
+  // standard 2-stone opener; the actual game starts with the side to move
+  // having moves_left=2 unless `bundle.position.placements_remaining === 1`,
+  // and the sample line cell counts already encode that for the sample-line
+  // overlay (see proofSampleLineOverlaySvg).
+  const select = document.getElementById("analysis-numbering");
+  const mode = (select && select.value) || (typeof localStorage !== "undefined"
+    && localStorage.getItem("hexo_analysis_numbering")) || "ply";
+  if (mode !== "round") return depth + 1;
+  if (depth <= 0) return 0;
+  return Math.floor((depth + 3) / 4);
+}
 let proofExplorerState = null;
 let proofPreviousFocus = null;
 let proofBoardBounds = null;
@@ -13,6 +33,10 @@ let proofView = {x: 0, y: 0, scale: 1};
 let proofPan = null;
 const proofSavedUrls = new WeakMap();
 let proofVerificationSerial = 0;
+// User toggle: draw the sample winning line on the proof board (mirrors the
+// "Winning lines" overlay on the analysis board). Defaults to true when a
+// sample line exists; the user can flip it off via the board-tools checkbox.
+let proofShowLine = true;
 
 function proofAttackerChoices(node) {
   if (node.kind !== "attacker_move") return [];
@@ -118,20 +142,33 @@ function proofOptimizationDescription(bundle) {
       || !optimization.bestUpperDepth) return null;
   const upper = Number(optimization.bestUpperDepth);
   const lower = Number(optimization.excludedThroughDepth || 0);
-  if (optimization.shortestCertified && lower + 1 === upper) {
-    const dagDepth = Number(bundle.verification.maxAttackerTurns);
+  const dagDepth = Number(bundle.verification.maxAttackerTurns);
+  const certMatches = dagDepth === upper;
+  if (optimization.shortestCertified && lower + 1 === upper && certMatches) {
+    // Tightest case: the saved DAG itself proves the exact shortest bound.
     return {
       short: `shortest win: ${upper} turns`,
-      full: dagDepth === upper
-        ? `The search proved that the winning side can force a win in ${upper} turns and cannot force one sooner. Every reply shown here was checked on this device.`
-        : `The search proved that the winning side can force a win in ${upper} turns and cannot force one sooner. The saved replies shown here prove a win within ${dagDepth} turns.`,
+      full: `The search proved that the winning side can force a win in ${upper} turns and cannot force one sooner. Every reply shown here was checked on this device.`,
     };
   }
+  if (optimization.shortestCertified && lower + 1 === upper && !certMatches) {
+    // Defensive branch: the server only flips shortestCertified when the
+    // saved cert re-verifies at the new bound, but an older bundle saved
+    // before that fix could still ship the inconsistent state. Don't claim
+    // a proven shortest win in that case.
+    return {
+      short: lower > 0 ? `shortest win: ${lower + 1}–${upper} turns` : `win within ${upper} turns`,
+      full: `The search narrowed the shortest win to between ${lower + 1} and ${upper} turns by the winning side, but the saved replies still prove a win within ${dagDepth} turns. Re-run with more effort to save a tighter certificate.`,
+    };
+  }
+  // General case: the optimizer proved only a SEARCH upper, not a PROVEN
+  // shortest bound. Be honest about that — the saved cert proves dagDepth
+  // turns, and there may be a shorter win within `upper` turns.
   return {
     short: lower > 0 ? `shortest win: ${lower + 1}–${upper} turns` : `win within ${upper} turns`,
     full: lower > 0
-      ? `The search proved that the shortest win takes between ${lower + 1} and ${upper} turns by the winning side. The saved replies shown here prove a win within ${bundle.verification.maxAttackerTurns} turns.`
-      : `The search proved a win within ${upper} turns by the winning side, but did not prove whether a faster win exists.`,
+      ? `The search proved that the shortest win takes between ${lower + 1} and ${upper} turns by the winning side. The saved replies shown here prove a win within ${dagDepth} turns.`
+      : `The search proved a win within ${upper} turns by the winning side, but did not prove whether a faster win exists. The saved replies prove a win within ${dagDepth} turns.`,
   };
 }
 
@@ -244,6 +281,20 @@ function openProofExplorerBundle(bundle, {savedUrl = null} = {}) {
     proofPreviousFocus = document.activeElement;
     document.getElementById("proof-explorer").hidden = false;
     document.body.classList.add("proof-explorer-open");
+    // The "Show winning line" toggle only makes sense when the cert was saved
+    // with a sample line (plain PDS-PN runs produce a cert but no sample line,
+    // so the toggle is disabled rather than silently showing nothing).
+    const toggle = document.getElementById("proof-show-line");
+    const hasSampleLine = Boolean(sampleLine && sampleLine.turns.length);
+    proofShowLine = hasSampleLine;
+    if (toggle) {
+      toggle.checked = hasSampleLine;
+      toggle.disabled = !hasSampleLine;
+      toggle.parentElement.style.opacity = hasSampleLine ? "" : "0.5";
+      toggle.parentElement.title = hasSampleLine
+        ? "Show every cell of the saved winning line on the board"
+        : "No sample line was saved with this result";
+    }
     renderProofExplorer();
     requestAnimationFrame(() => {
       proofFitBoard();
@@ -340,19 +391,50 @@ async function loadSavedProof(proofId) {
 }
 
 async function copyProofText(text) {
+  // Try the async Clipboard API first. It is the only path that works in
+  // cross-origin iframes and in most secure contexts, but it rejects with
+  // NotAllowedError when the user has blocked clipboard access, the document
+  // is not focused, or the call loses its user-activation window — in which
+  // case the legacy textarea + execCommand fallback below still succeeds on
+  // every major browser.
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (_error) {
+      // Fall through to the legacy path.
+    }
   }
   const field = document.createElement("textarea");
   field.value = text;
   field.setAttribute("readonly", "");
+  // Keep the field off-screen and out of the viewport's overflow scroll so
+  // the user cannot accidentally land focus on it; `position: fixed` plus
+  // negative offsets is the widely-recommended recipe.
   field.style.position = "fixed";
+  field.style.top = "0";
+  field.style.left = "0";
+  field.style.width = "1px";
+  field.style.height = "1px";
   field.style.opacity = "0";
+  field.style.pointerEvents = "none";
   document.body.appendChild(field);
+  const previousSelection = document.getSelection();
+  const previousRange = previousSelection && previousSelection.rangeCount > 0
+    ? previousSelection.getRangeAt(0) : null;
+  field.focus({preventScroll: true});
   field.select();
-  const copied = document.execCommand("copy");
-  field.remove();
+  field.setSelectionRange(0, field.value.length);
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } finally {
+    field.remove();
+    if (previousRange && previousSelection) {
+      previousSelection.removeAllRanges();
+      previousSelection.addRange(previousRange);
+    }
+  }
   if (!copied) throw new Error("Your browser blocked clipboard access.");
 }
 
@@ -575,7 +657,7 @@ function renderProofExplorer() {
   const sampleAttainsBound = proofExplorerState.sampleLine
     && proofExplorerState.sampleLine.entries.at(-1).attackerTurnsPlayed
       === Number(proofExplorerState.bundle.optimization.bestUpperDepth);
-  shortestButton.textContent = sampleAttainsBound ? "Longest defence" : "Example winning line";
+  shortestButton.textContent = sampleAttainsBound ? "Best defence line" : "Example winning line";
   let cardHtml = "";
   let branches = [];
   let accent = "var(--brass)";
@@ -621,8 +703,8 @@ function renderProofExplorer() {
     accent = defender === "P1" ? "var(--p1)" : "var(--p2)";
     const plural = node.responses.length === 1 ? "response" : "responses";
     cardHtml = `<div class="proof-step-kicker">Defending side · ${proofPlayerClass(defender)}</div>`
-      + `<div class="proof-step-title">Choose a reply</div>`
-      + `<div class="proof-step-copy">The search checked all ${node.responses.length} ${plural} shown here. Choose one to see how the winning side continues.</div>`
+      + `<div class="proof-step-title">Choose a defence</div>`
+      + `<div class="proof-step-copy">The search checked all ${node.responses.length} ${plural}. A best defence is the strongest refutation here: it forces the winning side to take the longest proved continuation.</div>`
       + proofStepTags(entry, node, remaining);
     const worstIndex = model.worstResponseIndex(node);
     const worstBound = model.remaining(node.responses[worstIndex].child);
@@ -634,14 +716,14 @@ function renderProofExplorer() {
         letter: String.fromCharCode(65 + index), action: response.action,
         color: PROOF_CHOICE_COLORS[index % PROOF_CHOICE_COLORS.length],
         copy: isWorst
-          ? (worstTies > 1 ? "Also delays the win for the longest time" : "Delays the win for the longest time")
+          ? (worstTies > 1 ? "Also a best defence · delays the win longest" : "Best defence · delays the win longest")
           : "The winning side can answer this too",
-        bound, badge: isWorst ? "longest defence" : "", badgeClass: "longest",
+        bound, badge: isWorst ? "best defence" : "", badgeClass: "longest",
         onclick: `proofExplorerChooseDefense(${index})`,
       };
     });
     worstButton.disabled = false;
-    worstButton.textContent = "Choose longest defence →";
+    worstButton.textContent = "Choose best defence →";
   } else if (node.kind === "immediate_win") {
     accent = "var(--good)";
     cardHtml = `<div class="proof-step-kicker">Winning side · ${proofPlayerClass(attacker)}</div>`
@@ -686,11 +768,11 @@ function renderShortestSampleLine() {
   const sampleAttackerTurns = sampleLine.entries[total].attackerTurnsPlayed;
   const attainsBound = sampleAttackerTurns === Number(optimization.bestUpperDepth);
   document.getElementById("proof-explorer-summary").textContent =
-    `shortest win ${optimization.bestUpperDepth} turns · ${attainsBound ? "longest defence" : "example"} uses ${sampleAttackerTurns} turns by the winning side · ${total} total turns`;
+    `shortest win ${optimization.bestUpperDepth} turns · ${attainsBound ? "best defence" : "example"} uses ${sampleAttackerTurns} turns by the winning side · ${total} total turns`;
   const note = document.getElementById("proof-optimization-note");
   note.hidden = false;
   note.textContent = attainsBound
-    ? `This line shows the winning side choosing the quickest proved win while the other side always chooses the reply that delays it longest. The win still finishes in ${optimization.bestUpperDepth} turns by the winning side.`
+    ? `This is the best-defence line: the winning side chooses its quickest proved win while the defender always chooses a reply that delays it longest. It shows why no listed defence can extend the win beyond ${optimization.bestUpperDepth} turns.`
     : `This is one example winning line. It finishes after ${sampleAttackerTurns} turns by the winning side because these replies do not delay the win as long as possible. Against any reply, the win takes no more than ${optimization.bestUpperDepth} turns.`;
   document.getElementById("proof-attacker-swatch").style.background = attacker === "P1" ? "#f08a3c" : "#3fb6d9";
   document.getElementById("proof-defender-swatch").style.background = defender === "P1" ? "#f08a3c" : "#3fb6d9";
@@ -713,12 +795,12 @@ function renderShortestSampleLine() {
   if (next) {
     const role = next.player === attacker ? "Attacker" : "Defender";
     card.style.setProperty("--proof-accent", next.player === "P1" ? "var(--p1)" : "var(--p2)");
-    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Longest defence" : "Example winning line"} · ${role === "Attacker" ? "winning side" : "defending side"}</div>`
+    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Best defence line" : "Example winning line"} · ${role === "Attacker" ? "winning side" : "defending side"}</div>`
       + `<div class="proof-step-title">Play turn ${lineIndex + 1}</div>`
       + `<div class="proof-step-copy">${attainsBound ? "The winning side chooses its quickest proved win. The other side chooses the reply that delays it longest." : "This is one example. The defending side may have another reply that delays the win longer."}</div>`;
   } else {
     card.style.setProperty("--proof-accent", "var(--good)");
-    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Longest defence complete" : "Example line complete"}</div>`
+    card.innerHTML = `<div class="proof-step-kicker">${attainsBound ? "Best defence line complete" : "Example line complete"}</div>`
       + `<div class="proof-step-title">Winning line complete</div>`
       + `<div class="proof-step-copy">The final highlighted move completes the win. Return to all replies to try other defensive moves.</div>`;
   }
@@ -990,6 +1072,7 @@ function drawProofBoard() {
     const winLength = Number((proofExplorerState.position.config || {}).win_length || 6);
     body += proofWinningLineSvg(entry.stones, proofExplorerState.attacker, winLength);
   }
+  body += proofSampleLineOverlaySvg();
   body += `</g>`;
   document.getElementById("proof-board").innerHTML = body;
   proofBoardBounds = {minX, minY, maxX, maxY};
@@ -1056,6 +1139,13 @@ function proofZoom(factor, anchorX = null, anchorY = null) {
   updateProofTransform();
 }
 
+function proofSetShowLine(visible) {
+  proofShowLine = Boolean(visible);
+  const toggle = document.getElementById("proof-show-line");
+  if (toggle && toggle.checked !== proofShowLine) toggle.checked = proofShowLine;
+  drawProofBoard();
+}
+
 function syncProofExplorerButtons(node) {
   const available = Boolean(node && node.result && node.result.forcing_certificate);
   for (const id of ["analysis-explore-certificate-btn", "analysis-share-certificate-btn",
@@ -1109,8 +1199,67 @@ if (typeof document !== "undefined") {
   });
 }
 
+// Render the sample winning line as numbered stones on the proof board. Mirrors
+// the analysis board's `forcing-pv*` styling: solid fills in the winner's stone
+// colour for the attacker's cells, outlined in the defender's stone colour for
+// the defender's forced replies. Skipped when the toggle is off or when no
+// sample line was saved with the certificate (e.g. plain PDS-PN runs that
+// produced a cert without a sample line).
+function proofSampleLineOverlaySvg() {
+  if (!proofShowLine) return "";
+  const state = proofExplorerState;
+  if (!state || !state.sampleLine || !state.sampleLine.turns.length) return "";
+  const attacker = state.attacker;
+  const attackerColor = attacker === "P2" ? "#3fb6d9" : "#f08a3c";
+  const defenderColor = attacker === "P2" ? "#f08a3c" : "#3fb6d9";
+  // The numbering mode is read live so flipping "Ply/Round" in the analysis
+  // settings takes effect immediately on the proof board. Under "round" we group
+  // placements by their owning turn (round k = turns 2k-2 + 2k-1) instead of
+  // using a flat placement counter — that respects the actual moves_left per turn
+  // (a turn may legitimately have 1 or 2 cells depending on the starting
+  // moves_remaining) rather than assuming the standard 2-stone opener.
+  const mode = (typeof positionNumbering === "function"
+    && positionNumbering()) || ((typeof localStorage !== "undefined"
+    && localStorage.getItem("hexo_analysis_numbering")) || "ply");
+  const placed = new Set();
+  let cells = "";
+  let depth = 0;
+  let turnIndex = -1;
+  for (const turn of state.sampleLine.turns) {
+    turnIndex++;
+    for (const [q, r] of turn.cells) {
+      const key = `${q},${r}`;
+      if (placed.has(key)) { depth++; continue; }
+      placed.add(key);
+      const point = axialToPixel(q, r);
+      const isAttacker = turn.player === attacker;
+      const cls = isAttacker
+        ? "forcing-pv forcing-pv-attacker"
+        : "forcing-pv forcing-pv-defender";
+      const labelCls = isAttacker
+        ? "forcing-pv-label forcing-pv-label-attacker"
+        : "forcing-pv-label forcing-pv-label-defender";
+      // Round grouping: round 1 = turns 0+1, round 2 = turns 2+3, etc.
+      // Ply grouping: each placement is a unique number across the whole line.
+      const label = mode === "round"
+        ? Math.floor(turnIndex / 2) + 1
+        : depth + 1;
+      const fontSize = Math.round(S * 0.42);
+      if (isAttacker) {
+        cells += `<circle class="${cls}" cx="${point.x}" cy="${point.y}" r="${S * 0.42}" fill="${attackerColor}"/>`;
+      } else {
+        cells += `<circle class="${cls}" cx="${point.x}" cy="${point.y}" r="${S * 0.42}" stroke="${defenderColor}"/>`;
+      }
+      cells += `<text class="${labelCls}" x="${point.x}" y="${point.y + 1}" font-size="${fontSize}" fill="${isAttacker ? "#0d0f0e" : defenderColor}">${label}</text>`;
+      depth++;
+    }
+  }
+  return `<g class="proof-sample-line">${cells}</g>`;
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildProofModel, applyProofAction, normalizeProofPosition, proofAttackerChoices,
+    copyProofText, proofOptimizationDescription, proofSampleLineOverlaySvg, proofSetShowLine,
   };
 }

@@ -1,0 +1,10 @@
+{
+  "default": "pulsatrix-246",
+  "variants": [
+    {
+      "id": "pulsatrix-246",
+      "label": "Pulsatrix-246",
+      "path": "/var/home/tyto/Development/personal/hexo-strix/models/pulsatrix-246.safetensors"
+    }
+  ]
+}

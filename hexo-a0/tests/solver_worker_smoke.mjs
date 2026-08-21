@@ -121,7 +121,7 @@ if (fixturePath) {
 }
 
 let pdspnCertificate = null;
-for (const [requestId, engine] of ["idtt", "dfpn", "pdspn", "pns"].entries()) {
+for (const [requestId, engine] of ["idtt", "pdspn"].entries()) {
   posted.length = 0;
   await self.onmessage({data: {
     type: "solve",
@@ -139,14 +139,9 @@ for (const [requestId, engine] of ["idtt", "dfpn", "pdspn", "pns"].entries()) {
   assert.equal(message.requestId, requestId);
   assert.equal(message.result.kind, "win");
   assert.ok(message.result.elapsedMs >= 0);
-  if (engine === "pns") {
-    assert.equal(message.result.depth, null);
-    assert.deepEqual(message.result.pv, []);
-  } else {
-    assert.ok(message.result.depth >= 1);
-    assert.ok(message.result.pv.length > 0);
-    assert.equal(message.result.pv.length, message.result.pvOwners.length);
-  }
+  assert.ok(message.result.depth >= 1);
+  assert.ok(message.result.pv.length > 0);
+  assert.equal(message.result.pv.length, message.result.pvOwners.length);
   if (engine === "idtt") assert.equal(message.result.nodes, "0");
   else assert.ok(BigInt(message.result.nodes) > 0n);
   if (engine === "pdspn") {
@@ -208,4 +203,4 @@ assert.equal(posted[0].result.excludedThroughDepth, 0);
 assert.ok(posted[0].result.certificate);
 assert.ok(Array.isArray(posted[0].result.turns));
 
-console.log("OK Observatory solver worker: IDTT, DFPN, PDS-PN, shortest PDS-PN, PNS, certificate verifier");
+console.log("OK Observatory solver worker: IDTT, PDS-PN, shortest PDS-PN, certificate verifier");

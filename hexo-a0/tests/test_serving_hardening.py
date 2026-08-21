@@ -282,6 +282,28 @@ def test_admin_token_via_header():
         conn.close()
 
 
+def test_admin_page_has_no_leftover_placeholders_or_mangled_js():
+    # Regression: the admin template's JS used window.__ADMIN_TOKEN__ as a
+    # variable name, which collided with the __ADMIN_TOKEN__ placeholder and
+    # was replaced into `window."<token>" = ...` — a syntax error that killed
+    # the whole script (so the add-model form submitted natively and 404'd).
+    with _server(admin_token="secret-token") as port:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/admin", headers={"X-Admin-Token": "secret-token"})
+        resp = conn.getresponse()
+        html = resp.read().decode()
+        conn.close()
+        assert resp.status == 200
+        for placeholder in ("__SUMMARY__", "__ACTIVE__", "__TABLE__",
+                            "__PREFIX_RAW__", "__ASSET_V__",
+                            "__ADMIN_TOKEN__", "__URL_PREFIX__"):
+            assert placeholder not in html, f"leftover placeholder {placeholder}"
+        # The token must be injected as a JS string, not mangled into a
+        # property access like window."secret-token".
+        assert 'const TOKEN = "secret-token";' in html
+        assert 'window."' not in html
+
+
 def test_rate_limiter_caps_bursts():
     from hexo_a0.serving.app import RateLimiter
     rl = RateLimiter(3)

@@ -97,9 +97,9 @@ pub(crate) struct GuidedOrNode {
 pub(crate) fn reconstruct(
     pos: &Position,
     wide: bool,
-    proven: &FxHashSet<u64>,
+    proven: &mut FxHashSet<u64>,
 ) -> Result<ProofCertificate, String> {
-    reconstruct_at(pos, wide, proven, None)
+    reconstruct_at(pos, wide, proven, None, None)
 }
 
 /// Reconstruct the strategy proved at one exact attacker-turn horizon. Unlike
@@ -109,17 +109,31 @@ pub(crate) fn reconstruct(
 pub(crate) fn reconstruct_bounded(
     pos: &Position,
     wide: bool,
-    proven: &FxHashSet<u64>,
+    proven: &mut FxHashSet<u64>,
     remaining: u8,
 ) -> Result<ProofCertificate, String> {
-    reconstruct_at(pos, wide, proven, Some(remaining))
+    reconstruct_at(pos, wide, proven, Some(remaining), None)
+}
+
+/// Guided variant: nodes the search closed via certificate win-depth hints have
+/// no children in the proven set, so the reconstruction consults `hints` to
+/// close their children at the probe's horizon (monotone positive facts only).
+pub(crate) fn reconstruct_bounded_guided(
+    pos: &Position,
+    wide: bool,
+    proven: &mut FxHashSet<u64>,
+    remaining: u8,
+    hints: &WinDepthHints,
+) -> Result<ProofCertificate, String> {
+    reconstruct_at(pos, wide, proven, Some(remaining), Some(hints))
 }
 
 fn reconstruct_at(
     pos: &Position,
     wide: bool,
-    proven: &FxHashSet<u64>,
+    proven: &mut FxHashSet<u64>,
     remaining: Option<u8>,
+    hints: Option<&WinDepthHints>,
 ) -> Result<ProofCertificate, String> {
     let k = KernelCtx::new_wide(
         &pos.stones,
@@ -139,6 +153,7 @@ fn reconstruct_at(
     let mut builder = ProofBuilder {
         k,
         proven,
+        hints,
         memo: FxHashMap::default(),
         nodes: Vec::new(),
         depths: Vec::new(),
@@ -154,13 +169,26 @@ fn reconstruct_at(
 
 struct ProofBuilder<'a> {
     k: KernelCtx,
-    proven: &'a FxHashSet<u64>,
+    proven: &'a mut FxHashSet<u64>,
+    hints: Option<&'a WinDepthHints>,
     memo: FxHashMap<u64, u32>,
     nodes: Vec<ProofNode>,
     depths: Vec<u32>,
 }
 
 impl ProofBuilder<'_> {
+    /// True when the certificate's win-depth hints prove the node (whose position
+    /// the board currently reflects) at the given remaining-turn horizon. Only
+    /// positive facts are consulted — a miss means "search it", never "close it".
+    #[inline]
+    fn hint_proven(&self, node: Node, remaining: Option<u8>) -> bool {
+        let (Some(hints), Some(turns)) = (self.hints, remaining) else {
+            return false;
+        };
+        let (is_or, placements) = node.tag();
+        hints.proves_within(self.k.hash(), is_or, placements, turns)
+    }
+
     fn emit(&mut self, node: Node, remaining: Option<u8>) -> Result<u32, String> {
         let key = node_key_at(self.k.hash(), node, remaining);
         if let Some(&id) = self.memo.get(&key) {
@@ -197,10 +225,14 @@ impl ProofBuilder<'_> {
                         self.k.place_attacker(action);
                         let child_node = Node::And;
                         let child_key = node_key_at(self.k.hash(), child_node, child_remaining);
-                        let built = self
-                            .proven
-                            .contains(&child_key)
-                            .then(|| self.emit(child_node, child_remaining));
+                        let built = if self.proven.contains(&child_key) {
+                            Some(self.emit(child_node, child_remaining))
+                        } else if self.hint_proven(child_node, child_remaining) {
+                            self.proven.insert(child_key);
+                            Some(self.emit(child_node, child_remaining))
+                        } else {
+                            None
+                        };
                         self.k.unplace(action);
                         if let Some(built) = built {
                             let child = built?;
@@ -259,6 +291,9 @@ impl ProofBuilder<'_> {
                         let child_key = node_key_at(self.k.hash(), child_node, remaining);
                         let built = if self.proven.contains(&child_key) {
                             self.emit(child_node, remaining)
+                        } else if self.hint_proven(child_node, remaining) {
+                            self.proven.insert(child_key);
+                            self.emit(child_node, remaining)
                         } else {
                             Err(format!("missing proved defense child {child_key:016x}"))
                         };
@@ -292,6 +327,30 @@ impl ProofBuilder<'_> {
 pub(crate) fn worst_case_pv(
     pos: &Position,
     certificate: &ProofCertificate,
+) -> Result<Vec<Coord>, String> {
+    replay_pv(pos, certificate, true)
+}
+
+/// Replay the certificate's shortest line: the primary (shortest retained)
+/// attack at every OR node and a minimum-delay reply at every AND node. The
+/// result is a concrete witness that wins in the fewest attacker turns the
+/// certificate can exhibit — the natural "example winning line" for the UI.
+/// The certificate's worst-case bound is unchanged; this only picks the
+/// defender's fastest-losing replies instead of the longest-delay ones.
+pub(crate) fn shortest_pv(
+    pos: &Position,
+    certificate: &ProofCertificate,
+) -> Result<Vec<Coord>, String> {
+    replay_pv(pos, certificate, false)
+}
+
+/// Shared DAG replay for [`worst_case_pv`] / [`shortest_pv`]. `worst_case`
+/// selects the maximum-delay defender reply at AND nodes (the certificate's
+/// certified bound); otherwise the minimum-delay reply (the shortest line).
+fn replay_pv(
+    pos: &Position,
+    certificate: &ProofCertificate,
+    worst_case: bool,
 ) -> Result<Vec<Coord>, String> {
     verify(pos, certificate)?;
 
@@ -333,7 +392,7 @@ pub(crate) fn worst_case_pv(
         pos.config.placement_radius,
         certificate.width == "wide",
     )
-    .ok_or("could not build the worst-case replay kernel")?;
+    .ok_or("could not build the replay kernel")?;
     let mut id = certificate.root;
     let mut pv = Vec::new();
     loop {
@@ -355,10 +414,16 @@ pub(crate) fn worst_case_pv(
                 id = *child;
             }
             ProofNode::DefenderReplies { responses } => {
-                let response = responses
-                    .iter()
-                    .max_by_key(|response| depths.get(&response.child).copied().unwrap_or(0))
-                    .ok_or("verified defender node had no responses")?;
+                let response = if worst_case {
+                    responses
+                        .iter()
+                        .max_by_key(|response| depths.get(&response.child).copied().unwrap_or(0))
+                } else {
+                    responses
+                        .iter()
+                        .min_by_key(|response| depths.get(&response.child).copied().unwrap_or(0))
+                }
+                .ok_or("verified defender node had no responses")?;
                 let cells = CellSet2::from_cells(&response.action);
                 k.place_defender(&cells);
                 pv.extend_from_slice(cells.cells());

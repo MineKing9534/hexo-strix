@@ -51,6 +51,7 @@ def _load_template(name: str) -> str:
 
 _STATIC_TYPES = {
     ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
     ".woff2": "font/woff2",
     ".woff": "font/woff",
@@ -73,7 +74,43 @@ def _asset_version() -> str:
     return format(latest & 0xFFFFFFFF, "x")
 
 
+def _js(s) -> str:
+    """JSON-encode a value for safe interpolation inside a <script> context.
+
+    ``json.dumps`` escapes quotes and backslashes but not ``<``; escape
+    ``<``/``>`` so a crafted value can't break out of the script
+    (defense-in-depth; values are operator-controlled).
+    """
+    return json.dumps(s).replace("<", "\\u003c").replace(">", "\\u003e")
+
+
 MAX_BODY_BYTES = 262144  # 256 KiB — public request body cap
+MAX_UPLOAD_BYTES = 512 * 1024 * 1024  # 512 MiB — admin model-upload cap
+
+
+def _parse_multipart(content_type: str, body: bytes) -> dict[str, tuple[str | None, bytes]]:
+    """Parse a multipart/form-data body into {field: (filename, content)}.
+
+    Uses the stdlib email parser so boundary/encoding edge cases are handled
+    correctly. Returns an empty dict for non-multipart content types.
+    """
+    from email.parser import BytesParser
+    from email.policy import default
+
+    if not content_type.lower().startswith("multipart/form-data"):
+        return {}
+    msg = BytesParser(policy=default).parsebytes(
+        b"Content-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + body
+    )
+    result: dict[str, tuple[str | None, bytes]] = {}
+    if not msg.is_multipart():
+        return result
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        result[name] = (part.get_filename(), part.get_payload(decode=True) or b"")
+    return result
 ELO_MIN, ELO_MAX = 0, 3500
 COORD_MAX = 1000  # reject coordinates beyond the playable board at the trust boundary
 MAX_CONCURRENT = 32        # cap concurrent in-flight requests (slowloris / flood backstop)
@@ -187,8 +224,49 @@ def _derive_model_label(ckpt_path: str, ckpt: dict) -> str:
     return f"{run_name}@{p.stem}"
 
 
+def _model_variant_id(label: str) -> str:
+    """Stable URL/request identifier derived from an operator-facing label."""
+    value = re.sub(r"[^a-z0-9]+", "-", label.strip().lower()).strip("-")
+    if not value:
+        raise SystemExit("--model-variant labels must contain a letter or number")
+    return value[:48].rstrip("-")
+
+
+def _browser_load_error(name, exc):
+    """Clear 400 message for a checkpoint the browser engine can't load."""
+    return (
+        f"checkpoint {name!r} is not loadable for browser inference: {exc}. "
+        "Only standard HeXONet checkpoints (single GINE/GATv2 conv per layer "
+        "with a value head) can be uploaded; KLENT Q-head / axis-relational "
+        "checkpoints are not supported by the browser engine."
+    )
+
+
+def _parse_model_variants(specs) -> list[tuple[str, str, Path]]:
+    """Parse repeatable ``LABEL=PATH`` model variants with collision checks."""
+    result, seen = [], {"default"}
+    for raw in specs or []:
+        if not isinstance(raw, str) or "=" not in raw:
+            raise SystemExit("--model-variant must use LABEL=PATH")
+        label, path_raw = (part.strip() for part in raw.split("=", 1))
+        if not label or not path_raw:
+            raise SystemExit("--model-variant must use a non-empty LABEL=PATH")
+        model_id = _model_variant_id(label)
+        if model_id in seen:
+            raise SystemExit(f"duplicate model variant id {model_id!r}")
+        path = Path(path_raw)
+        if not path.is_file():
+            raise SystemExit(f"model variant not found: {path}")
+        if path.suffix != ".safetensors":
+            raise SystemExit(
+                f"model variant {label!r} must be a .safetensors export for browser inference")
+        seen.add(model_id)
+        result.append((model_id, label, path))
+    return result
+
+
 def _parse_difficulty_sims(spec: str) -> dict[str, int]:
-    """Parse '16,32,64,128' into a {label: sims} dict in canonical order."""
+    """Parse '0,64,128,512' into a {label: sims} dict in canonical order."""
     parts = [s.strip() for s in spec.split(",") if s.strip()]
     if not parts:
         raise SystemExit("--difficulty-sims must list at least one sim count")
@@ -739,6 +817,202 @@ def _fmt_duration(created_at: str, completed_at: str) -> str:
         return "?"
 
 
+class ModelManager:
+    """Runtime model catalogue shared by play (``GameManager``) and analysis.
+
+    Owns the mutable registry of deployed models and the default selection.
+    Runtime changes (add / remove / re-default) are persisted to a JSON file so
+    they survive restarts. CLI-configured variants are re-applied on startup
+    and are not persisted, so removing one is temporary until its flag is
+    dropped; runtime-added variants are persisted and restored on restart.
+    """
+
+    def __init__(self, mgr, analysis_contexts, build_variant, persist_path=None,
+                 models_dir=None):
+        self._mgr = mgr
+        self._analysis_contexts = analysis_contexts
+        self._build_variant = build_variant  # (model_id, label, path) -> item dict
+        self._persist_path = persist_path
+        self._models_dir = models_dir  # where uploaded models are stored (or None)
+        self._lock = threading.Lock()
+        # id -> {"label", "path"} for runtime-added variants (persisted).
+        self._runtime_variants = {}
+
+    # -- persistence -----------------------------------------------------
+    def restore(self):
+        """Re-apply persisted runtime variants + default selection on startup."""
+        if not self._persist_path:
+            return
+        try:
+            with open(self._persist_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.exception("model catalogue: ignoring unreadable %s", self._persist_path)
+            return
+        if not isinstance(data, dict):
+            return
+        # Add variants first so a persisted default selection can point at one.
+        for entry in data.get("variants", []):
+            if not isinstance(entry, dict):
+                continue
+            model_id, label, path = entry.get("id"), entry.get("label"), entry.get("path")
+            if not all(isinstance(x, str) and x for x in (model_id, label, path)):
+                continue
+            if model_id in self._mgr.model_variants:
+                continue  # already configured (CLI) or duplicate
+            try:
+                self._add(model_id, label, path, persist=False)
+            except Exception:
+                logger.exception("model catalogue: skipping unloadable variant %r", model_id)
+        default = data.get("default")
+        if isinstance(default, str) and default in self._mgr.model_variants:
+            self._mgr.default_model_id = default
+
+    def _persist(self):
+        if not self._persist_path:
+            return
+        data = {
+            "default": self._mgr.default_model_id,
+            "variants": [
+                {"id": mid, "label": v["label"], "path": v["path"]}
+                for mid, v in self._runtime_variants.items()
+            ],
+        }
+        tmp = self._persist_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            os.replace(tmp, self._persist_path)
+        except Exception:
+            logger.exception("model catalogue: failed to persist %s", self._persist_path)
+
+    # -- mutations -------------------------------------------------------
+    def _add(self, model_id, label, path, persist=True):
+        item = self._build_variant(model_id, label, path)
+        with self._lock:
+            self._mgr.model_variants[model_id] = {
+                "checkpoint_path": item["path"],
+                "model_label": item["label"],
+                "model_step": item["step"],
+                "bot_turn_fn": item["bot_turn_fn"],
+            }
+            self._analysis_contexts[model_id] = item["analyze_ctx"]
+        if persist:
+            self._runtime_variants[model_id] = {"label": label, "path": item["path"]}
+            self._persist()
+        return item
+
+    def add_variant(self, label, path):
+        model_id = _model_variant_id(label)
+        if model_id in self._mgr.model_variants:
+            raise BadRequestError(f"model id {model_id!r} already exists")
+        path = Path(path)
+        if not path.is_file():
+            raise BadRequestError(f"model file not found: {path}")
+        if path.suffix != ".safetensors":
+            raise BadRequestError("model must be a .safetensors export for browser inference")
+        try:
+            return self._add(model_id, label, str(path.resolve()))
+        except ValueError as e:
+            raise BadRequestError(_browser_load_error(path.name, e)) from e
+
+    def add_upload(self, label, filename, data):
+        """Register an uploaded model file (bytes from the admin panel).
+
+        Accepts a ``.safetensors`` export directly, or a ``.pt`` training
+        checkpoint which is converted to ``hexo-safetensors-v1`` via
+        ``export_checkpoint`` (the single format producer) before registration.
+        The resulting file is stored under ``models_dir`` as ``<id>.safetensors``
+        so it is served to the browser for client-side inference.
+        """
+        model_id = _model_variant_id(label)
+        if model_id in self._mgr.model_variants:
+            raise BadRequestError(f"model id {model_id!r} already exists")
+        if not self._models_dir:
+            raise BadRequestError("model uploads are disabled (no models directory)")
+        suffix = Path(filename).suffix.lower()
+        if suffix not in (".pt", ".safetensors"):
+            raise BadRequestError("upload must be a .pt checkpoint or .safetensors export")
+        if not data:
+            raise BadRequestError("empty upload")
+        if suffix == ".pt":
+            import importlib.util
+            if importlib.util.find_spec("torch") is None:
+                raise BadRequestError(
+                    "this server cannot convert .pt checkpoints (torch is not installed); "
+                    "upload a .safetensors export instead"
+                )
+
+        models_dir = Path(self._models_dir)
+        models_dir.mkdir(parents=True, exist_ok=True)
+        final_path = models_dir / f"{model_id}.safetensors"
+        if final_path.exists():
+            raise BadRequestError(f"a model file already exists at {final_path}")
+
+        try:
+            if suffix == ".safetensors":
+                final_path.write_bytes(data)
+            else:
+                from hexo_a0.export import export_checkpoint
+                tmp_pt = models_dir / f"{model_id}.uploading.pt"
+                tmp_pt.write_bytes(data)
+                try:
+                    export_checkpoint(tmp_pt, final_path)
+                finally:
+                    tmp_pt.unlink(missing_ok=True)
+        except Exception as e:
+            final_path.unlink(missing_ok=True)
+            raise BadRequestError(f"could not convert uploaded checkpoint: {e}") from e
+
+        try:
+            return self._add(model_id, label, str(final_path))
+        except ValueError as e:
+            final_path.unlink(missing_ok=True)
+            raise BadRequestError(_browser_load_error(filename, e)) from e
+        except Exception:
+            final_path.unlink(missing_ok=True)
+            raise
+
+    def remove_variant(self, model_id):
+        with self._lock:
+            if model_id not in self._mgr.model_variants:
+                raise BadRequestError(f"unknown model {model_id!r}")
+            if model_id == "default":
+                raise BadRequestError("the default model cannot be removed")
+            if model_id == self._mgr.default_model_id:
+                raise BadRequestError(
+                    "cannot remove the current default model; set another default first")
+            del self._mgr.model_variants[model_id]
+            self._analysis_contexts.pop(model_id, None)
+        self._runtime_variants.pop(model_id, None)
+        self._persist()
+
+    def set_default(self, model_id):
+        with self._lock:
+            if model_id not in self._mgr.model_variants:
+                raise BadRequestError(f"unknown model {model_id!r}")
+            self._mgr.default_model_id = model_id
+        self._persist()
+
+    def list_models(self):
+        with self._lock:
+            items = list(self._mgr.model_variants.items())
+        result = []
+        for model_id, variant in items:
+            path = Path(variant["checkpoint_path"])
+            result.append({
+                "id": model_id,
+                "label": variant["model_label"],
+                "step": variant.get("model_step"),
+                "path": variant["checkpoint_path"],
+                "local": path.suffix == ".safetensors",
+                "is_default": model_id == self._mgr.default_model_id,
+            })
+        return result
+
+
 _ADMIN_HTML = _load_template("admin.html")
 
 
@@ -767,7 +1041,7 @@ def _render_admin(mgr: GameManager) -> str:
                 f'</tr>'
             )
         active_html = (
-            f'<h2 style="color:#00d4ff;margin:8px 0">Active games ({len(active)})</h2>'
+            f'<h2>Active games <span class="count">{len(active)}</span></h2>'
             "<table><thead><tr>"
             "<th>id</th><th>Started (UTC)</th><th>Name</th><th>Human side</th>"
             "<th>To move</th><th>Remaining</th><th>Moves so far</th>"
@@ -780,19 +1054,24 @@ def _render_admin(mgr: GameManager) -> str:
 
     recorder = mgr.recorder
     if recorder is None:
-        return _ADMIN_HTML.format(
-            summary="(no recorder configured)",
-            active=active_html,
-            table='<div class="empty">No database.</div>',
-        )
+        return (_ADMIN_HTML
+                .replace("__SUMMARY__", '<div class="empty">No database configured.</div>')
+                .replace("__ACTIVE__", active_html)
+                .replace("__TABLE__", '<div class="empty">No database.</div>'))
     stats = recorder.summary()
     summary = (
-        f"<span><b>{stats['total']}</b> completed</span>"
-        f"<span>Active: <b>{len(active)}</b></span>"
-        f"<span>Human wins: <b>{stats['human_wins']}</b></span>"
-        f"<span>Bot wins: <b>{stats['bot_wins']}</b></span>"
-        f"<span>Draws: <b>{stats['draws']}</b></span>"
-        f"<span>Resigns: <b>{stats['resigns']}</b></span>"
+        f'<div class="stat-card"><span class="stat-value">{stats["total"]}</span>'
+        f'<span class="stat-label">completed</span></div>'
+        f'<div class="stat-card"><span class="stat-value">{len(active)}</span>'
+        f'<span class="stat-label">active</span></div>'
+        f'<div class="stat-card"><span class="stat-value">{stats["human_wins"]}</span>'
+        f'<span class="stat-label">human wins</span></div>'
+        f'<div class="stat-card"><span class="stat-value">{stats["bot_wins"]}</span>'
+        f'<span class="stat-label">bot wins</span></div>'
+        f'<div class="stat-card"><span class="stat-value">{stats["draws"]}</span>'
+        f'<span class="stat-label">draws</span></div>'
+        f'<div class="stat-card"><span class="stat-value">{stats["resigns"]}</span>'
+        f'<span class="stat-label">resigns</span></div>'
     )
     games = recorder.recent_games(limit=200)
     if not games:
@@ -856,14 +1135,19 @@ def _render_admin(mgr: GameManager) -> str:
             + "".join(rows)
             + "</tbody></table>"
         )
-    return _ADMIN_HTML.format(summary=summary, active=active_html, table=table)
+    return (_ADMIN_HTML
+            .replace("__SUMMARY__", summary)
+            .replace("__ACTIVE__", active_html)
+            .replace("__TABLE__", table))
 
 
 HTML = _load_template("index.html")
 
 
 def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str = "",
-                       analyze_ctx: AnalyzeContext | None = None, max_body_bytes: int = MAX_BODY_BYTES,
+                       analyze_ctx: AnalyzeContext | dict[str, AnalyzeContext] | None = None,
+                       model_manager: ModelManager | None = None,
+                       max_body_bytes: int = MAX_BODY_BYTES,
                        max_concurrent: int = MAX_CONCURRENT,
                        analyze_limiter: RateLimiter | None = None,
                        new_game_limiter: RateLimiter | None = None,
@@ -873,6 +1157,32 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
     concurrency = threading.BoundedSemaphore(max_concurrent)
     # Caps concurrently-queued full-game analysis jobs (queue-slot exhaustion).
     analyze_game_semaphore = threading.Semaphore(ANALYZE_GAME_MAX_INFLIGHT)
+    analysis_contexts = analyze_ctx if isinstance(analyze_ctx, dict) else (
+        {mgr.default_model_id: analyze_ctx} if analyze_ctx is not None else {})
+
+    def _analysis_context(body: dict) -> AnalyzeContext | None:
+        model_id = body.get("model_id", mgr.default_model_id)
+        if not isinstance(model_id, str) or model_id not in analysis_contexts:
+            raise BadRequestError(f"unknown model {model_id!r}")
+        return analysis_contexts[model_id]
+
+    def _public_models() -> list[dict]:
+        result = []
+        # Snapshot: the admin API can mutate model_variants concurrently.
+        for model_id, variant in list(mgr.model_variants.items()):
+            path = Path(variant["checkpoint_path"])
+            try:
+                version = path.stat().st_mtime_ns
+            except OSError:
+                version = _asset_version()
+            result.append({
+                "id": model_id,
+                "label": variant["model_label"],
+                "step": variant.get("model_step"),
+                "url": f"{url_prefix}/models/{model_id}.safetensors?v={version}",
+                "local": path.suffix == ".safetensors",
+            })
+        return result
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 60
@@ -890,6 +1200,16 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
 
         def _client_key(self) -> str:
             return self.client_address[0] if self.client_address else "?"
+
+        def _admin_authorized(self) -> bool:
+            """True if the request carries the admin token (header or ?token=)."""
+            if not admin_token:
+                return False
+            token = self.headers.get("X-Admin-Token", "")
+            if not token:
+                qs = parse_qs(urlparse(self.path).query)
+                token = qs.get("token", [""])[0]
+            return secrets.compare_digest(token, admin_token)
 
         def _begin_request(self) -> bool:
             """Acquire a concurrency slot (non-blocking). Returns False if at cap."""
@@ -979,9 +1299,14 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
             self.end_headers()
             self.wfile.write(data)
 
-        def _send_model_weights(self):
-            """Serve the exact deployed safetensors to the browser inference worker."""
-            target = Path(mgr.checkpoint_path)
+        def _send_model_weights(self, model_id: str | None = None):
+            """Serve one exact deployed safetensors model to browser inference."""
+            selected = model_id or mgr.default_model_id
+            variant = mgr.model_variants.get(selected)
+            if variant is None:
+                self.send_error(404)
+                return
+            target = Path(variant["checkpoint_path"])
             if target.suffix != ".safetensors" or not target.is_file():
                 self.send_error(404)
                 return
@@ -1049,6 +1374,27 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                 raise BadRequestError("request body must be a JSON object")
             return obj
 
+        def _read_upload(self) -> tuple[str, bytes]:
+            """Read a raw (multipart) upload body, capped at MAX_UPLOAD_BYTES.
+
+            Returns ``(content_type, body)``. Mirrors _read_json's smuggling
+            defenses (close connection, reject chunked/negative lengths).
+            """
+            self.close_connection = True
+            if self.headers.get("Transfer-Encoding"):
+                raise BadRequestError("Transfer-Encoding not supported")
+            raw = self.headers.get("Content-Length")
+            try:
+                length = int(raw) if raw is not None else 0
+            except (TypeError, ValueError):
+                raise BadRequestError("malformed Content-Length")
+            if length < 0:
+                raise BadRequestError("negative Content-Length")
+            if length > MAX_UPLOAD_BYTES:
+                raise PayloadTooLargeError(f"upload too large: {length} bytes")
+            content_type = self.headers.get("Content-Type") or ""
+            return content_type, self.rfile.read(length)
+
         def _route_path(self):
             parsed = urlparse(self.path)
             path = parsed.path
@@ -1081,11 +1427,6 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
             if path in ("/", "", "/analysis") or proof_route:
                 diffs = mgr.difficulty_sims or {}
                 ordered = {k: diffs[k] for k in DIFFICULTY_ORDER if k in diffs}
-                # json.dumps escapes " and \ but not <, and these land inside a
-                # <script>; escape < so a crafted url_prefix can't break out of
-                # the script context (defense-in-depth; values are operator-controlled).
-                def _js(s):
-                    return json.dumps(s).replace("<", "\\u003c").replace(">", "\\u003e")
                 # Absolute origin for the OG/Twitter social-card tags (scrapers need
                 # absolute image/URL). Built from the request's Host + X-Forwarded-Proto
                 # (Cloudflare/proxy sets the latter), so it works for any domain; empty
@@ -1097,6 +1438,8 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                             .replace('"__URL_PREFIX__"', _js(url_prefix))
                             .replace('"__DIFFICULTY_SIMS__"', _js(ordered))
                             .replace('"__DEFAULT_DIFFICULTY__"', _js(mgr.default_difficulty))
+                            .replace('__MODELS__', _js(_public_models()))
+                            .replace('"__DEFAULT_MODEL_ID__"', _js(mgr.default_model_id))
                             .replace('__WIN_LENGTH__', str(int(mgr.game_kwargs["win_length"])))
                             .replace('__PLACEMENT_RADIUS__',
                                      str(int(mgr.game_kwargs["placement_radius"])))
@@ -1124,26 +1467,37 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                 self._send_static(path[len("/static/"):])
             elif path == "/model.safetensors":
                 self._send_model_weights()
+            elif re.fullmatch(r"/models/[a-z0-9][a-z0-9-]{0,47}\.safetensors", path):
+                self._send_model_weights(path[len("/models/"):-len(".safetensors")])
             elif path == "/stats":
-                self._send_json(200, mgr.recorder.bot_brag(mgr.model_label, mgr.model_step)
-                                if mgr.recorder else {"model_label": mgr.model_label})
+                requested = parse_qs(query).get("model", [mgr.default_model_id])[0]
+                variant = mgr.model_variants.get(requested)
+                if variant is None:
+                    raise BadRequestError(f"unknown model {requested!r}")
+                label, step = variant["model_label"], variant.get("model_step")
+                self._send_json(200, mgr.recorder.bot_brag(label, step)
+                                if mgr.recorder else {"model_label": label, "step": step})
             elif path == "/admin":
-                if not admin_token:
-                    self.send_error(404)
-                    return
-                # Accept the token via X-Admin-Token header (preferred — keeps it
-                # out of proxy access logs / browser history) or ?token= (back-compat).
-                token = self.headers.get("X-Admin-Token", "")
-                if not token:
-                    qs = parse_qs(query)
-                    token = qs.get("token", [""])[0]
-                if not secrets.compare_digest(token, admin_token):
+                if not self._admin_authorized():
                     self.send_error(404)
                     return
                 admin_html = (_render_admin(mgr)
                               .replace('__PREFIX_RAW__', html.escape(url_prefix, quote=True))
-                              .replace('__ASSET_V__', _asset_version()))
+                              .replace('__ASSET_V__', _asset_version())
+                              .replace('__ADMIN_TOKEN__', _js(admin_token))
+                              .replace('__URL_PREFIX__', _js(url_prefix)))
                 self._send_html(admin_html)
+            elif path == "/admin/models":
+                if not self._admin_authorized():
+                    self.send_error(404)
+                    return
+                if model_manager is None:
+                    self._send_json(503, {"error": "model management unavailable"})
+                    return
+                self._send_json(200, {
+                    "default": mgr.default_model_id,
+                    "models": model_manager.list_models(),
+                })
             else:
                 self.send_error(404)
 
@@ -1189,6 +1543,7 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                         difficulty=body.get("difficulty"),
                         self_reported_elo=elo_val,
                         local_bot=body.get("local_bot") is True,
+                        model_id=body.get("model_id"),
                     )
                     self._send_json(200, {
                         "game_id": rec.game_id,
@@ -1255,31 +1610,34 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                         self._send_json(503, {"error": "rate limit: too many analysis requests"})
                         return
                     body = self._read_json()
-                    if analyze_ctx is None:
+                    ctx = _analysis_context(body) if analysis_contexts else None
+                    if ctx is None:
                         self._send_json(503, {"error": "analysis disabled"})
                         return
-                    status, resp = handle_analyze(body, analyze_ctx)
+                    status, resp = handle_analyze(body, ctx)
                     self._send_json(status, resp)
                 elif path == "/analyze_trajectory":
                     if analyze_limiter is not None and not analyze_limiter.allow(self._client_key()):
                         self._send_json(503, {"error": "rate limit: too many analysis requests"})
                         return
                     body = self._read_json()
-                    if analyze_ctx is None:
+                    ctx = _analysis_context(body) if analysis_contexts else None
+                    if ctx is None:
                         self._send_json(503, {"error": "analysis disabled"})
                         return
-                    status, resp = handle_trajectory(body, analyze_ctx)
+                    status, resp = handle_trajectory(body, ctx)
                     self._send_json(status, resp)
                 elif path == "/analyze_game":
                     if analyze_game_limiter is not None and not analyze_game_limiter.allow(self._client_key()):
                         self._send_json(503, {"error": "rate limit: too many full-game analyses"})
                         return
                     body = self._read_json()
-                    if analyze_ctx is None:
+                    ctx = _analysis_context(body) if analysis_contexts else None
+                    if ctx is None:
                         self._send_json(503, {"error": "analysis disabled"})
                         return
                     # Streams its own SSE response (status/headers/body).
-                    handle_analyze_game_sse(self, analyze_ctx, body, analyze_game_semaphore)
+                    handle_analyze_game_sse(self, ctx, body, analyze_game_semaphore)
                 elif path == "/game_htttx":
                     body = self._read_json()
                     try:
@@ -1291,6 +1649,79 @@ def make_handler_class(mgr: GameManager, admin_token: str = "", url_prefix: str 
                     body = self._read_json()
                     status, resp = handle_convert_hds(body)
                     self._send_json(status, resp)
+                elif path == "/admin/models":
+                    if not self._admin_authorized():
+                        self.send_error(404)
+                        return
+                    if model_manager is None:
+                        self._send_json(503, {"error": "model management unavailable"})
+                        return
+                    body = self._read_json()
+                    label = body.get("label")
+                    path_raw = body.get("path")
+                    if not isinstance(label, str) or not label.strip():
+                        raise BadRequestError("missing model label")
+                    if not isinstance(path_raw, str) or not path_raw.strip():
+                        raise BadRequestError("missing model path")
+                    model_manager.add_variant(label.strip(), path_raw.strip())
+                    self._send_json(200, {
+                        "default": mgr.default_model_id,
+                        "models": model_manager.list_models(),
+                    })
+                elif path == "/admin/models/remove":
+                    if not self._admin_authorized():
+                        self.send_error(404)
+                        return
+                    if model_manager is None:
+                        self._send_json(503, {"error": "model management unavailable"})
+                        return
+                    body = self._read_json()
+                    model_id = body.get("id")
+                    if not isinstance(model_id, str) or not model_id:
+                        raise BadRequestError("missing model id")
+                    model_manager.remove_variant(model_id)
+                    self._send_json(200, {
+                        "default": mgr.default_model_id,
+                        "models": model_manager.list_models(),
+                    })
+                elif path == "/admin/models/default":
+                    if not self._admin_authorized():
+                        self.send_error(404)
+                        return
+                    if model_manager is None:
+                        self._send_json(503, {"error": "model management unavailable"})
+                        return
+                    body = self._read_json()
+                    model_id = body.get("id")
+                    if not isinstance(model_id, str) or not model_id:
+                        raise BadRequestError("missing model id")
+                    model_manager.set_default(model_id)
+                    self._send_json(200, {
+                        "default": mgr.default_model_id,
+                        "models": model_manager.list_models(),
+                    })
+                elif path == "/admin/models/upload":
+                    if not self._admin_authorized():
+                        self.send_error(404)
+                        return
+                    if model_manager is None:
+                        self._send_json(503, {"error": "model management unavailable"})
+                        return
+                    content_type, body = self._read_upload()
+                    fields = _parse_multipart(content_type, body)
+                    label_field = fields.get("label")
+                    file_field = fields.get("file")
+                    label = label_field[1].decode("utf-8", "replace").strip() if label_field else ""
+                    filename, data = file_field if file_field else (None, b"")
+                    if not label:
+                        raise BadRequestError("missing model label")
+                    if not filename or not data:
+                        raise BadRequestError("missing model file")
+                    model_manager.add_upload(label, filename, data)
+                    self._send_json(200, {
+                        "default": mgr.default_model_id,
+                        "models": model_manager.list_models(),
+                    })
                 else:
                     self.send_error(404)
             except GameError as e:
@@ -1354,15 +1785,30 @@ def run(cfg, analyze_ctx: AnalyzeContext | None = None):
 
 def _serve(cfg, analyze_ctx):
     """Server body, run under run()'s flock try/finally."""
-    if str(cfg.checkpoint).endswith(".safetensors"):
-        model, mc, ckpt = load_native_model(cfg.checkpoint)
-    else:
-        model, mc, ckpt = load_model(cfg.checkpoint, "cpu",
-                                     model_config_dict=_model_config_fallback(cfg))
+    def load_runtime(path):
+        if str(path).endswith(".safetensors"):
+            return load_native_model(path)
+        return load_model(path, "cpu", model_config_dict=_model_config_fallback(cfg))
+
+    model, mc, ckpt = load_runtime(cfg.checkpoint)
+    default_label = cfg.model_label or _derive_model_label(cfg.checkpoint, ckpt)
+    loaded_variants = [{
+        "id": "default", "label": default_label,
+        "path": str(Path(cfg.checkpoint).resolve()), "model": model,
+        "model_config": mc, "checkpoint": ckpt,
+    }]
+    for model_id, label, path in _parse_model_variants(
+            getattr(cfg, "model_variant", None)):
+        variant_model, variant_mc, variant_ckpt = load_runtime(path)
+        loaded_variants.append({
+            "id": model_id, "label": label, "path": str(path.resolve()),
+            "model": variant_model, "model_config": variant_mc,
+            "checkpoint": variant_ckpt,
+        })
 
     # CPU inference: N slots let analysis run beside the bot instead of 503ing.
     inference_workers = max(1, getattr(cfg, "inference_workers", 2))
-    if getattr(model, "_hexo_native", None) is None:
+    if any(getattr(item["model"], "_hexo_native", None) is None for item in loaded_variants):
         # Cap torch's intra-op threads so N concurrent forward passes don't
         # oversubscribe the cores (torch defaults to using all of them per op).
         import torch
@@ -1376,7 +1822,7 @@ def _serve(cfg, analyze_ctx):
             f"configured tiers {list(difficulty_sims)}"
         )
 
-    model_label = cfg.model_label or _derive_model_label(cfg.checkpoint, ckpt)
+    model_label = default_label
     model_step = _derive_step(cfg.checkpoint, ckpt)
 
     game_kwargs = dict(
@@ -1384,18 +1830,25 @@ def _serve(cfg, analyze_ctx):
         placement_radius=cfg.placement_radius,
         max_moves=cfg.max_moves,
     )
-    bot_fn = make_bot_turn_fn(
-        model=model, model_config=mc,
-        mcts_sims=cfg.mcts_sims, m_actions=cfg.m_actions,
-        difficulty_sims=difficulty_sims,
-        # No CLI knob for this (yet): every tier's forcing depth comes from
-        # game.py's measured DEFAULT_DIFFICULTY_FORCING_DEPTH map unless a
-        # caller-built cfg opts into a custom one.
-        difficulty_forcing_depth=getattr(cfg, "difficulty_forcing_depth", None),
-        guard=guard,
-        game_kwargs=game_kwargs,
-        live_forcing=getattr(cfg, "live_forcing", True),
-    )
+    model_variants = OrderedDict()
+    for item in loaded_variants:
+        step = _derive_step(item["path"], item["checkpoint"])
+        item["step"] = step
+        item["bot_turn_fn"] = make_bot_turn_fn(
+            model=item["model"], model_config=item["model_config"],
+            mcts_sims=cfg.mcts_sims, m_actions=cfg.m_actions,
+            difficulty_sims=difficulty_sims,
+            difficulty_forcing_depth=getattr(cfg, "difficulty_forcing_depth", None),
+            guard=guard, game_kwargs=game_kwargs,
+            live_forcing=getattr(cfg, "live_forcing", True),
+        )
+        model_variants[item["id"]] = {
+            "checkpoint_path": item["path"],
+            "model_label": item["label"],
+            "model_step": step,
+            "bot_turn_fn": item["bot_turn_fn"],
+        }
+    bot_fn = model_variants["default"]["bot_turn_fn"]
     mgr = GameManager(
         game_kwargs=game_kwargs,
         bot_turn_fn=bot_fn,
@@ -1404,35 +1857,69 @@ def _serve(cfg, analyze_ctx):
         checkpoint_path=str(Path(cfg.checkpoint).resolve()),
         model_label=model_label,
         model_step=model_step,
+        model_variants=model_variants,
+        default_model_id="default",
         difficulty_sims=difficulty_sims,
         default_difficulty=cfg.default_difficulty,
         recorder=recorder,
     )
     restored_games = mgr.restore_active_games()
 
-    if analyze_ctx is None:
-        # Model identity for cache invalidation: label (run@step) + the
-        # checkpoint file's size+mtime, so retraining the same path also busts it.
-        model_id = model_label
-        try:
-            cst = Path(cfg.checkpoint).stat()
-            model_id = f"{model_label}:{cst.st_size}:{int(cst.st_mtime)}"
-        except OSError:
-            pass
-        # Persist the analysis cache beside the games DB (skip for :memory:).
-        cache_db = None
-        if cfg.db and cfg.db != ":memory:":
-            cache_db = str(Path(cfg.db).with_suffix(".analysis.sqlite"))
-        analyze_ctx = AnalyzeContext(
-            model, mc, guard,
-            win_length=cfg.win_length,
-            placement_radius=cfg.placement_radius,
-            max_moves=cfg.max_moves,
-            mcts_sims=cfg.mcts_sims,
-            m_actions=cfg.m_actions,
-            model_id=model_id,
+    # Persist each model's cache in the same bounded model-keyed store.
+    cache_db = None
+    if cfg.db and cfg.db != ":memory:":
+        cache_db = str(Path(cfg.db).with_suffix(".analysis.sqlite"))
+    analysis_contexts = {}
+    for item in loaded_variants:
+        if item["id"] == "default" and analyze_ctx is not None:
+            analysis_contexts[item["id"]] = analyze_ctx
+            continue
+        stat = Path(item["path"]).stat()
+        cache_model_id = f"{item['label']}:{stat.st_size}:{int(stat.st_mtime)}"
+        analysis_contexts[item["id"]] = AnalyzeContext(
+            item["model"], item["model_config"], guard,
+            win_length=cfg.win_length, placement_radius=cfg.placement_radius,
+            max_moves=cfg.max_moves, mcts_sims=cfg.mcts_sims,
+            m_actions=cfg.m_actions, model_id=cache_model_id,
             cache_db_path=cache_db,
         )
+
+    # Runtime model catalogue: load/add/remove/re-default models without a
+    # restart. ``build_variant`` is the shared recipe for turning a checkpoint
+    # path into a playable + analysable model (used by the admin API).
+    def build_variant(model_id, label, path):
+        model, mc, ckpt = load_runtime(path)
+        step = _derive_step(str(path), ckpt)
+        bot_turn_fn = make_bot_turn_fn(
+            model=model, model_config=mc,
+            mcts_sims=cfg.mcts_sims, m_actions=cfg.m_actions,
+            difficulty_sims=difficulty_sims,
+            difficulty_forcing_depth=getattr(cfg, "difficulty_forcing_depth", None),
+            guard=guard, game_kwargs=game_kwargs,
+            live_forcing=getattr(cfg, "live_forcing", True),
+        )
+        stat = Path(path).stat()
+        cache_model_id = f"{label}:{stat.st_size}:{int(stat.st_mtime)}"
+        variant_ctx = AnalyzeContext(
+            model, mc, guard,
+            win_length=cfg.win_length, placement_radius=cfg.placement_radius,
+            max_moves=cfg.max_moves, mcts_sims=cfg.mcts_sims,
+            m_actions=cfg.m_actions, model_id=cache_model_id,
+            cache_db_path=cache_db,
+        )
+        return {
+            "id": model_id, "label": label, "path": str(Path(path).resolve()),
+            "step": step, "bot_turn_fn": bot_turn_fn, "analyze_ctx": variant_ctx,
+        }
+
+    models_file = None
+    models_dir = None
+    if cfg.db and cfg.db != ":memory:":
+        models_file = str(Path(cfg.db).with_suffix(".models.json"))
+        models_dir = str(Path(cfg.db).parent / "models")
+    model_manager = ModelManager(mgr, analysis_contexts, build_variant, models_file,
+                                 models_dir=models_dir)
+    model_manager.restore()
 
     admin_token = secrets.token_urlsafe(16) if cfg.admin_token is None else cfg.admin_token
     url_prefix = cfg.url_prefix.rstrip("/")
@@ -1448,7 +1935,8 @@ def _serve(cfg, analyze_ctx):
         proof_db = str(Path(cfg.db).with_suffix(".proofs.sqlite"))
     proof_store = ProofStore(proof_db)
     handler_cls = make_handler_class(mgr, admin_token=admin_token, url_prefix=url_prefix,
-                                     analyze_ctx=analyze_ctx,
+                                     analyze_ctx=analysis_contexts,
+                                     model_manager=model_manager,
                                      analyze_limiter=analyze_limiter,
                                      new_game_limiter=new_game_limiter,
                                      analyze_game_limiter=analyze_game_limiter,
@@ -1464,6 +1952,8 @@ def _serve(cfg, analyze_ctx):
     print(f"Play server running at http://{cfg.bind}:{cfg.port}{url_prefix}/")
     print(f"  checkpoint: {cfg.checkpoint}")
     print(f"  model:      {model_label}")
+    for item in loaded_variants[1:]:
+        print(f"  variant:    {item['label']} ({item['id']}) -> {item['path']}")
     print(f"  rules: win={cfg.win_length} radius={cfg.placement_radius} "
           f"max={cfg.max_moves}  m_actions={cfg.m_actions}")
     tier_str = "  ".join(f"{k}={v}" for k, v in difficulty_sims.items())

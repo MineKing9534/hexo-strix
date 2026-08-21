@@ -86,6 +86,23 @@ def test_serve_has_inference_workers_flag(capsys):
     assert "inference-workers" in capsys.readouterr().out
 
 
+def test_model_variant_parser_uses_stable_ids_and_rejects_collisions(tmp_path):
+    from hexo_a0.serving.app import _parse_model_variants
+
+    first = tmp_path / "first.safetensors"
+    second = tmp_path / "second.safetensors"
+    first.touch()
+    second.touch()
+    assert _parse_model_variants([
+        f"Strix 2026.08={first}", f"Experimental Q-head={second}",
+    ]) == [
+        ("strix-2026-08", "Strix 2026.08", first),
+        ("experimental-q-head", "Experimental Q-head", second),
+    ]
+    with pytest.raises(SystemExit, match="duplicate model variant"):
+        _parse_model_variants([f"Same model={first}", f"same-model={second}"])
+
+
 @pytest.mark.skipif(not os.path.exists(CKPT), reason="ckpt absent")
 def test_analyze_returns_candidate_set():
     from hexo_a0.serving.app import AnalyzeContext, handle_analyze

@@ -79,6 +79,15 @@ pub struct ProverConfig {
     pub node_budget: u64,
     pub tt_mb: usize,
     pub pn2_nodes: u64,
+    /// Adaptive level-2 budget: when > 0, each leaf's PN² node cap is scaled
+    /// by its branching factor. `pn2_scale` is the reference branching factor
+    /// that maps to the full `pn2_nodes`; 0 disables scaling (fixed budget).
+    /// By default the budget scales UP with branching (`pn2_nodes * branching /
+    /// pn2_scale`); set `pn2_scale_inverse` to scale it DOWN instead
+    /// (`pn2_nodes * pn2_scale / branching`), matching the observed
+    /// puzzle-dependence where low-branching positions want larger budgets.
+    pub pn2_scale: u64,
+    pub pn2_scale_inverse: bool,
     pub leaf_budget: u64,
     pub leaf_budget_max: u64,
     /// Optional total level-1 node budget for PDS-PN root-attack screening in
@@ -100,6 +109,8 @@ impl Default for ProverConfig {
             node_budget: 20_000_000,
             tt_mb: 512,
             pn2_nodes: 50_000,
+            pn2_scale: 0,
+            pn2_scale_inverse: false,
             leaf_budget: 1_000_000,
             leaf_budget_max: 10_000_000,
             root_screen_budget: 0,
@@ -418,43 +429,52 @@ pub fn guided_pdspn_shortest(
         return Err("shortest search depth cap must be at least 1".to_string());
     }
     let summary = certificate::verify(pos, certificate)?;
-    let mut upper = u8::try_from(summary.max_attacker_turns)
+    let original_upper = u8::try_from(summary.max_attacker_turns)
         .map_err(|_| "certificate depth exceeds the supported 255-turn bound".to_string())?;
-    if upper == 0 {
+    if original_upper == 0 {
         return Err("certificate reported a zero-turn win".to_string());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     let started = Instant::now();
+    let mut upper = original_upper;
     let mut lower = 0u8;
+    let mut current_cert = certificate.clone();
     let mut total_nodes = 0u64;
     let mut total_tt_hits = 0u64;
     let mut total_leaf_solves = 0u64;
     let mut probes = 0u64;
     let mut tt_bytes = 0u64;
     let mut best_pv = Vec::new();
-    let mut best_certificate: Option<ProofCertificate> = None;
 
-    // If the user's cap is below the certificate, first ask that exact cap. A
-    // miss is still valuable (`no win <= cap`) but we must not silently search
-    // above the requested ceiling. Otherwise bisect the verified interval.
-    let mut threshold = if cfg.depth_cap < upper {
-        Some(cfg.depth_cap)
-    } else if lower.saturating_add(1) < upper {
-        Some(lower + (upper - lower) / 2)
+    // Top-down certificate-guided probing. Each probe asks the exact next
+    // depth below the current certified upper bound, and the certificate's
+    // win-depth hints close every node it already resolves at that horizon —
+    // so a probe only re-searches the certificate's critical nodes (the ones
+    // whose certified depth exceeds the probe's remaining-turn budget). A WIN
+    // probe tightens the bound by at least one turn and adopts the tighter
+    // certificate; a NO probe proves the previous bound exact; a budget miss
+    // stops the walk and reports the verified interval honestly.
+    //
+    // If the user's cap is below the certificate, the first probe asks that
+    // exact cap: a miss is still valuable (`no win <= cap`) but we must not
+    // silently search above the requested ceiling.
+    let mut target = if cfg.depth_cap < upper {
+        cfg.depth_cap
     } else {
-        None
+        upper.saturating_sub(1)
     };
-    let mut capped_probe = cfg.depth_cap < upper;
-
-    while let Some(depth) = threshold {
+    while lower.saturating_add(1) < upper {
         if ctl.expired() || total_nodes >= cfg.node_budget {
             break;
         }
+        let (_hint_summary, hints, _guide_nodes) =
+            certificate::verify_with_hints(pos, &current_cert)?;
+        let hints = Rc::new(hints);
         let mut probe_cfg = cfg.clone();
-        probe_cfg.depth_cap = depth;
+        probe_cfg.depth_cap = target;
         probe_cfg.node_budget = cfg.node_budget.saturating_sub(total_nodes);
-        let probe = pdspn::solve_bounded(pos, &probe_cfg, ctl);
+        let probe = pdspn::solve_bounded_guided(pos, &probe_cfg, ctl, Rc::clone(&hints));
         probes += 1;
         total_nodes = total_nodes.saturating_add(probe.stats.nodes);
         total_tt_hits = total_tt_hits.saturating_add(probe.stats.tt_hits);
@@ -463,37 +483,58 @@ pub fn guided_pdspn_shortest(
 
         match probe.verdict {
             Verdict::Win => {
-                upper = upper.min(depth);
+                // Adopt the probe's certificate when it re-verifies at the new
+                // bound. The probe may have found an even shorter win than
+                // `target`; the verified summary is the honest new upper.
+                if let Some(candidate) = probe.certificate
+                    && let Ok(candidate_summary) = certificate::verify(pos, &candidate)
+                {
+                    let new_upper = u8::try_from(candidate_summary.max_attacker_turns)
+                        .unwrap_or(upper);
+                    upper = upper.min(new_upper);
+                    current_cert = candidate;
+                } else {
+                    upper = target;
+                }
                 if !probe.pv.is_empty() && dfpn::pv_replays_win(pos, &probe.pv) {
                     best_pv = probe.pv;
                 }
-                if let Some(candidate) = probe.certificate
-                    && let Ok(candidate_summary) = certificate::verify(pos, &candidate)
-                    && candidate_summary.max_attacker_turns == u32::from(upper)
-                {
-                    best_certificate = Some(candidate);
-                }
-                capped_probe = false;
+                target = upper.saturating_sub(1);
             }
             Verdict::No => {
-                lower = lower.max(depth);
-                if capped_probe {
-                    break;
-                }
+                lower = target;
+                break;
             }
             Verdict::BudgetExceeded | Verdict::Unverified => break,
         }
-        if lower.saturating_add(1) >= upper {
-            break;
-        }
-        threshold = Some(lower + (upper - lower) / 2);
     }
 
     let exact = lower.saturating_add(1) == upper;
+    // The UI may call the result shortest only when the saved certificate
+    // itself proves the reported upper. It need not be numerically tighter:
+    // an original one-turn certificate, or an original upper followed by an
+    // adjacent NO probe, already matches the exact bound without a WIN probe.
+    let cert_tightened = exact
+        && certificate::verify(pos, &current_cert)
+            .is_ok_and(|summary| summary.max_attacker_turns == u32::from(upper));
+    // Present the defender's strongest tested resistance. The attacker takes
+    // its quickest certified move and the defender takes the reply that delays
+    // the win longest. This line witnesses the certificate's upper bound and is
+    // much more useful than a cooperative example when explaining refutations.
+    if let Ok(pv) = certificate::worst_case_pv(pos, &current_cert)
+        && dfpn::pv_replays_win(pos, &pv)
+    {
+        best_pv = pv;
+    } else if best_pv.is_empty()
+        && let Ok(pv) = certificate::shortest_pv(pos, &current_cert)
+        && dfpn::pv_replays_win(pos, &pv)
+    {
+        best_pv = pv;
+    }
     let mut result = DriverResult::new(if exact { Verdict::Win } else { Verdict::BudgetExceeded });
     result.depth = Some(upper);
     result.pv = best_pv;
-    result.certificate = Some(best_certificate.unwrap_or_else(|| certificate.clone()));
+    result.certificate = Some(current_cert);
     result.stats.nodes = total_nodes;
     result.stats.tt_hits = total_tt_hits;
     result.stats.tt_bytes = tt_bytes;
@@ -505,6 +546,7 @@ pub fn guided_pdspn_shortest(
     result.stats.line_steps = probes;
     result.stats.best_upper_depth = upper;
     result.stats.excluded_through_depth = lower;
+    result.stats.cert_tightened = cert_tightened;
     Ok(result)
 }
 

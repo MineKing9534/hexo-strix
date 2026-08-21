@@ -348,8 +348,6 @@ impl StrixSolver {
         let certificate: ProofCertificate = serde_json::from_str(certificate_json)
             .map_err(|error| JsError::new(&format!("invalid certificate JSON: {error}")))?;
         let proof_position = prover_position(&pos);
-        let summary = verify_proof_certificate(&proof_position, &certificate)
-            .map_err(|error| JsError::new(&format!("certificate verification failed: {error}")))?;
         let cfg = hexo_solver::prover::ProverConfig {
             driver: hexo_solver::prover::DriverKind::PdspnShortest,
             wide,
@@ -358,6 +356,8 @@ impl StrixSolver {
             // Keep the browser comfortably below the wasm32 4 GiB ceiling.
             tt_mb: 128,
             pn2_nodes: limits.pn2_nodes.max(1),
+            pn2_scale: 0,
+            pn2_scale_inverse: false,
             leaf_budget: 1_000_000,
             leaf_budget_max: 10_000_000,
             root_screen_budget: 0,
@@ -373,8 +373,19 @@ impl StrixSolver {
             &ctl,
         )
         .map_err(|error| JsError::new(&format!("shortest optimization failed: {error}")))?;
-        let shortest_certified = result.verdict == hexo_solver::prover::io::Verdict::Win;
-        let kind = if shortest_certified {
+        // `shortest_certified` requires BOTH (a) the bisection resolved to an
+        // exact upper bound (Verdict::Win), AND (b) a probe actually produced
+        // a candidate certificate that re-verified at the new bound. Without
+        // (b) the saved cert still proves the original (longer) bound and the
+        // optimizer only narrowed the SEARCH upper — surfacing that as
+        // "shortest" would lie. Re-verify the new cert to get its fresh
+        // summary fields for the UI.
+        let saved_cert = result.certificate.clone().unwrap_or(certificate.clone());
+        let saved_summary = verify_proof_certificate(&proof_position, &saved_cert)
+            .map_err(|error| JsError::new(&format!("certificate verification failed: {error}")))?;
+        let shortest_certified = result.verdict == hexo_solver::prover::io::Verdict::Win
+            && result.stats.cert_tightened;
+        let kind = if result.verdict == hexo_solver::prover::io::Verdict::Win {
             SolveKind::Win
         } else {
             SolveKind::BudgetExceeded
@@ -389,10 +400,10 @@ impl StrixSolver {
             excluded_through_depth: result.stats.excluded_through_depth,
             threshold_probes: result.stats.line_steps,
             shortest_certified,
-            certificate_json: certificate.to_json(),
-            certificate_nodes: summary.dag_nodes,
-            certificate_edges: summary.proof_edges,
-            certificate_max_attacker_turns: summary.max_attacker_turns,
+            certificate_json: saved_cert.to_json(),
+            certificate_nodes: saved_summary.dag_nodes,
+            certificate_edges: saved_summary.proof_edges,
+            certificate_max_attacker_turns: saved_summary.max_attacker_turns,
         })
     }
 

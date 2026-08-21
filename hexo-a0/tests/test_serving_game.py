@@ -93,6 +93,32 @@ def test_local_bot_mode_does_not_run_server_reply_after_human_turn():
     assert rec.state.current_player() == rec.bot_side == "P1"
 
 
+def test_game_pins_selected_model_and_server_fallback_uses_it():
+    calls = []
+    variants = {
+        "default": {
+            "checkpoint_path": "stable.safetensors", "model_label": "Stable",
+            "model_step": 100, "bot_turn_fn": lambda rec: calls.append("default"),
+        },
+        "preview": {
+            "checkpoint_path": "preview.safetensors", "model_label": "Preview",
+            "model_step": 120, "bot_turn_fn": lambda rec: calls.append("preview"),
+        },
+    }
+    manager = GameManager(
+        game_kwargs={"win_length": 6, "placement_radius": 8, "max_moves": 400},
+        bot_turn_fn=variants["default"]["bot_turn_fn"], recorder=None,
+        mcts_sims=64, m_actions=16, checkpoint_path="stable.safetensors",
+        model_label="Stable", model_step=100, model_variants=variants,
+        difficulty_sims={"standard": 64}, default_difficulty="standard",
+    )
+    rec = manager.create_game("P1", model_id="preview", local_bot=True)
+    assert rec.model_id == "preview"
+    assert manager.snapshot(rec, placement_radius=8, win_length=6)["model_id"] == "preview"
+    manager.apply_server_bot_turn(rec.game_id)
+    assert calls == ["preview"]
+
+
 def test_apply_human_move_unknown_game_raises():
     with pytest.raises(UnknownGameError):
         _mgr().apply_human_move("nope", 1, 0)
@@ -782,11 +808,11 @@ def test_forcing_defensive_deadline_passed_to_solver(monkeypatch):
 
 def test_forcing_depth_capped_per_difficulty_tier(monkeypatch):
     # Per-difficulty forcing DEPTH cap: a forced win that only a deep-enough
-    # search can prove must be executed by "strong" (depth=16) but NOT by
-    # "casual" (depth=2) — casual falls through to the raw-argmax path
+    # search can prove must be executed by "deep" (depth=25) but NOT by
+    # "quick" (depth=2) — quick falls through to the raw-argmax path
     # rather than executing a win it can't (at its tier's depth) see.
     # `hexo_rs.solve_forcing` is stubbed to "find" the win only when
-    # depth_cap >= 6 (strictly between easy's 4 and standard's 6), recording
+    # depth_cap >= 6 (strictly between standard's 4 and strong's 8), recording
     # every depth_cap it's called with so the per-tier PLUMBING itself (not
     # just the pass/fail outcome) is verified.
     cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
@@ -805,35 +831,35 @@ def test_forcing_depth_capped_per_difficulty_tier(monkeypatch):
             move_log=[(0, 0, "P1"), (1, 0, "P2")], difficulty=difficulty,
         )
 
-    # --- casual (depth=2): the win needs depth>=6, so it's never found. ---
-    state, rec = _rec("g-depth-casual", "casual")
+    # --- quick (depth=2): the win needs depth>=6, so it's never found. ---
+    state, rec = _rec("g-depth-quick", "quick")
     win_cell = tuple(state.legal_moves()[0])
     depths = []
 
-    def _stub_casual(_state, depth_cap, _node_budget):
+    def _stub_quick(_state, depth_cap, _node_budget):
         depths.append(depth_cap)
         return (win_cell, [win_cell]) if depth_cap >= 6 else None
 
-    monkeypatch.setattr(hexo_rs, "solve_forcing", _stub_casual)
+    monkeypatch.setattr(hexo_rs, "solve_forcing", _stub_quick)
     _bot_turn_fn(cfg_kwargs)(rec)
 
-    assert depths and all(d == 2 for d in depths)  # casual's tier depth, every call
+    assert depths and all(d == 2 for d in depths)  # quick's tier depth, every call
     assert rec.forcing_pv is None  # the win was never executed via forcing
 
-    # --- strong: the same win threshold is now cleared. ---
-    state, rec = _rec("g-depth-strong", "strong")
+    # --- deep: the same win threshold is now cleared. ---
+    state, rec = _rec("g-depth-deep", "deep")
     win_cell = tuple(state.legal_moves()[0])
     depths = []
 
-    def _stub_strong(_state, depth_cap, _node_budget):
+    def _stub_deep(_state, depth_cap, _node_budget):
         depths.append(depth_cap)
         return (win_cell, [win_cell]) if depth_cap >= 6 else None
 
-    monkeypatch.setattr(hexo_rs, "solve_forcing", _stub_strong)
+    monkeypatch.setattr(hexo_rs, "solve_forcing", _stub_deep)
     _bot_turn_fn(cfg_kwargs)(rec)
 
-    # strong's tier depth; own-win solve found it immediately
-    assert depths == [game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]]
+    # deep's tier depth; own-win solve found it immediately
+    assert depths == [game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["deep"]]
     assert rec.move_log[-1][:2] == win_cell  # the win WAS executed
 
 
@@ -849,7 +875,7 @@ def test_forcing_defense_saves_strongloss_a_via_killer_pair():
     stones = [((0, 0), "P1"), ((1, 2), "P2"), ((2, 3), "P2"), ((3, -1), "P1"),
               ((2, 1), "P1"), ((1, 4), "P2"), ((1, 3), "P2")]
     state = hexo_rs.GameState.from_state(stones, "P1", 2, cfg)
-    depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]
+    depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["deep"]
 
     # Sanity: the threat is real and no single block kills it (else this
     # fixture no longer tests the pair pass).
@@ -861,7 +887,7 @@ def test_forcing_defense_saves_strongloss_a_via_killer_pair():
         game_id="g-strongloss-a", created_at=now, last_active_at=now,
         state=state, human_side="P2", bot_side="P1", human_name="a",
         move_log=[(q, r, side) for (q, r), side in stones],
-        difficulty="strong",
+        difficulty="deep",
     )
     _bot_turn_fn(cfg_kwargs)(rec)
 
@@ -958,8 +984,8 @@ def test_forcing_defense_partner_cache_not_reused_across_turns(monkeypatch):
     assert calls["n"] >= 2
 
 
-def test_forcing_defense_deadline_strong_tier(monkeypatch):
-    # Per-tier defense deadline: "strong" gets a longer solve_defense time
+def test_forcing_defense_deadline_deep_tier(monkeypatch):
+    # Per-tier defense deadline: "deep" gets a longer solve_defense time
     # limit than the flat 3 s backstop (the chao loss was a deadline expiry on
     # the slow production host — see DIFFICULTY_DEFENSE_DEADLINE_S).
     cfg_kwargs = {"win_length": 6, "placement_radius": 8, "max_moves": 400}
@@ -979,13 +1005,13 @@ def test_forcing_defense_deadline_strong_tier(monkeypatch):
 
     now = datetime.now(timezone.utc)
     rec = GameRecord(
-        game_id="g-deadline-strong", created_at=now, last_active_at=now,
+        game_id="g-deadline-deep", created_at=now, last_active_at=now,
         state=state, human_side="P2", bot_side="P1", human_name="a",
-        move_log=[(0, 0, "P1"), (1, 0, "P2")], difficulty="strong",
+        move_log=[(0, 0, "P1"), (1, 0, "P2")], difficulty="deep",
     )
     _bot_turn_fn(cfg_kwargs)(rec)
 
-    expected = int(game_mod.DIFFICULTY_DEFENSE_DEADLINE_S["strong"] * 1000)
+    expected = int(game_mod.DIFFICULTY_DEFENSE_DEADLINE_S["deep"] * 1000)
     assert seen["ms"] == expected
     assert expected > int(game_mod.DEFENSE_DEADLINE_S * 1000)
 
@@ -1088,7 +1114,7 @@ def test_forcing_defense_saves_chao_game_via_pair_cache(monkeypatch):
         state.apply_move(q, r)
     assert state.current_player() == "P2"  # strix to move, 2 placements
 
-    depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]
+    depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH["deep"]
     # Sanity: chao's threat is real at the bot's turn start.
     flip = hexo_rs.GameState.from_state(state.placed_stones(), "P1", 2, cfg)
     assert hexo_rs.solve_forcing(flip, depth, game_mod.DEF_NODE_BUDGET) is not None
@@ -1111,7 +1137,7 @@ def test_forcing_defense_saves_chao_game_via_pair_cache(monkeypatch):
     rec = GameRecord(
         game_id="g-chao", created_at=now, last_active_at=now, state=state,
         human_side="P1", bot_side="P2", human_name="chao",
-        move_log=move_log, difficulty="strong",
+        move_log=move_log, difficulty="deep",
     )
     _bot_turn_fn(cfg_kwargs)(rec)
 
@@ -1160,12 +1186,12 @@ def _hayes_position(n):
 
 def test_live_budget_finds_hayes_turn16_win():
     # The turn-16 win must be visible to the own-win solve at the LIVE node
-    # budget, at both the standard and strong tier depth caps (the win is 7
-    # attacker-turns deep; standard's depth 8 covers it).
+    # budget, at both the strong and deep tier depth caps (the win is 7
+    # attacker-turns deep; strong's depth 8 covers it).
     state, _ = _hayes_position(30)
     assert state.current_player() == "P1"
     assert state.moves_remaining_this_turn() == 2
-    for tier in ("standard", "strong"):
+    for tier in ("strong", "deep"):
         depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH[tier]
         res = hexo_rs.solve_forcing(state, depth, game_mod.LIVE_NODE_BUDGET)
         assert res is not None, f"turn-16 win invisible at {tier} live budget"
@@ -1179,7 +1205,7 @@ def test_live_budget_finds_hayes_placement31_win():
     state, _ = _hayes_position(31)
     assert state.current_player() == "P1"
     assert state.moves_remaining_this_turn() == 1
-    for tier in ("standard", "strong"):
+    for tier in ("strong", "deep"):
         depth = game_mod.DEFAULT_DIFFICULTY_FORCING_DEPTH[tier]
         res = hexo_rs.solve_forcing(state, depth, game_mod.LIVE_NODE_BUDGET)
         assert res is not None, f"placement-31 win invisible at {tier} live budget"
@@ -1196,7 +1222,7 @@ def test_forcing_bot_wins_hayes_turn16_position():
     rec = GameRecord(
         game_id="g-hayes-t16", created_at=now, last_active_at=now,
         state=state, human_side="P2", bot_side="P1", human_name="hayes",
-        move_log=move_log, difficulty="strong",
+        move_log=move_log, difficulty="deep",
     )
     _bot_turn_fn(cfg_kwargs)(rec)
 

@@ -45,6 +45,32 @@ def test_unit_trace_is_full_player_perspective_return():
     assert result == pytest.approx([-1.0, -1.0, 1.0, 1.0])
 
 
+def test_gamma_discounts_each_transition_but_not_terminal_reward():
+    result = lambda_returns(
+        players=["P2", "P2", "P1", "P1"],
+        rewards=[0.0, 0.0, 0.0, 1.0],
+        state_values=[0.0, 0.0, 0.0, 0.0],
+        trace_decay=1.0,
+        gamma=0.5,
+    )
+
+    assert result == pytest.approx([-0.125, -0.25, 0.5, 1.0])
+
+
+def test_gamma_discounts_truncated_successor_bootstrap():
+    result = lambda_returns(
+        players=["P1"],
+        rewards=[0.0],
+        state_values=[0.0],
+        trace_decay=1.0,
+        gamma=0.5,
+        bootstrap_player="P2",
+        bootstrap_value=0.8,
+    )
+
+    assert result == pytest.approx([-0.4])
+
+
 def test_truncated_return_bootstraps_from_live_successor_perspective():
     result = lambda_returns(
         players=["P2", "P2"],

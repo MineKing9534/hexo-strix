@@ -14,8 +14,11 @@ FIXTURE = Path(__file__).parent / "fixtures" / "config.toml"
 def test_config_fixture_loads_algorithm_collection_and_model():
     config = load_config(FIXTURE)
 
+    assert config.model.critic == "scalar"
     assert config.algorithm.alpha == pytest.approx(0.03)
     assert config.algorithm.beta == pytest.approx(0.1)
+    assert config.algorithm.gamma == pytest.approx(1.0)
+    assert config.algorithm.critic_mass_floor == pytest.approx(0.2)
     assert config.algorithm.trace_decay == pytest.approx(0.8824969025845955)
     assert config.model.axis_relational is True
     assert config.model.node_coords is False
@@ -42,6 +45,47 @@ def test_config_fixture_loads_algorithm_collection_and_model():
     assert config.training.search_q_teacher_root_batch_size == 16
     assert config.training.search_q_teacher_refit_epochs == 0
     assert config.run.compile is False
+
+
+def test_categorical_critic_gamma_and_mass_floor_load(tmp_path):
+    path = tmp_path / "categorical.toml"
+    path.write_text(
+        "[model]\n"
+        'critic = "categorical"\n'
+        "[algorithm]\n"
+        "gamma = 0.99\n"
+        "critic_mass_floor = 0.25\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.model.critic == "categorical"
+    assert config.algorithm.gamma == pytest.approx(0.99)
+    assert config.algorithm.critic_mass_floor == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ('[model]\ncritic = "gaussian"\n', "model.critic"),
+        ("[algorithm]\ngamma = 0.0\n", "algorithm.gamma"),
+        (
+            "[algorithm]\ncritic_mass_floor = 1.1\n",
+            "algorithm.critic_mass_floor",
+        ),
+    ],
+)
+def test_categorical_algorithm_options_are_validated(
+    tmp_path,
+    contents,
+    message,
+):
+    path = tmp_path / "invalid-categorical.toml"
+    path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_config(path)
 
 
 def test_config_fixture_loads_game_and_named_opponents():

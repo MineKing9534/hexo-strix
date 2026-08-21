@@ -267,12 +267,135 @@ fn certificate_guided_pdspn_finds_the_exact_shortest_interval() {
     assert_eq!(result.stats.excluded_through_depth, shortest.saturating_sub(1));
     assert_pv_wins(&p, &result.pv);
     assert_eq!(attacker_turns_in_pv(&p, &result.pv), shortest);
+    let saved = result.certificate.as_ref().expect("shortest certificate");
     assert_eq!(
-        certificate::verify(&p, result.certificate.as_ref().expect("shortest certificate"))
+        result.pv,
+        certificate::worst_case_pv(&p, saved).expect("best-defence PV"),
+        "the displayed sample must follow maximum-delay defender replies",
+    );
+    assert_eq!(
+        certificate::verify(&p, saved)
             .unwrap()
             .max_attacker_turns,
         u32::from(shortest),
     );
+    assert!(
+        result.stats.cert_tightened,
+        "an exact shortest result must report cert_tightened so the UI can          advertise shortestness instead of a search-only bound",
+    );
+}
+
+/// When the budget is exhausted before any probe produces a candidate cert
+/// that re-verifies at the tightened upper bound, the saved cert is still
+/// the ORIGINAL (longer) one — the optimizer only narrowed the SEARCH
+/// upper. `cert_tightened` must be false in that case so the UI does not
+/// claim a proven shortest win it cannot back up.
+#[test]
+fn guided_pdspn_shortest_reports_cert_tightened_false_when_budget_exhausted() {
+    let ctl = Ctl::new(0.0);
+    // XSNFYLL has idtt depth 2 in this fixture; use it but force the budget
+    // to run out before the leaf solve finishes.
+    let p = pos(XSNFYLL, P2, 2);
+    let pd = pdspn::solve(&p, &fast_cfg(), &ctl);
+    let certificate = pd.certificate.as_ref().expect("pdspn WIN certificate").clone();
+    let tiny_cfg = ProverConfig {
+        node_budget: 50, // impossibly small: every probe times out
+        depth_cap: 1,    // first probe must fail to certify below the original bound
+        ..fast_cfg()
+    };
+    let result = guided_pdspn_shortest(&p, &certificate, &tiny_cfg, &ctl)
+        .expect("guided optimizer must not error on budget exhaustion");
+    assert!(
+        !result.stats.cert_tightened,
+        "saved cert must be the original (longer) one when the budget ran out:          best_upper_depth={:?}, verdict={:?}",
+        result.stats.best_upper_depth, result.verdict,
+    );
+    let saved_max = certificate::verify(&p, result.certificate.as_ref().unwrap())
+        .unwrap().max_attacker_turns;
+    assert_eq!(
+        saved_max,
+        certificate::verify(&p, &certificate).unwrap().max_attacker_turns,
+        "the saved cert in the budget-exhausted case must be the ORIGINAL cert,          not a newer one",
+    );
+}
+
+/// The top-down certificate-guided walk finds the exact shortest win with a
+/// budget far below what unguided bisection probes would need: the certificate's
+/// win-depth hints close every non-critical node, so each probe only re-searches
+/// the nodes whose certified depth exceeds the probe's horizon.
+#[test]
+fn guided_pdspn_shortest_top_down_finds_exact_shortest_with_small_budget() {
+    let ctl = Ctl::new(0.0);
+    let p = pos(XSNFYLL, P2, 2);
+    let shortest = idtt(&p, &fast_cfg(), &ctl).depth.expect("fixture IDTT win");
+    let pd = pdspn::solve(&p, &fast_cfg(), &ctl);
+    let certificate = pd.certificate.as_ref().expect("pdspn WIN certificate").clone();
+    let small_cfg = ProverConfig {
+        node_budget: 2_000_000,
+        depth_cap: 40,
+        ..fast_cfg()
+    };
+    let result = guided_pdspn_shortest(&p, &certificate, &small_cfg, &ctl)
+        .expect("guided optimizer must not error");
+    assert_eq!(result.verdict, Verdict::Win);
+    assert_eq!(result.depth, Some(shortest));
+    assert!(
+        result.stats.cert_tightened,
+        "the walk must adopt a tighter certificate than the input"
+    );
+    assert_eq!(result.stats.best_upper_depth, shortest);
+    assert_eq!(result.stats.excluded_through_depth, shortest.saturating_sub(1));
+    // The adopted certificate must itself prove the exact shortest bound.
+    let adopted = certificate::verify(&p, result.certificate.as_ref().unwrap()).unwrap();
+    assert_eq!(adopted.max_attacker_turns, u32::from(shortest));
+}
+
+/// The certificate's shortest-line replay is a legal winning line whose attacker
+/// turns never exceed the certificate's worst-case bound, and it is no longer
+/// than the worst-case (longest-defence) replay.
+#[test]
+fn certificate_shortest_pv_replays_and_is_no_longer_than_worst_case() {
+    let ctl = Ctl::new(0.0);
+    let p = pos(XSNFYLL, P2, 2);
+    let pd = pdspn::solve(&p, &fast_cfg(), &ctl);
+    let certificate = pd.certificate.as_ref().expect("pdspn WIN certificate").clone();
+    let shortest = certificate::shortest_pv(&p, &certificate).expect("shortest PV");
+    let worst = certificate::worst_case_pv(&p, &certificate).expect("worst-case PV");
+    assert_pv_wins(&p, &shortest);
+    assert_pv_wins(&p, &worst);
+    let shortest_turns = attacker_turns_in_pv(&p, &shortest);
+    let worst_turns = attacker_turns_in_pv(&p, &worst);
+    let bound = certificate::verify(&p, &certificate).unwrap().max_attacker_turns;
+    assert!(shortest_turns <= worst_turns, "shortest line must not exceed the worst case");
+    assert!(u32::from(shortest_turns) <= bound, "shortest line must respect the bound");
+}
+
+/// Regression for the qietby7 line-refutation workflow. After the defender's
+/// turn-9 cover `(0,8), (6,2)`, nine attacker turns are not enough and ten are:
+/// the submitted 17-turn replay therefore extends to 19 under best defence.
+#[test]
+#[ignore = "slow qietby7 best-defence shortest proof (~20s release)"]
+fn qietby7_best_defense_turn9_requires_ten_more_attacker_turns() {
+    let p = Position::load(&fixture("qietby7_best_defense_turn9.json"))
+        .expect("best-defence fixture");
+    let cfg = ProverConfig {
+        node_budget: 100_000_000,
+        pn2_nodes: 1_000_000,
+        time_limit_s: 120.0,
+        wide: true,
+        ..ProverConfig::default()
+    };
+    let ctl = Ctl::new(cfg.time_limit_s);
+    let initial = pdspn::solve(&p, &cfg, &ctl);
+    assert_eq!(initial.verdict, Verdict::Win);
+    assert_eq!(initial.depth, Some(10));
+    let certificate = initial.certificate.as_ref().expect("PDS-PN certificate");
+    let shortest = guided_pdspn_shortest(&p, certificate, &cfg, &ctl)
+        .expect("guided shortest proof");
+    assert_eq!(shortest.verdict, Verdict::Win);
+    assert_eq!(shortest.depth, Some(10));
+    assert_eq!(shortest.stats.excluded_through_depth, 9);
+    assert_eq!(attacker_turns_in_pv(&p, &shortest.pv), 10);
 }
 
 // ---- slow parity fixtures (the big/deep ones) ----
@@ -495,4 +618,34 @@ fn kernel_supported_bounds() {
     assert!(KernelCtx::supported(6));
     assert!(!KernelCtx::supported(0));
     assert!(!KernelCtx::supported(20));
+}
+
+// Regression diagnostic: every forcing attacker pair on the user-supplied
+// qietby7 17-turn replay (up to its first unstoppable threat) must be emitted
+// by the wide kernel; otherwise a bounded NO would be model-incomplete.
+#[test]
+fn qietby7_user_spine_is_generated_wide() {
+    let p = Position::load(&fixture("qietby7.json")).expect("position");
+    let mut k = KernelCtx::new_wide(&p.stones, p.attacker, p.config.win_length, p.config.placement_radius, true)
+        .expect("kernel");
+    let cells: &[Coord] = &[(-1, 1), (1, -1), (-3, 3), (2, -2), (1, 0), (1, -2), (1, 2), (1, -3), (2, 0), (3, 0), (-1, 0), (4, 0), (3, 1), (3, 2), (3, 4), (3, -1), (2, 1), (5, 1), (6, 1), (0, 1), (4, 2), (6, 0), (2, 4), (7, -1), (5, 2), (5, 3), (5, 4), (7, 2), (4, 3), (6, 3), (2, 3), (8, 3), (3, 5), (2, 6), (1, 7), (7, 1), (4, 5), (6, 5), (7, 5), (4, 6), (6, 7), (6, 10), (6, 4), (6, 8), (7, 10), (8, 10), (4, 10), (9, 10), (8, 9), (5, 12), (4, 13), (10, 7), (8, 11), (8, 12), (8, 8), (8, 13), (6, 12), (7, 12), (4, 12), (9, 12), (7, 11), (9, 9)];
+    for (turn, chunk) in cells.chunks_exact(4).enumerate() {
+        let attack = crate::forcing::CellSet2::two(chunk[0], chunk[1]);
+        let super::kernel::OrEval::Moves(moves) = k.or_eval(2) else {
+            panic!("turn {turn}: expected forcing attack moves");
+        };
+        assert!(moves.contains(&attack), "turn {turn}: wide kernel omitted {attack:?}");
+        k.place_attacker(&attack);
+        let response = crate::forcing::CellSet2::two(chunk[2], chunk[3]);
+        let super::kernel::AndEval::Covers(covers) = k.and_eval() else {
+            panic!("turn {turn}: expected defender covers");
+        };
+        assert!(covers.contains(&response), "turn {turn}: line response not a kernel cover");
+        k.place_defender(&response);
+    }
+    let attack = crate::forcing::CellSet2::two(cells[60], cells[61]);
+    let super::kernel::OrEval::Moves(moves) = k.or_eval(2) else { panic!("turn 15: expected moves") };
+    assert!(moves.contains(&attack), "turn 15: wide kernel omitted {attack:?}");
+    k.place_attacker(&attack);
+    assert!(matches!(k.and_eval(), super::kernel::AndEval::AttackerWin));
 }

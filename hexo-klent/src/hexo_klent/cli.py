@@ -82,8 +82,8 @@ def _parser() -> argparse.ArgumentParser:
     checkpoint_source.add_argument(
         "--init-from",
         help=(
-            "compatible production Axis-GINE Q-head or dense KLENT "
-            "checkpoint used to initialize a new KLENT run"
+            "compatible production Axis-GINE Q-head or KLENT checkpoint "
+            "used to initialize a new run with a fresh optimizer"
         ),
     )
     train.add_argument("--device", help="override run.device")

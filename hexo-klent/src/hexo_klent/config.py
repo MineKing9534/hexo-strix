@@ -18,6 +18,7 @@ class KlentModelConfig(ModelConfig):
     """KLENT network plus its execution representation."""
 
     architecture: str = "graph"
+    critic: str = "scalar"
     dense_ray_radius: int = 5
     ray_channels: int = 12
     ray_update_hidden: int = 48
@@ -51,6 +52,8 @@ class AlgorithmConfig:
     alpha: float = 0.03
     beta: float = 0.1
     tau: float = 8.0
+    gamma: float = 1.0
+    critic_mass_floor: float = 0.2
 
     @property
     def trace_decay(self) -> float:
@@ -283,6 +286,14 @@ def _validate(cfg: Config) -> None:
         raise ValueError("game.placement_radius must be positive")
     if cfg.game.rollout_horizon <= 0:
         raise ValueError("game.rollout_horizon must be positive")
+    if cfg.model.critic not in {"scalar", "categorical"}:
+        raise ValueError("model.critic must be 'scalar' or 'categorical'")
+    if not 0.0 < cfg.algorithm.gamma <= 1.0:
+        raise ValueError("algorithm.gamma must be in (0, 1]")
+    if not 0.0 < cfg.algorithm.critic_mass_floor <= 1.0:
+        raise ValueError(
+            "algorithm.critic_mass_floor must be in (0, 1]"
+        )
     if cfg.collection.positions_per_iteration <= 0:
         raise ValueError("collection.positions_per_iteration must be positive")
     if cfg.collection.parallel_games <= 0:

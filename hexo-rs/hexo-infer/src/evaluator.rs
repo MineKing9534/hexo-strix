@@ -5,7 +5,7 @@
 //! Logits are RAW (the search softmaxes internally); values are side-to-move-relative.
 
 use crate::forward::InferModel;
-use hexo_rs::axis_graph::game_to_axis_graph_raw_opts;
+use hexo_rs::axis_graph::{game_to_axis_graph_raw_lean, game_to_axis_graph_raw_opts, LeanOpts, MovesScope};
 use hexo_rs::hexo_engine::types::Coord;
 use hexo_rs::hexo_engine::GameState;
 use rustc_hash::FxHashMap;
@@ -14,12 +14,27 @@ impl InferModel {
     /// Evaluate one state: graph build -> forward -> coord->logit map + value.
     pub fn eval_one(&self, state: &GameState) -> (FxHashMap<Coord, f64>, f64) {
         let cfg = self.config();
-        let g = game_to_axis_graph_raw_opts(
-            state,
-            cfg.prune_empty_edges,
-            cfg.threat_features,
-            cfg.relative_stones,
-        );
+        let g = if cfg.axis_relational {
+            game_to_axis_graph_raw_lean(
+                state,
+                cfg.prune_empty_edges,
+                cfg.threat_features,
+                cfg.relative_stones,
+                &LeanOpts {
+                    axis_relational: true,
+                    compact_stone_onehot: cfg.compact_stone_onehot,
+                    node_coords: cfg.node_coords,
+                    moves_scope: if cfg.moves_scope == "graph" { MovesScope::Graph } else { MovesScope::Node },
+                },
+            )
+        } else {
+            game_to_axis_graph_raw_opts(
+                state,
+                cfg.prune_empty_edges,
+                cfg.threat_features,
+                cfg.relative_stones,
+            )
+        };
         let (logits, value) = self.forward(&g);
         let legal = state.legal_moves();
         debug_assert_eq!(legal.len(), logits.len());

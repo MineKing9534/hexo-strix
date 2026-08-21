@@ -1,0 +1,335 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-21T17:42:46.374369+00:00",
+  "title": "Design System: HeXO Observatory",
+  "extensions": {
+    "colorMeta": {
+      "aged-brass": {
+        "role": "primary",
+        "displayName": "Aged Brass",
+        "canonical": "#c9a35e",
+        "tonalRamp": [
+          "#392c13",
+          "#654d22",
+          "#916e30",
+          "#bc903f",
+          "#cda969",
+          "#dbc295",
+          "#eadbc0",
+          "#f9f4ec"
+        ]
+      },
+      "phosphor": {
+        "role": "primary",
+        "displayName": "Phosphor",
+        "canonical": "#f2b65a",
+        "tonalRamp": [
+          "#472d06",
+          "#7d500a",
+          "#b3720e",
+          "#e99412",
+          "#f0ad45",
+          "#f5c57b",
+          "#f9ddb1",
+          "#fdf5e7"
+        ]
+      },
+      "observatory-ink": {
+        "role": "neutral",
+        "displayName": "Observatory Ink",
+        "canonical": "#0d0f0e",
+        "tonalRamp": [
+          "#242926",
+          "#3f4843",
+          "#5a6761",
+          "#75877e",
+          "#94a29b",
+          "#b3bdb8",
+          "#d2d8d5",
+          "#f1f3f2"
+        ]
+      },
+      "panel": {
+        "role": "neutral",
+        "displayName": "Panel",
+        "canonical": "#15191a",
+        "tonalRamp": [
+          "#22292a",
+          "#3c484b",
+          "#56676b",
+          "#70868b",
+          "#90a1a5",
+          "#b0bcc0",
+          "#d1d8da",
+          "#f1f3f4"
+        ]
+      },
+      "panel-2": {
+        "role": "neutral",
+        "displayName": "Panel 2",
+        "canonical": "#1b201f",
+        "tonalRamp": [
+          "#232928",
+          "#3e4947",
+          "#586965",
+          "#738884",
+          "#92a3a0",
+          "#b2bebc",
+          "#d2d9d7",
+          "#f1f3f3"
+        ]
+      },
+      "warm-parchment": {
+        "role": "neutral",
+        "displayName": "Warm Parchment",
+        "canonical": "#ece6da",
+        "tonalRamp": [
+          "#332a1a",
+          "#594b2e",
+          "#806b42",
+          "#a68b55",
+          "#bba67b",
+          "#cfc0a1",
+          "#e3dac8",
+          "#f6f4ee"
+        ]
+      },
+      "p1-orange": {
+        "role": "semantic",
+        "displayName": "P1 Orange",
+        "canonical": "#f08a3c",
+        "tonalRamp": [
+          "#472205",
+          "#7d3c0a",
+          "#b3560e",
+          "#e96f12",
+          "#f18f45",
+          "#f5b07b",
+          "#f9d0b1",
+          "#fdf1e7"
+        ]
+      },
+      "p2-blue": {
+        "role": "semantic",
+        "displayName": "P2 Blue",
+        "canonical": "#3fb6d9",
+        "tonalRamp": [
+          "#0d3440",
+          "#165c71",
+          "#2084a1",
+          "#2aacd2",
+          "#58bfde",
+          "#88d2e8",
+          "#b9e4f1",
+          "#eaf7fb"
+        ]
+      },
+      "good-green": {
+        "role": "semantic",
+        "displayName": "Good Green",
+        "canonical": "#79cf9a",
+        "tonalRamp": [
+          "#143822",
+          "#24633c",
+          "#338e56",
+          "#42b970",
+          "#6bca90",
+          "#96dab0",
+          "#c1e9d1",
+          "#ecf8f1"
+        ]
+      },
+      "warn-amber": {
+        "role": "semantic",
+        "displayName": "Warn Amber",
+        "canonical": "#e0a23a",
+        "tonalRamp": [
+          "#422d0a",
+          "#745012",
+          "#a7721a",
+          "#d99522",
+          "#e4ad52",
+          "#ecc584",
+          "#f4ddb7",
+          "#fcf5e9"
+        ]
+      },
+      "bad-red": {
+        "role": "semantic",
+        "displayName": "Bad Red",
+        "canonical": "#e25c5c",
+        "tonalRamp": [
+          "#410c0c",
+          "#721414",
+          "#a41d1d",
+          "#d52626",
+          "#e15555",
+          "#ea8686",
+          "#f2b8b8",
+          "#fbe9e9"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Wordmark and section headings."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Body copy and controls."
+      },
+      "label": {
+        "displayName": "Label / Mono",
+        "purpose": "Labels, coordinates, and data readouts."
+      }
+    },
+    "shadows": [
+      {
+        "name": "overlay",
+        "value": "0 8px 32px rgba(0,0,0,0.5)",
+        "purpose": "Modals and dialogs."
+      },
+      {
+        "name": "floating-panel",
+        "value": "0 16px 42px rgba(0,0,0,0.34)",
+        "purpose": "The proof explorer panel."
+      },
+      {
+        "name": "tooltip",
+        "value": "0 4px 8px rgba(0,0,0,0.35)",
+        "purpose": "The thinking status chip."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Default easing for state transitions."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "phone",
+        "value": "480px"
+      },
+      {
+        "name": "tablet",
+        "value": "768px"
+      },
+      {
+        "name": "desktop",
+        "value": "769px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The single brass call-to-action (Start game, Load game, Check for a forced win).",
+      "html": "<button class=\"ds-btn-primary\">START GAME</button>",
+      "css": ".ds-btn-primary{background:#c9a35e;color:#0d0f0e;border:none;border-radius:6px;padding:10px 12px;font:700 14px 'Hanken Grotesk',system-ui,sans-serif;cursor:pointer;transition:background-color .18s cubic-bezier(.16,1,.3,1),transform .12s cubic-bezier(.16,1,.3,1);}.ds-btn-primary:hover{background:#f2b65a;}.ds-btn-primary:active{transform:translateY(1px);}.ds-btn-primary:focus-visible{outline:2px solid #f2b65a;outline-offset:2px;}"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "A quiet dark action (Cancel, Change, Copy game record).",
+      "html": "<button class=\"ds-btn-secondary\">CANCEL</button>",
+      "css": ".ds-btn-secondary{background:#232826;color:#d8d2c6;border:1px solid transparent;border-radius:6px;padding:8px 12px;font:600 13px 'Hanken Grotesk',system-ui,sans-serif;cursor:pointer;transition:background-color .18s cubic-bezier(.16,1,.3,1),border-color .18s cubic-bezier(.16,1,.3,1),color .18s cubic-bezier(.16,1,.3,1);}.ds-btn-secondary:hover{border-color:#c9a35e;color:#ece6da;}.ds-btn-secondary:active{transform:translateY(1px);}.ds-btn-secondary:focus-visible{outline:2px solid #f2b65a;outline-offset:2px;}"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "A recessed field for names, ratings, and pasted game records.",
+      "html": "<input class=\"ds-input\" type=\"text\" placeholder=\"Name (optional)\">",
+      "css": ".ds-input{width:100%;min-height:42px;padding:9px 10px;background:#111514;color:#ece6da;border:1px solid #3a423f;border-radius:6px;font:400 14px 'Hanken Grotesk',system-ui,sans-serif;}.ds-input::placeholder{color:#9ca098;}.ds-input:hover{border-color:#c9a35e;background:#181d1b;}.ds-input:focus-visible{outline:2px solid #f2b65a;outline-offset:2px;border-color:#c9a35e;}"
+    },
+    {
+      "name": "Select",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "A recessed dropdown with a brass chevron (analysis effort, search method).",
+      "html": "<select class=\"ds-select\"><option>Standard</option><option>Quick</option><option>Deep</option></select>",
+      "css": ".ds-select{width:100%;min-height:40px;padding:8px 34px 8px 10px;appearance:none;background-color:#111514;color:#ece6da;border:1px solid #3a423f;border-radius:6px;font:400 13px 'Hanken Grotesk',system-ui,sans-serif;background-image:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='8' viewBox='0 0 14 8'%3E%3Cpath d='M1 1l6 6 6-6' fill='none' stroke='%23c9a35e' stroke-width='1.5'/%3E%3C/svg%3E\");background-repeat:no-repeat;background-position:right 11px center;cursor:pointer;}.ds-select:hover{border-color:#c9a35e;background-color:#181d1b;}.ds-select:focus-visible{outline:2px solid #f2b65a;outline-offset:2px;}"
+    },
+    {
+      "name": "Side Select",
+      "kind": "custom",
+      "refersTo": "side-btn",
+      "description": "The P1 / random / P2 side picker in the new-game modal.",
+      "html": "<div class=\"ds-side-row\"><button class=\"ds-side-btn selected\"><span class=\"ds-stone ds-stone-p1\">\u25cf</span>P1 <span class=\"ds-side-colour\">orange</span></button><button class=\"ds-side-btn\"><span class=\"ds-stone\">?</span>Random</button><button class=\"ds-side-btn\"><span class=\"ds-stone ds-stone-p2\">\u25cf</span>P2 <span class=\"ds-side-colour\">blue</span></button></div>",
+      "css": ".ds-side-row{display:flex;gap:8px;}.ds-side-btn{flex:1;min-height:84px;padding:12px 8px;background:#111514;color:#ece6da;border:1px solid #3a423f;border-radius:6px;cursor:pointer;font:400 13px 'Hanken Grotesk',system-ui,sans-serif;text-align:center;}.ds-side-btn:hover{background:#181d1b;border-color:#c9a35e;}.ds-side-btn.selected{border-color:#c9a35e;background:#2a2410;box-shadow:inset 0 0 0 1px #c9a35e;}.ds-stone{font-size:26px;display:block;margin-bottom:4px;}.ds-stone-p1{color:#f08a3c;}.ds-stone-p2{color:#3fb6d9;}.ds-side-colour{color:#aeb2aa;}"
+    },
+    {
+      "name": "Difficulty Badge",
+      "kind": "chip",
+      "refersTo": "difficulty-badge",
+      "description": "A small brass chip showing the current bot difficulty tier.",
+      "html": "<span class=\"ds-badge\">STANDARD</span>",
+      "css": ".ds-badge{padding:2px 8px;background:#2a2410;color:#c9a35e;border-radius:10px;font:700 11px 'Martian Mono',ui-monospace,monospace;text-transform:uppercase;letter-spacing:.5px;}"
+    },
+    {
+      "name": "Advantage Gauge",
+      "kind": "custom",
+      "refersTo": "gauge",
+      "description": "The vertical evaluation rail on the board's right edge.",
+      "html": "<div class=\"ds-gauge\"><div class=\"ds-gauge-track\"><div class=\"ds-gauge-zero\"></div><div class=\"ds-gauge-needle\"></div></div></div>",
+      "css": ".ds-gauge{width:62px;padding:10px 7px;background:#15191a;border:1px solid #3a423f;border-radius:6px;display:grid;justify-items:center;}.ds-gauge-track{position:relative;width:12px;height:160px;border-radius:6px;border:1px solid #3a423f;background:linear-gradient(180deg,#a9531d,#1a1c1a 50%,#1d6f8c);}.ds-gauge-zero{position:absolute;left:-3px;right:-3px;top:50%;height:2px;background:#ece6da;opacity:.5;transform:translateY(-50%);}.ds-gauge-needle{position:absolute;left:-4px;right:-4px;height:3px;top:50%;border-radius:2px;background:#f2b65a;box-shadow:0 0 7px rgba(242,182,90,.75);transform:translateY(-50%);}"
+    },
+    {
+      "name": "Stone",
+      "kind": "custom",
+      "refersTo": "stone",
+      "description": "A flat hexagonal stone; the most recent move gets a phosphor halo.",
+      "html": "<svg class=\"ds-stone-svg\" viewBox=\"0 0 56 64\" width=\"56\" height=\"64\"><polygon class=\"ds-hex ds-hex-p1\" points=\"28,0 56,16 56,48 28,64 0,48 0,16\"/><polygon class=\"ds-hex ds-hex-last\" points=\"28,0 56,16 56,48 28,64 0,48 0,16\"/></svg>",
+      "css": ".ds-stone-svg{display:block;}.ds-hex-p1{fill:#f08a3c;}.ds-hex-last{fill:none;stroke:#f2b65a;stroke-width:2.4;animation:ds-halo 2.4s ease-in-out infinite;}@keyframes ds-halo{0%,100%{stroke-opacity:.35;}50%{stroke-opacity:.9;}}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Brass Astrolabe",
+    "overview": "HeXO Observatory is a dark instrument panel for reading a game. Its personality is precise, nocturnal, warm-brass, instrument-grade, and quietly confident. The interface recedes behind the board \u2014 the artifact being studied \u2014 and every control, label, and readout behaves like a calibrated part of a measuring instrument rather than a decorative web widget. The system is built on three voices: a serif display face for the wordmark and headings, a humanist sans for body and controls, and a monospace for labels, coordinates, and data. Brass is the single accent, used sparingly against near-black ink; phosphor is its brighter, hotter sibling reserved for hover, focus, and the live signal. A faint honeycomb watermark and recurring hexagonal geometry tie the whole surface back to the game itself.",
+    "keyCharacteristics": [
+      "Dark, near-black ink ground with warm off-white text.",
+      "One brass accent, used sparingly; phosphor for the live/hover/focus signal.",
+      "Serif display + humanist sans + monospace label trio.",
+      "Flat surfaces with tonal layering; shadows only for lifted overlays.",
+      "Hexagonal motif (honeycomb watermark, hex stones, hex clip-path markers).",
+      "Precise, deliberate controls with visible press and focus states."
+    ],
+    "rules": [
+      {
+        "name": "The One Voice Rule",
+        "body": "Brass is the only accent and is used on a small fraction of any screen. If a second accent starts competing with it, the instrument-panel calm is lost.",
+        "section": "colors"
+      },
+      {
+        "name": "The Three Voices Rule",
+        "body": "Serif speaks (wordmark, headings), sans explains (body, controls), mono measures (labels, coordinates, data). Never swap a role.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-By-Default Rule",
+        "body": "Surfaces are flat at rest. Shadows appear only as a response to elevation (modal, floating panel), never as decoration on resting cards.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep brass rare \u2014 one accent, used on a small fraction of any screen.",
+      "Do use the three-voice type system: serif for headings, sans for body, mono for labels and data.",
+      "Do keep surfaces flat at rest; reserve shadows for lifted overlays.",
+      "Do use the hexagon as the recurring signature (stones, markers, watermark).",
+      "Do give every interactive control a visible focus ring (2px phosphor) and a press-down state."
+    ],
+    "donts": [
+      "Don't introduce a second accent color that competes with brass.",
+      "Don't add bevels, gradients, or 3D treatment to stones \u2014 they are flat.",
+      "Don't use shadows as decoration on resting cards.",
+      "Don't swap the type roles (serif for data, mono for headings).",
+      "Don't use large decorative whitespace; the board is the hero."
+    ]
+  }
+}

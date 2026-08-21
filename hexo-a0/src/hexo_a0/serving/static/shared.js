@@ -29,6 +29,34 @@ function applyResponsiveHexSize() {
 window.addEventListener("resize", applyResponsiveHexSize);
 applyResponsiveHexSize();
 const URL_PREFIX = (window.__HEXO_CFG__ || {}).urlPrefix || "";
+const STRIX_MODELS = (() => {
+  const configured = (window.__HEXO_CFG__ || {}).models;
+  if (Array.isArray(configured) && configured.length) return configured;
+  return [{
+    id: (window.__HEXO_CFG__ || {}).defaultModelId || "default",
+    label: "Strix",
+    url: (window.__HEXO_CFG__ || {}).modelUrl,
+  }];
+})();
+const DEFAULT_MODEL_ID = (window.__HEXO_CFG__ || {}).defaultModelId || STRIX_MODELS[0].id;
+function strixModel(modelId) {
+  return STRIX_MODELS.find(model => model.id === modelId)
+    || STRIX_MODELS.find(model => model.id === DEFAULT_MODEL_ID)
+    || STRIX_MODELS[0];
+}
+function strixModelUrl(modelId) {
+  return strixModel(modelId)?.url || (window.__HEXO_CFG__ || {}).modelUrl;
+}
+function populateModelSelect(select, selectedId) {
+  if (!select) return;
+  select.replaceChildren(...STRIX_MODELS.map(model => {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.label;
+    option.selected = model.id === selectedId;
+    return option;
+  }));
+}
 function axialToPixel(q, r) {
   return { x: S * (SQ3 * q + SQ3/2 * r), y: S * (3/2 * r) };
 }
@@ -176,8 +204,14 @@ function encodeMovesCompact(moves) {
 }
 function decodeMovesCompact(s) {
   if (!s) return [];
+  // Some chat/email clients wrap long share URLs and encode the inserted space
+  // as %20. Whitespace is not data in our unpadded base64url alphabet, so remove
+  // it after URL-decoding rather than turning an otherwise valid replay blank.
+  let compact;
+  try { compact = decodeURIComponent(s).replace(/\s+/g, ""); }
+  catch (_e) { return []; }
   let bytes;
-  try { bytes = _bytesFromB64url(s); } catch (_e) { return []; }
+  try { bytes = _bytesFromB64url(compact); } catch (_e) { return []; }
   const ints = [];
   let i = 0;
   while (i < bytes.length) {

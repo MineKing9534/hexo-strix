@@ -181,14 +181,21 @@ impl KernelCtx {
     /// that leaf.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn isolated(&self) -> KernelCtx {
-        KernelCtx::new_wide(
-            &self.board.stones,
-            self.atk,
-            self.wl,
-            self.radius,
-            self.wide,
-        )
-        .expect("an existing kernel position must rebuild with the same rules")
+        // Clone the already-built board (one memcpy of the dense grid + stone
+        // list) instead of re-running `new_wide`, which would re-derive the
+        // bounding box, re-allocate the grid, and re-place every stone with a
+        // fresh Zobrist hash. The board is already at the leaf position, so the
+        // clone is an exact, cheaper copy; only the memo maps are reset.
+        KernelCtx {
+            board: self.board.clone(),
+            atk: self.atk,
+            dfn: self.dfn,
+            wl: self.wl,
+            radius: self.radius,
+            wide: self.wide,
+            comps: FxHashMap::default(),
+            gencache: FxHashMap::default(),
+        }
     }
 
     #[inline]

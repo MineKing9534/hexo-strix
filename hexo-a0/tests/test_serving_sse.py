@@ -152,7 +152,8 @@ def test_html_exposes_authoritative_rules_to_worker_client():
         assert b"hds-import" in ui
         assert b"analysis-forcing-depth-control" in ui
         assert b"analysis-display-options" in ui
-        assert b"DFPN" in ui and b"PDS-PN" in ui and b"PNS" in ui
+        assert b"PDS-PN" in ui
+        assert b"DFPN" not in ui and b"PNS" not in ui
         assert b"analysis-download-certificate-btn" in ui
         assert b"analysis-explore-certificate-btn" in ui
         assert b"proof-explorer" in ui

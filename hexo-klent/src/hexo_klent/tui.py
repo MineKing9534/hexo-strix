@@ -1384,6 +1384,25 @@ class TrainingDashboard:
         table.add_column(justify="right", style=_WHITE)
         table.add_column(style=_MUTED, ratio=1)
         table.add_column(justify="right", style=_WHITE)
+        critic_ce = latest.get("training/critic_ce")
+        critic_row = (
+            (
+                "CRITIC CE",
+                _number(critic_ce),
+                "Q MSE",
+                _number(latest.get("training/q_mse")),
+            )
+            if critic_ce is not None
+            else (
+                "Q LOSS",
+                _number(latest.get("training/q_loss")),
+                "REVERSE KL",
+                _number(
+                    latest.get("collection/mean_reverse_kl"),
+                    decimals=4,
+                ),
+            )
+        )
         rows = [
             (
                 "POLICY LOSS",
@@ -1394,12 +1413,7 @@ class TrainingDashboard:
                     decimals=4,
                 ),
             ),
-            (
-                "Q LOSS",
-                _number(latest.get("training/q_loss")),
-                "REVERSE KL",
-                _number(latest.get("collection/mean_reverse_kl"), decimals=4),
-            ),
+            critic_row,
             (
                 "FROZEN KL B / A",
                 (
@@ -2025,6 +2039,14 @@ class TrainingDashboard:
                 ),
             ),
         ]
+        critic_ce = latest.get("training/critic_ce")
+        if critic_ce is not None:
+            rows[1] = (
+                "CRITIC CE",
+                _number(critic_ce),
+                "Q MSE",
+                _number(latest.get("training/q_mse")),
+            )
         if latest.get("collection/played_q_outcome_mse") is not None:
             rows[3] = (
                 "MC Q MSE A / O",

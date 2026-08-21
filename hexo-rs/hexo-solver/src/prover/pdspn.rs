@@ -39,6 +39,8 @@
 
 use super::io::Position;
 use super::{Ctl, DriverResult, ProverConfig, dfpn};
+use crate::forcing::WinDepthHints;
+use std::rc::Rc;
 
 pub fn solve(pos: &Position, cfg: &ProverConfig, ctl: &Ctl) -> DriverResult {
     dfpn::solve_mode(pos, cfg, ctl, true)
@@ -50,4 +52,18 @@ pub fn solve(pos: &Position, cfg: &ProverConfig, ctl: &Ctl) -> DriverResult {
 /// fact so it can never be mistaken for an unbounded refutation.
 pub(crate) fn solve_bounded(pos: &Position, cfg: &ProverConfig, ctl: &Ctl) -> DriverResult {
     dfpn::solve_mode_bounded(pos, cfg, ctl, true)
+}
+
+/// Certificate-guided depth-bounded PDS-PN: the same truncated search as
+/// [`solve_bounded`], but every node the certificate already resolved at the
+/// probe's horizon is closed by its win-depth hint instead of being re-expanded.
+/// The search therefore only re-proves the certificate's critical nodes — the
+/// ones whose certified depth exceeds the probe's remaining-turn budget.
+pub(crate) fn solve_bounded_guided(
+    pos: &Position,
+    cfg: &ProverConfig,
+    ctl: &Ctl,
+    hints: Rc<WinDepthHints>,
+) -> DriverResult {
+    dfpn::solve_mode_at_guided(pos, cfg, ctl, true, Some(cfg.depth_cap), Some(hints))
 }

@@ -18,11 +18,14 @@ interface AppActions {
     convertHds(): void;
     analysisInputChanged(): void;
     editAnalysisSource(): void;
+    copyAnalysisHtttx(): void;
     cancelAnalysisSourceEdit(): void;
     saveAutomaticAnalysis(): void;
     saveAutomaticForcing(): void;
     saveDisplayPreferences(): void;
+    savePositionNumbering(): void;
     updateForcingSolverUi(): void;
+    updateForcingEffortUi(): void;
     solveCurrentForcing(): void;
     cancelForcingSolve(): void;
     openProofExplorer(): void;
@@ -30,6 +33,8 @@ interface AppActions {
     downloadForcingCertificate(): void;
     loadGame(): void;
     saveAnalysisStrength(): void;
+    selectAnalysisModel(): void;
+    selectPlayModel(): void;
     analyzeCurrentPosition(): void;
     analyzeWholeGame(): void;
     rerenderCurrentAnalysis(): void;
@@ -48,6 +53,7 @@ interface AppActions {
     proofFitBoard(): void;
     closeProofExplorer(): void;
     proofZoom(factor: number): void;
+    proofSetShowLine(visible: boolean): void;
     selectSide(side: Side): void;
     startGame(): void;
 }
@@ -143,7 +149,10 @@ const analysisControls = (): TemplateResult => html`
     <div id="analysis-controls-body" role="tabpanel" aria-labelledby="analysis-mode-analysis">
       <div id="analysis-source-summary" hidden>
         <span><strong id="analysis-source-title">Loaded game</strong><small id="analysis-source-meta"></small></span>
-        <button type="button" class="secondary-button" @click=${() => invoke("editAnalysisSource")}>Change</button>
+        <span class="analysis-source-actions">
+          <button id="analysis-copy-htttx" type="button" class="secondary-button" @click=${() => invoke("copyAnalysisHtttx")}>Copy as HTTTX</button>
+          <button type="button" class="secondary-button" @click=${() => invoke("editAnalysisSource")}>Change</button>
+        </span>
       </div>
       <div id="analysis-setup">
         <button id="hds-import-trigger" type="button" @click=${() => invoke("openHdsImport")}>
@@ -176,6 +185,11 @@ const analysisControls = (): TemplateResult => html`
         <div class="analysis-settings-body">
           <section class="analysis-settings-section" aria-labelledby="analysis-search-settings-title">
             <h3 id="analysis-search-settings-title">Analysis</h3>
+            <label id="analysis-model-field" class="analysis-strength-field" for="analysis-model" hidden>
+              <span class="field-label">Strix version</span>
+              <span class="field-hint">Choose which trained model evaluates this position.</span>
+              <select id="analysis-model" @change=${() => invoke("selectAnalysisModel")}></select>
+            </label>
             <label class="analysis-strength-field" for="analysis-strength">
               <span class="field-label">Analysis effort</span>
               <span id="analysis-strength-hint" class="field-hint">Higher settings examine more possible continuations and take longer. Instant gives an estimate without searching ahead.</span>
@@ -205,6 +219,17 @@ const analysisControls = (): TemplateResult => html`
               <label><input type="checkbox" id="analysis-forcing" checked @change=${() => invoke("saveDisplayPreferences")}> Winning lines</label>
               <label><input type="checkbox" id="analysis-threats" @change=${() => invoke("saveDisplayPreferences")}> Threats to answer</label>
             </div>
+          </section>
+          <section class="analysis-settings-section" aria-labelledby="analysis-numbering-settings-title">
+            <h3 id="analysis-numbering-settings-title">Position numbering</h3>
+            <label class="analysis-strength-field" for="analysis-numbering">
+              <span class="field-label">Numbering</span>
+              <span class="field-hint">Number each placement, or group each full round of both players.</span>
+              <select id="analysis-numbering" @change=${() => invoke("savePositionNumbering")}>
+                <option value="ply" selected>Ply (1, 2, 3…)</option>
+                <option value="round">Round (1, 1, 1, 2…)</option>
+              </select>
+            </label>
           </section>
         </div>
       </details>
@@ -254,13 +279,11 @@ const forcingControls = (): TemplateResult => html`
     <section class="proof-lab-settings" aria-labelledby="proof-search-settings-title">
       <h3 id="proof-search-settings-title">Search settings</h3>
       <label for="analysis-forcing-engine">Search method
-        <span id="analysis-forcing-engine-hint" class="field-hint">PDS-PN saves every checked reply, so you can explore, share, or download the result.</span>
+        <span id="analysis-forcing-engine-hint" class="field-hint">The default first proves a win, then rules out every shorter win. It saves all checked replies and the best-defence line.</span>
         <select id="analysis-forcing-engine" aria-describedby="analysis-forcing-engine-hint" @change=${() => invoke("updateForcingSolverUi")}>
-          <option value="pdspn">Explore every reply · PDS-PN</option>
-          <option value="idtt" selected>Find the shortest win · IDTT</option>
-          <option value="dfpn">Find any win · DFPN</option>
-          <option value="pdspn-shortest">Confirm the shortest win · PDS-PN</option>
-          <option value="pns">Second yes-or-no check · PNS</option>
+          <option value="pdspn-shortest" selected>Prove the shortest win · PDS-PN</option>
+          <option value="pdspn">Find and explore a win · PDS-PN</option>
+          <option value="idtt">Bounded shortest check · IDTT</option>
         </select>
       </label>
       <label for="analysis-forcing-width">Moves to consider
@@ -270,29 +293,14 @@ const forcingControls = (): TemplateResult => html`
         </select>
       </label>
       <label id="analysis-forcing-depth-row" for="analysis-forcing-depth">
-        <span id="analysis-forcing-depth-label">Maximum turns by the winning side</span>
-        <span class="analysis-depth-input"><input id="analysis-forcing-depth" type="number" min="1" max="60" value="12" step="1" inputmode="numeric"> turns</span>
+        <span id="analysis-forcing-depth-label">Longest win to check</span>
+        <span class="analysis-depth-input"><input id="analysis-forcing-depth" type="number" min="1" max="60" value="25" step="1" inputmode="numeric"> turns</span>
       </label>
-      <label for="analysis-forcing-budget"><span id="analysis-forcing-budget-label">Search effort</span>
-        <select id="analysis-forcing-budget">
-          <option value="20000">Quick · 20,000 steps</option>
-          <option value="250000" selected>Standard · 250,000 steps</option>
-          <option value="1000000">Thorough · 1 million steps</option>
-          <option value="5000000">Deep · 5 million steps</option>
-          <option value="25000000">Extended · 25 million steps</option>
-          <option value="100000000">Very long · 100 million steps</option>
-        </select>
-      </label>
-      <label id="analysis-forcing-leaf-row" for="analysis-forcing-leaf-budget" hidden>
-        <span>Extra search for each branch</span>
-        <select id="analysis-forcing-leaf-budget">
-          <option value="1000">Light · 1,000 steps</option>
-          <option value="2000" selected>Balanced · 2,000 steps</option>
-          <option value="5000">Thorough · 5,000 steps</option>
-          <option value="10000">Deep · 10,000 steps</option>
-          <option value="25000">Extended · 25,000 steps</option>
-          <option value="50000">Very deep · 50,000 steps</option>
-        </select>
+      <label id="analysis-forcing-effort-row" for="analysis-forcing-effort">
+        <span class="proof-effort-heading"><span>Search effort</span><output id="analysis-forcing-effort-label" for="analysis-forcing-effort">Standard</output></span>
+        <input id="analysis-forcing-effort" type="range" min="0" max="5" value="1" step="1"
+          aria-describedby="analysis-forcing-effort-hint" @input=${() => invoke("updateForcingEffortUi")}>
+        <span id="analysis-forcing-effort-hint" class="field-hint">Good default for most positions.</span>
       </label>
     </section>
     <div class="analysis-solver-actions">
@@ -307,8 +315,8 @@ const forcingControls = (): TemplateResult => html`
     <details class="analysis-advanced proof-lab-help">
       <summary>How the search works</summary>
       <div class="proof-lab-help-body">
-        <p id="analysis-solver-help">This method finds the shortest win, up to the maximum number of turns you set. It counts only turns taken by the side trying to win.</p>
-        <p>Search effort limits the number of calculations, not the number of seconds. Broad search considers every legal move. Direct-only search considers moves that create an immediate threat. Broad search is more complete but may take longer.</p>
+        <p id="analysis-solver-help">First finds and verifies a forced win. Then reuses that proof to rule out every shorter win. The saved best-defence line shows the replies that delay the win longest.</p>
+        <p>Search effort controls how long the solver may keep trying. PDS-PN automatically races several complementary branch strategies. Broad search considers every legal move; direct-only search is faster but considers only immediate threats.</p>
       </div>
     </details>
   </div>
@@ -371,10 +379,17 @@ const proofExplorer = (): TemplateResult => html`
         <button id="proof-close-btn" class="proof-close" @click=${() => invoke("closeProofExplorer")}
           aria-label="Close proof explorer">Close</button>
       </div>
-      <div class="proof-board-tools" aria-label="Board zoom controls">
-        <button @click=${() => invoke("proofZoom", 1.25)} aria-label="Zoom in">+</button>
-        <button @click=${() => invoke("proofZoom", 0.8)} aria-label="Zoom out">−</button>
-        <button @click=${() => invoke("proofFitBoard")}>Fit</button>
+      <div class="proof-board-tools" aria-label="Proof board tools">
+        <label class="proof-board-toggle" for="proof-show-line">
+          <input id="proof-show-line" type="checkbox"
+            @change=${(event: Event) => invoke("proofSetShowLine", (event.target as HTMLInputElement).checked)}>
+          <span>Show winning line</span>
+        </label>
+        <div class="proof-board-zoom" aria-label="Board zoom controls">
+          <button @click=${() => invoke("proofZoom", 1.25)} aria-label="Zoom in">+</button>
+          <button @click=${() => invoke("proofZoom", 0.8)} aria-label="Zoom out">−</button>
+          <button @click=${() => invoke("proofFitBoard")}>Fit</button>
+        </div>
       </div>
       <div class="proof-board-legend">
         <span><i id="proof-attacker-swatch" class="proof-sw"></i><span id="proof-attacker-legend">winning side</span></span>
@@ -415,6 +430,11 @@ const newGameDialog = (): TemplateResult => html`
   <div id="modal-bg">
     <div id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <h2 id="modal-title">New game</h2>
+      <label id="play-model-field" for="play-model" hidden>
+        <span class="field-label">Opponent</span>
+        <span class="field-optional">Choose a Strix version</span>
+        <select id="play-model" @change=${() => invoke("selectPlayModel")}></select>
+      </label>
       <div id="bot-stats">
         <div id="bot-stats-current">Loading the bot's record…</div>
         <div id="bot-stats-alltime"></div>

@@ -151,20 +151,207 @@ impl InferModel {
         (rep, d)
     }
 
+    /// The axis-relational representation (KLENT lean schema): per-layer
+    /// `AxisRelationalConv` with 3 tied axis branches (scatter-add into
+    /// (N,3,H) buckets, symmetric SUM) + an untied global "star" branch
+    /// (dummy node ↔ all real nodes), then `node_update` + residual.
+    ///
+    /// Mirrors `hexo-a0/src/hexo_a0/axis_conv.py` (`separate_global_star=True`):
+    ///   dist_table = axis_lin(dist_embed)                       (window, H)
+    ///   messages   = relu(normed[src] + dist_table[edge_dist-1])
+    ///   buckets[dst, edge_type] += messages                     (N, 3, H)
+    ///   axis_inputs = (1+axis_eps)*normed + buckets[:, :3]
+    ///   axis_hidden = relu(axis_nn0(axis_inputs.reshape(N*3, H)))
+    ///   agg = axis_nn2(axis_hidden.view(N,3,H).sum(1)) + 3*axis_nn2_bias
+    ///   global_edge = global_lin(global_edge_embed)
+    ///   global_bucket[real] = relu(normed[dummy] + global_edge)   (index_copy_)
+    ///   global_bucket[dummy] += relu(normed[real] + global_edge)  (index_add_)
+    ///   agg += global_nn2(relu(global_nn0((1+global_eps)*normed + global_bucket)))
+    ///   x = relu(node_update2(relu(node_update0(cat([normed, agg])))) + x)
+    fn representation_relational(&self, g: &AxisGraphData) -> (Vec<f32>, usize) {
+        let w = &self.weights;
+        let cfg = &w.config;
+        let h = cfg.hidden_dim;
+        let n = g.num_nodes;
+        let e = g.edge_src.len();
+        const NUM_AXES: usize = 3;
+        let window = cfg.axis_window;
+        debug_assert_eq!(g.features.len(), n * cfg.node_dim, "node feature stride");
+        debug_assert_eq!(g.edge_type.len(), e, "edge_type stride");
+        debug_assert_eq!(g.edge_dist.len(), e, "edge_dist stride");
+
+        let mut x = Vec::new();
+        ops::linear(&g.features, n, &w.input_proj_w, &w.input_proj_b, cfg.node_dim, h, &mut x);
+
+        let mut hs: Vec<Vec<f32>> = Vec::with_capacity(cfg.num_layers);
+        let mut normed = Vec::new();
+        for layer in &w.rel_layers {
+            ops::layer_norm(&x, n, h, &layer.norm_w, &layer.norm_b, &mut normed);
+
+            // dist_table = axis_lin(dist_embed)  (window, H)
+            let mut dist_table = Vec::new();
+            ops::linear(&layer.dist_embed, window, &layer.axis_lin_w, &layer.axis_lin_b, h, h, &mut dist_table);
+
+            // messages = relu(normed[src] + dist_table[edge_dist-1]); scatter-add
+            // into buckets[dst*3 + edge_type].
+            let mut buckets = vec![0.0f32; n * NUM_AXES * h];
+            for k in 0..e {
+                let s = g.edge_src[k] as usize;
+                let d = g.edge_dst[k] as usize;
+                let t = g.edge_type[k] as usize;
+                let row = g.edge_dist[k] as usize - 1;
+                let nb = &normed[s * h..(s + 1) * h];
+                let dt = &dist_table[row * h..(row + 1) * h];
+                let bucket = &mut buckets[(d * NUM_AXES + t) * h..(d * NUM_AXES + t + 1) * h];
+                for j in 0..h {
+                    let m = nb[j] + dt[j];
+                    if m > 0.0 {
+                        bucket[j] += m;
+                    }
+                }
+            }
+
+            // axis_inputs = (1+eps)*normed + buckets[:, :3]
+            // axis_hidden = relu(axis_nn0(axis_inputs.reshape(N*3, H)))
+            // axis_hidden_sum = axis_hidden.view(N,3,H).sum(dim=1)
+            // agg = axis_nn2(axis_hidden_sum) + 3*axis_nn2_bias
+            let scale = 1.0 + layer.axis_eps;
+            let mut axis_inputs = vec![0.0f32; n * NUM_AXES * h];
+            for i in 0..n {
+                for a in 0..NUM_AXES {
+                    for j in 0..h {
+                        axis_inputs[(i * NUM_AXES + a) * h + j] =
+                            scale * normed[i * h + j] + buckets[(i * NUM_AXES + a) * h + j];
+                    }
+                }
+            }
+            let mut axis_hidden = Vec::new();
+            ops::linear(&axis_inputs, n * NUM_AXES, &layer.axis_nn0_w, &layer.axis_nn0_b, h, h, &mut axis_hidden);
+            ops::relu_inplace(&mut axis_hidden);
+            let mut axis_hidden_sum = vec![0.0f32; n * h];
+            for i in 0..n {
+                for a in 0..NUM_AXES {
+                    for j in 0..h {
+                        axis_hidden_sum[i * h + j] += axis_hidden[(i * NUM_AXES + a) * h + j];
+                    }
+                }
+            }
+            let mut agg = Vec::new();
+            ops::linear(&axis_hidden_sum, n, &layer.axis_nn2_w, &layer.axis_nn2_b, h, h, &mut agg);
+            // F.linear(..., bias * num_axes): `linear` already added 1×bias, so add
+            // the remaining (num_axes-1)×.
+            for i in 0..n {
+                for j in 0..h {
+                    agg[i * h + j] += (NUM_AXES as f32 - 1.0) * layer.axis_nn2_b[j];
+                }
+            }
+
+            // Global star branch: dummy node ↔ all real nodes.
+            // global_edge = global_lin(global_edge_embed)  (H,)
+            let mut global_edge = Vec::new();
+            ops::linear(&layer.global_edge_embed, 1, &layer.global_lin_w, &layer.global_lin_b, h, h, &mut global_edge);
+
+            let dummy = n - 1;
+            let ng = g.global_edge_src.len();
+            let mut global_bucket = vec![0.0f32; n * h];
+            // dummy -> real (even indices): assign relu(normed[dummy] + global_edge)
+            for k in (0..ng).step_by(2) {
+                let real = g.global_edge_dst[k] as usize;
+                let nb = &normed[dummy * h..(dummy + 1) * h];
+                let gb = &mut global_bucket[real * h..(real + 1) * h];
+                for j in 0..h {
+                    let m = nb[j] + global_edge[j];
+                    gb[j] = if m > 0.0 { m } else { 0.0 };
+                }
+            }
+            // real -> dummy (odd indices): accumulate relu(normed[real] + global_edge)
+            for k in (1..ng).step_by(2) {
+                let real = g.global_edge_src[k] as usize;
+                let nb = &normed[real * h..(real + 1) * h];
+                let gb = &mut global_bucket[dummy * h..(dummy + 1) * h];
+                for j in 0..h {
+                    let m = nb[j] + global_edge[j];
+                    if m > 0.0 {
+                        gb[j] += m;
+                    }
+                }
+            }
+
+            // global_inputs = (1+global_eps)*normed + global_bucket
+            // agg += global_nn2(relu(global_nn0(global_inputs)))
+            let gscale = 1.0 + layer.global_eps;
+            let mut global_inputs = vec![0.0f32; n * h];
+            for i in 0..n {
+                for j in 0..h {
+                    global_inputs[i * h + j] = gscale * normed[i * h + j] + global_bucket[i * h + j];
+                }
+            }
+            let mut g1 = Vec::new();
+            ops::linear(&global_inputs, n, &layer.global_nn0_w, &layer.global_nn0_b, h, h, &mut g1);
+            ops::relu_inplace(&mut g1);
+            let mut g2 = Vec::new();
+            ops::linear(&g1, n, &layer.global_nn2_w, &layer.global_nn2_b, h, h, &mut g2);
+            for i in 0..n * h {
+                agg[i] += g2[i];
+            }
+
+            // conv_out = node_update2(relu(node_update0(cat([normed, agg]))))
+            let mut cat = vec![0.0f32; n * 2 * h];
+            for i in 0..n {
+                cat[i * 2 * h..i * 2 * h + h].copy_from_slice(&normed[i * h..(i + 1) * h]);
+                cat[i * 2 * h + h..(i + 1) * 2 * h].copy_from_slice(&agg[i * h..(i + 1) * h]);
+            }
+            let mut nu1 = Vec::new();
+            ops::linear(&cat, n, &layer.node_update0_w, &layer.node_update0_b, 2 * h, h, &mut nu1);
+            ops::relu_inplace(&mut nu1);
+            let mut nu2 = Vec::new();
+            ops::linear(&nu1, n, &layer.node_update2_w, &layer.node_update2_b, h, h, &mut nu2);
+
+            // x = relu(nu2 + x)
+            for i in 0..n * h {
+                x[i] = (nu2[i] + x[i]).max(0.0);
+            }
+            if cfg.use_jk_cat {
+                hs.push(x.clone());
+            }
+        }
+
+        // Representation: JK-cat of final_norm(h_i) in layer order, or final_norm(x).
+        let d = if cfg.use_jk_cat { cfg.num_layers * h } else { h };
+        let mut rep = vec![0.0f32; n * d];
+        if cfg.use_jk_cat {
+            for (li, hi) in hs.iter().enumerate() {
+                ops::layer_norm(hi, n, h, &w.final_norm_w, &w.final_norm_b, &mut normed);
+                for node in 0..n {
+                    rep[node * d + li * h..node * d + (li + 1) * h]
+                        .copy_from_slice(&normed[node * h..(node + 1) * h]);
+                }
+            }
+        } else {
+            ops::layer_norm(&x, n, h, &w.final_norm_w, &w.final_norm_b, &mut rep);
+        }
+
+        (rep, d)
+    }
+
     /// Forward pass: (logits in legal_moves() order, value in [-1,1] from to_move's view).
     pub fn forward(&self, g: &AxisGraphData) -> (Vec<f32>, f32) {
         let w = &self.weights;
         let cfg = &w.config;
         let n = g.num_nodes;
-        let e = g.edge_src.len();
-        let (rep, d) = self.representation(
-            n,
-            e,
-            &g.features,
-            &g.edge_attr,
-            |k| g.edge_src[k] as usize,
-            |k| g.edge_dst[k] as usize,
-        );
+        let (rep, d) = if cfg.axis_relational {
+            self.representation_relational(g)
+        } else {
+            let e = g.edge_src.len();
+            self.representation(
+                n,
+                e,
+                &g.features,
+                &g.edge_attr,
+                |k| g.edge_src[k] as usize,
+                |k| g.edge_dst[k] as usize,
+            )
+        };
 
         // Policy head: gather legal rows (graph order == legal_moves() order), MLP -> 1.
         let legal_rows: Vec<usize> = (0..n).filter(|&i| g.legal_mask[i]).collect();
@@ -179,29 +366,59 @@ impl InferModel {
         let mut logits = Vec::new();
         ops::linear(&p1, nl, &w.policy2_w, &w.policy2_b, cfg.policy_hidden, 1, &mut logits);
 
-        // Value head: mean-pool rep over STONE nodes; zero stones -> zeros (matches
-        // _forward_batch_core's scatter_add + clamp(min=1), NOT mean-over-all).
-        let mut pooled = vec![0.0f32; d];
-        let n_stones = g.stone_mask.iter().filter(|&&b| b).count();
-        if n_stones > 0 {
-            for node in 0..n {
-                if g.stone_mask[node] {
-                    for j in 0..d {
-                        pooled[j] += rep[node * d + j];
-                    }
+        // Value: KLENT Q-head (per-legal-node MLP -> Q, then
+        // V = Σ_a softmax(logits)_a · Q_a) or the standard mean-pooled value head.
+        // Discriminator is axis_relational (KLENT), not q_hidden (defaults to 64).
+        let value = if cfg.axis_relational {
+            let mut q1 = Vec::new();
+            ops::linear(&legal_rep, nl, &w.q0_w, &w.q0_b, d, cfg.q_hidden, &mut q1);
+            ops::relu_inplace(&mut q1);
+            let mut q2 = Vec::new();
+            ops::linear(&q1, nl, &w.q2_w, &w.q2_b, cfg.q_hidden, 1, &mut q2);
+            // softmax(logits) over legal actions, then V = Σ softmax·tanh(Q).
+            let mut max_logit = f32::NEG_INFINITY;
+            for &l in &logits {
+                if l > max_logit {
+                    max_logit = l;
                 }
             }
-            let inv = 1.0 / n_stones as f32;
-            for v in pooled.iter_mut() {
-                *v *= inv;
+            let mut sum_exp = 0.0f32;
+            let mut exps = vec![0.0f32; nl];
+            for (i, &l) in logits.iter().enumerate() {
+                let e = (l - max_logit).exp();
+                exps[i] = e;
+                sum_exp += e;
             }
-        }
-        let mut v1 = Vec::new();
-        ops::linear(&pooled, 1, &w.value0_w, &w.value0_b, d, cfg.value_hidden, &mut v1);
-        ops::relu_inplace(&mut v1);
-        let mut v2 = Vec::new();
-        ops::linear(&v1, 1, &w.value2_w, &w.value2_b, cfg.value_hidden, 1, &mut v2);
-        let value = v2[0].tanh();
+            let mut v = 0.0f32;
+            for i in 0..nl {
+                v += (exps[i] / sum_exp) * q2[i].tanh();
+            }
+            v
+        } else {
+            // Value head: mean-pool rep over STONE nodes; zero stones -> zeros (matches
+            // _forward_batch_core's scatter_add + clamp(min=1), NOT mean-over-all).
+            let mut pooled = vec![0.0f32; d];
+            let n_stones = g.stone_mask.iter().filter(|&&b| b).count();
+            if n_stones > 0 {
+                for node in 0..n {
+                    if g.stone_mask[node] {
+                        for j in 0..d {
+                            pooled[j] += rep[node * d + j];
+                        }
+                    }
+                }
+                let inv = 1.0 / n_stones as f32;
+                for v in pooled.iter_mut() {
+                    *v *= inv;
+                }
+            }
+            let mut v1 = Vec::new();
+            ops::linear(&pooled, 1, &w.value0_w, &w.value0_b, d, cfg.value_hidden, &mut v1);
+            ops::relu_inplace(&mut v1);
+            let mut v2 = Vec::new();
+            ops::linear(&v1, 1, &w.value2_w, &w.value2_b, cfg.value_hidden, 1, &mut v2);
+            v2[0].tanh()
+        };
 
         (logits, value)
     }

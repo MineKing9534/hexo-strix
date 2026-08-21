@@ -233,7 +233,7 @@ def run_head_to_head(
     sprt_s1: float = 0.55,
     sprt_alpha: float = 0.01,
     sprt_beta: float = 0.05,
-    window_size: int | None = 400,
+    window_size: int | None = None,
     pair_variance: float = 0.5,
     max_games: int = 1000,
     seed: int | None = None,

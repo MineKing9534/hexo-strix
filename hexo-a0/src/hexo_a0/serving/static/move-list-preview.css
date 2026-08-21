@@ -1,0 +1,10 @@
+@font-face{font-family:"Instrument Serif";font-style:normal;font-weight:400;font-display:swap;src:url("fonts/instrument-serif.woff2") format("woff2")}
+@font-face{font-family:"Hanken Grotesk";font-style:normal;font-weight:400 700;font-display:swap;src:url("fonts/hanken-grotesk.woff2") format("woff2")}
+@font-face{font-family:"Martian Mono";font-style:normal;font-weight:300 600;font-display:swap;src:url("fonts/martian-mono.woff2") format("woff2")}
+  :root{--ink:#0d0f0e;--panel:#15191a;--panel-2:#1b201f;--control:#111514;--control-hover:#20251f;
+    --line:#2a302e;--text:#ece6da;--muted:#8b8f88;--faint:#5f635d;--brass:#c9a35e;--phos:#f2b65a;
+    --mono:"Martian Mono",ui-monospace,monospace;color-scheme:dark;}
+  *{box-sizing:border-box} body{margin:0;min-height:100vh;padding:24px;background:var(--ink);color:var(--text);
+    font-family:"Hanken Grotesk",system-ui,sans-serif} main{width:min(430px,100%);margin:0 auto} h1{margin:0 0 6px;font:400 24px/1.2 "Instrument Serif",serif}
+  p{margin:0 0 16px;color:var(--muted);font-size:13px;line-height:1.45} .frame{padding:10px;border:1px solid var(--line);
+    border-radius:6px;background:var(--panel)} .note{margin-top:12px;font:14px/1.45 "Hanken Grotesk",system-ui,sans-serif;color:var(--muted)}

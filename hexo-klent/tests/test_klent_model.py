@@ -18,15 +18,19 @@ from hexo_klent.hex_axial_cnn import (
     _three_way_softmax,
 )
 from hexo_klent.model import (
+    BatchOutput,
     DenseAxisKlentNet,
     HexAxialCNNKlentNet,
     HexD6DilatedCNNKlentNet,
     HexDilatedCNNKlentNet,
     KlentNet,
     PersistentRayKlentNet,
+    acting_q_values,
+    categorical_q,
     compile_klent_forward,
     improved_policy,
     load_dense_klent_graft,
+    load_production_graph_weights,
     load_production_axis_weights,
     make_klent_net,
     convert_hex_dilated_to_d6,
@@ -101,6 +105,100 @@ def test_zero_initialized_heads_produce_uniform_policy_and_zero_q():
         torch.testing.assert_close(
             torch.softmax(logits, dim=0), torch.full((6,), 1 / 6)
         )
+
+
+def test_categorical_critic_composes_q_mass_and_acting_scores():
+    config = KlentModelConfig(
+        **dataclasses.asdict(tiny_model_config()),
+        critic="categorical",
+    )
+    model = KlentNet(config)
+    game_config = hexo_rs.GameConfig(2, 1, 4)
+    states = [hexo_rs.GameState(game_config) for _ in range(2)]
+    graphs = graph_batch_fn_from_model_config(config)(states)
+
+    output = model.forward_batch(Batch.from_data_list(graphs))
+
+    assert output.critic_logits is not None
+    assert output.q_mass is not None
+    assert output.critic_logits.shape == (12, 3)
+    torch.testing.assert_close(output.q_values, torch.zeros(12))
+    torch.testing.assert_close(output.q_mass, torch.full((12,), 2 / 3))
+    torch.testing.assert_close(
+        acting_q_values(output, mass_floor=0.2),
+        torch.zeros(12),
+    )
+
+
+def test_acting_q_normalizes_by_maximum_mass_per_position():
+    output = BatchOutput(
+        policy_logits=torch.zeros(4),
+        q_values=torch.tensor([0.1, -0.2, 0.3, -0.4]),
+        legal_counts=torch.tensor([2, 2]),
+        q_mass=torch.tensor([0.1, 0.4, 0.1, 0.8]),
+    )
+
+    actual = acting_q_values(output, mass_floor=0.2)
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([0.25, -0.5, 0.375, -0.5]),
+    )
+
+
+def test_categorical_q_uses_positive_negative_and_zero_probabilities():
+    logits = torch.tensor([[1.0, -1.0, 0.5], [-0.2, 0.7, -0.4]])
+    probabilities = logits.softmax(dim=-1)
+
+    q_values, mass = categorical_q(logits)
+
+    torch.testing.assert_close(
+        q_values,
+        probabilities[:, 0] - probabilities[:, 1],
+    )
+    torch.testing.assert_close(
+        mass,
+        probabilities[:, 0] + probabilities[:, 1],
+    )
+
+
+def test_scalar_graph_checkpoint_maps_to_trainable_categorical_head():
+    source_config = KlentModelConfig(
+        **dataclasses.asdict(tiny_model_config()),
+        critic="scalar",
+    )
+    target_config = dataclasses.replace(
+        source_config,
+        critic="categorical",
+    )
+    source = KlentNet(source_config)
+    with torch.no_grad():
+        source.q_head.mlp[2].weight.normal_(mean=0.0, std=0.2)
+        source.q_head.mlp[2].bias.fill_(0.15)
+    target = KlentNet(target_config)
+
+    copied = load_production_graph_weights(
+        target,
+        {"model_state_dict": source.state_dict()},
+    )
+
+    assert set(copied) == set(target.state_dict())
+    old_weight = source.q_head.mlp[2].weight
+    old_bias = source.q_head.mlp[2].bias
+    torch.testing.assert_close(target.q_head.mlp[2].weight[0], old_weight[0])
+    torch.testing.assert_close(target.q_head.mlp[2].weight[1], -old_weight[0])
+    torch.testing.assert_close(
+        target.q_head.mlp[2].weight[2],
+        torch.zeros_like(old_weight[0]),
+    )
+    torch.testing.assert_close(
+        target.q_head.mlp[2].bias[:2],
+        torch.cat((old_bias, -old_bias)),
+    )
+    torch.testing.assert_close(
+        target.q_head.mlp[2].bias[2:],
+        torch.zeros_like(old_bias),
+    )
 
 
 def test_hex_axial_cnn_forward_backward_uses_raster_batches():

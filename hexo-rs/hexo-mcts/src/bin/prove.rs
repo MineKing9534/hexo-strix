@@ -11,7 +11,7 @@
 //!                                                   (default: hybrid if --lines, else dfpn)
 //!       [--width tight|wide]                     (default tight)
 //!       [--depth-cap 40] [--node-budget 20000000]
-//!       [--tt-mb 512] [--pn2-nodes 50000]
+//!       [--tt-mb 512] [--pn2-nodes 50000] [--pn2-scale 0]
 //!       [--leaf-budget 1000000] [--leaf-budget-max 10000000]
 //!       [--root-screen-budget 0] [--root-screen-per-attack 5000]
 //!       [--time-limit 1800]                      (seconds, wall clock; 0 = none)
@@ -41,7 +41,7 @@ struct Args {
 fn usage() -> &'static str {
     "usage: prove --position pos.json [--lines a.json ...] [--driver idtt|dfpn|pdspn|pdspn-depth|pdspn-shortest|hybrid|race] \
      [--width tight|wide] [--depth-cap N] [--node-budget N] [--tt-mb N] [--pn2-nodes N] \
-     [--leaf-budget N] [--leaf-budget-max N] [--root-screen-budget N] \
+     [--pn2-scale N] [--leaf-budget N] [--leaf-budget-max N] [--root-screen-budget N] \
      [--root-screen-per-attack N] [--time-limit SECS] [--race-set d,d,...] \
      [--guide-certificate pdspn-report-or-certificate.json] \
      [--out report.json]\n       prove --verify-certificate proof-bundle.json [--position position.json]"
@@ -97,6 +97,8 @@ fn parse_args() -> Result<Args, String> {
             "--node-budget" => a.cfg.node_budget = parse_num(&next(&mut i, &argv, "--node-budget")?)?,
             "--tt-mb" => a.cfg.tt_mb = parse_num(&next(&mut i, &argv, "--tt-mb")?)? as usize,
             "--pn2-nodes" => a.cfg.pn2_nodes = parse_num(&next(&mut i, &argv, "--pn2-nodes")?)?,
+            "--pn2-scale" => a.cfg.pn2_scale = parse_num(&next(&mut i, &argv, "--pn2-scale")?)?,
+            "--pn2-scale-inverse" => a.cfg.pn2_scale_inverse = true,
             "--leaf-budget" => a.cfg.leaf_budget = parse_num(&next(&mut i, &argv, "--leaf-budget")?)?,
             "--leaf-budget-max" => {
                 a.cfg.leaf_budget_max = parse_num(&next(&mut i, &argv, "--leaf-budget-max")?)?

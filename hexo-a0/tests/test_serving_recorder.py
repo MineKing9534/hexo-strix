@@ -319,6 +319,7 @@ def test_active_game_roundtrip(tmp_path):
     row = rows[0]
     assert row["game_id"] == "g1"
     assert row["human_side"] == "P2" and row["bot_side"] == "P1"
+    assert row["model_id"] == "default"
     assert row["win_length"] == 6 and row["placement_radius"] == 8
     assert json.loads(row["moves_json"]) == [[0, 0, "P1"], [1, 0, "P2"]]
     r.delete_active("g1")

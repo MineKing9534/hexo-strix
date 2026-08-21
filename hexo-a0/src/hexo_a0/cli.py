@@ -303,11 +303,15 @@ def main(argv=None):
                                    "token is generated at startup. Pass an empty string to disable.")
     serve_parser.add_argument("--model-label", type=str, default=None,
                               help="Stable display label for stats continuity")
-    serve_parser.add_argument("--difficulty-sims", type=str, default="16,32,64,128",
+    serve_parser.add_argument(
+        "--model-variant", action="append", default=[], metavar="LABEL=PATH",
+        help="Additional browser-selectable .safetensors model; repeat for multiple variants",
+    )
+    serve_parser.add_argument("--difficulty-sims", type=str, default="0,64,128,512",
                               help="Comma-separated sim counts mapped onto "
-                                   "['casual', 'easy', 'standard', 'strong']")
+                                   "['quick', 'standard', 'strong', 'deep']")
     serve_parser.add_argument("--default-difficulty", type=str, default="standard",
-                              choices=["casual", "easy", "standard", "strong"],
+                              choices=["quick", "standard", "strong", "deep"],
                               help="Difficulty served when /new_game omits the field")
     serve_parser.add_argument("--request-timeout", type=int, default=60,
                               help="Socket/request timeout in seconds")
@@ -907,6 +911,10 @@ def _run_serve(args):
     if not ckpt_path.exists():
         print(f"Checkpoint not found: {ckpt_path}")
         return 1
+    for spec in args.model_variant:
+        if "=" not in spec or not Path(spec.split("=", 1)[1].strip()).is_file():
+            print(f"Model variant not found or malformed (expected LABEL=PATH): {spec}")
+            return 1
 
     # argparse converts hyphens to underscores, so args already has the
     # attribute shape app.run() expects.

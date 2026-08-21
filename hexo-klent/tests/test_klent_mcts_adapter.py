@@ -108,9 +108,11 @@ def test_adapter_does_not_reimprove_policy_for_test_time_value():
         "hex_d6_dilated_cnn",
     ],
 )
+@pytest.mark.parametrize("critic", ["scalar", "categorical"])
 def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(
     tmp_path,
     architecture,
+    critic,
 ):
     config = (
         tiny_dense_model_config()
@@ -123,6 +125,9 @@ def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(
         }
         else tiny_model_config()
     )
+    if not isinstance(config, KlentModelConfig):
+        config = KlentModelConfig(**dataclasses.asdict(config))
+    config.critic = critic
     if architecture == "persistent_ray_axis":
         config.architecture = architecture
         config.ray_channels = 4
@@ -137,7 +142,7 @@ def test_head_to_head_loader_runs_klent_checkpoint_through_rust_mcts(
         config.cnn_dilations = [1, 2]
     algorithm = AlgorithmConfig()
     network = make_klent_net(config)
-    checkpoint_path = tmp_path / f"klent-{architecture}.pt"
+    checkpoint_path = tmp_path / f"klent-{architecture}-{critic}.pt"
     torch.save(
         {
             "format": "hexo-klent-v1",

@@ -25,7 +25,7 @@ from hexo_klent.batching import (
     restore_state_order,
 )
 from hexo_klent.config import AlgorithmConfig
-from hexo_klent.model import KlentNet, improved_policy
+from hexo_klent.model import KlentNet, acting_q_values, improved_policy
 from hexo_klent.returns import lambda_returns
 
 
@@ -99,7 +99,10 @@ class CollectionStats:
     elapsed_seconds: float
 
 
-InferenceFn = Callable[[list[object]], tuple[list[Tensor], list[Tensor]]]
+InferenceFn = Callable[
+    [list[object]],
+    tuple[list[Tensor], list[Tensor], list[Tensor]],
+]
 CompletedTrajectoryFn = Callable[[list[Trajectory]], None]
 
 
@@ -146,6 +149,7 @@ def _attach_returns(
     trajectory: Trajectory,
     trace_decay: float,
     *,
+    gamma: float = 1.0,
     bootstrap_player: str | None = None,
     bootstrap_value: float | None = None,
 ) -> None:
@@ -154,6 +158,7 @@ def _attach_returns(
         rewards=[step.reward for step in trajectory.steps],
         state_values=[step.state_value for step in trajectory.steps],
         trace_decay=trace_decay,
+        gamma=gamma,
         bootstrap_player=bootstrap_player,
         bootstrap_value=bootstrap_value,
     )
@@ -340,15 +345,20 @@ def _collect_with_inference(
             # next loop drains every one to a terminal result.
             next_active = active[step_count:]
             states = [game for game, _trajectory in stepping]
-            logit_chunks, q_chunks = infer(states)
+            logit_chunks, q_chunks, q_score_chunks = infer(states)
             if (
                 len(logit_chunks) != len(stepping)
                 or len(q_chunks) != len(stepping)
+                or len(q_score_chunks) != len(stepping)
             ):
                 raise RuntimeError("inference response count does not match actors")
 
-            for (game, trajectory), logits, q_values in zip(
-                stepping, logit_chunks, q_chunks, strict=True
+            for (game, trajectory), logits, q_values, q_scores in zip(
+                stepping,
+                logit_chunks,
+                q_chunks,
+                q_score_chunks,
+                strict=True,
             ):
                 legal_coords = game.legal_moves()
                 if logits.numel() != len(legal_coords):
@@ -360,14 +370,46 @@ def _collect_with_inference(
                 # the improved policy in fp32 even after bf16 inference.
                 logits_f = logits.float()
                 q_f = q_values.float()
+                q_score_f = q_scores.float()
                 policy = improved_policy(
                     logits_f,
-                    q_f,
+                    q_score_f,
                     alpha=algorithm.alpha,
                     beta=algorithm.beta,
                 )
                 prior = torch.softmax(logits_f, dim=0)
                 policy_cpu = policy.cpu()
+                if (
+                    not bool(torch.isfinite(policy_cpu).all())
+                    or bool((policy_cpu < 0).any())
+                ):
+                    def tensor_summary(name: str, tensor: Tensor) -> str:
+                        values = tensor.detach().float().cpu()
+                        finite = values[torch.isfinite(values)]
+                        value_range = (
+                            "empty"
+                            if finite.numel() == 0
+                            else f"[{finite.min().item():.6g}, "
+                            f"{finite.max().item():.6g}]"
+                        )
+                        return (
+                            f"{name}: nonfinite="
+                            f"{int((~torch.isfinite(values)).sum())}/"
+                            f"{values.numel()} range={value_range}"
+                        )
+
+                    raise RuntimeError(
+                        "KLENT improved policy is not a finite probability "
+                        "distribution; "
+                        + "; ".join(
+                            (
+                                tensor_summary("policy_logits", logits_f),
+                                tensor_summary("raw_q", q_f),
+                                tensor_summary("acting_q", q_score_f),
+                                tensor_summary("policy", policy_cpu),
+                            )
+                        )
+                    )
                 action_index = int(
                     torch.multinomial(
                         policy_cpu, 1, generator=generator
@@ -460,7 +502,11 @@ def _collect_with_inference(
                         # HeXO can award the opponent a win after an illegal
                         # double-threat shape by the actor.
                         trajectory.steps[-1].reward = -1.0
-                    _attach_returns(trajectory, algorithm.trace_decay)
+                    _attach_returns(
+                        trajectory,
+                        algorithm.trace_decay,
+                        gamma=algorithm.gamma,
+                    )
                     finish_trajectory(
                         trajectory, include_in_training=True
                     )
@@ -578,9 +624,12 @@ def collect_games(
     was_training = model.training
     model.eval()
 
-    def infer(states: list[object]) -> tuple[list[Tensor], list[Tensor]]:
+    def infer(
+        states: list[object],
+    ) -> tuple[list[Tensor], list[Tensor], list[Tensor]]:
         logits: list[Tensor] = []
         q_values: list[Tensor] = []
+        q_scores: list[Tensor] = []
         for start in range(0, len(states), inference_batch_size):
             chunk = states[start : start + inference_batch_size]
             ordered, source_indices = order_states_for_batching(
@@ -588,6 +637,7 @@ def collect_games(
             )
             ordered_logits: list[Tensor] = []
             ordered_q: list[Tensor] = []
+            ordered_q_scores: list[Tensor] = []
             for batch_cpu, _state_slice in prepare_graph_batches(
                 ordered,
                 model_config=model_config,
@@ -602,9 +652,18 @@ def collect_games(
                 ]
                 ordered_logits.extend(output.policy_logits.split(counts))
                 ordered_q.extend(output.q_values.split(counts))
+                ordered_q_scores.extend(
+                    acting_q_values(
+                        output,
+                        mass_floor=algorithm.critic_mass_floor,
+                    ).split(counts)
+                )
             logits.extend(restore_state_order(ordered_logits, source_indices))
             q_values.extend(restore_state_order(ordered_q, source_indices))
-        return logits, q_values
+            q_scores.extend(
+                restore_state_order(ordered_q_scores, source_indices)
+            )
+        return logits, q_values, q_scores
 
     try:
         return _collect_with_inference(
@@ -648,6 +707,7 @@ class _EvalResponse:
     legal_counts: list[int]
     policy_logits: Any
     q_values: Any
+    q_scores: Any
 
 
 @dataclass
@@ -710,7 +770,9 @@ def _actor_worker_main(
             return
         request_id = 0
 
-        def infer(states: list[object]) -> tuple[list[Tensor], list[Tensor]]:
+        def infer(
+            states: list[object],
+        ) -> tuple[list[Tensor], list[Tensor], list[Tensor]]:
             nonlocal request_id
             if stop_event.is_set():
                 raise _ActorShutdown
@@ -737,9 +799,11 @@ def _actor_worker_main(
                 )
             logits = torch.from_numpy(response.policy_logits)
             q_values = torch.from_numpy(response.q_values)
+            q_scores = torch.from_numpy(response.q_scores)
             return (
                 list(logits.split(response.legal_counts)),
                 list(q_values.split(response.legal_counts)),
+                list(q_scores.split(response.legal_counts)),
             )
 
         try:
@@ -989,6 +1053,7 @@ class SharedInferenceActors:
         *,
         model: KlentNet,
         model_config,
+        algorithm: AlgorithmConfig,
         inference_batch_size: int,
         inference_edge_budget: int,
         device: torch.device,
@@ -1011,6 +1076,7 @@ class SharedInferenceActors:
 
         ordered_logits: list[Tensor] = []
         ordered_q: list[Tensor] = []
+        ordered_q_scores: list[Tensor] = []
         for batch_cpu, _state_slice in graph_batches:
             batch = move_batch_to_device(batch_cpu, device)
             with torch.inference_mode(), _autocast(device, precision):
@@ -1025,11 +1091,22 @@ class SharedInferenceActors:
             ordered_q.extend(
                 output.q_values.detach().float().cpu().split(counts)
             )
+            ordered_q_scores.extend(
+                acting_q_values(
+                    output,
+                    mass_floor=algorithm.critic_mass_floor,
+                ).detach().float().cpu().split(counts)
+            )
         logits_parts = restore_state_order(ordered_logits, source_indices)
         q_parts = restore_state_order(ordered_q, source_indices)
+        q_score_parts = restore_state_order(
+            ordered_q_scores,
+            source_indices,
+        )
         legal_counts = [int(part.numel()) for part in logits_parts]
         logits = torch.cat(logits_parts).numpy()
         q_values = torch.cat(q_parts).numpy()
+        q_scores = torch.cat(q_score_parts).numpy()
 
         graph_offset = 0
         legal_offset = 0
@@ -1045,6 +1122,9 @@ class SharedInferenceActors:
                         legal_offset : legal_offset + request_legal
                     ].copy(),
                     q_values=q_values[
+                        legal_offset : legal_offset + request_legal
+                    ].copy(),
+                    q_scores=q_scores[
                         legal_offset : legal_offset + request_legal
                     ].copy(),
                 )
@@ -1203,6 +1283,7 @@ class SharedInferenceActors:
                         requests,
                         model=model,
                         model_config=model_config,
+                        algorithm=algorithm,
                         inference_batch_size=inference_batch_size,
                         inference_edge_budget=inference_edge_budget,
                         device=device,

@@ -24,8 +24,6 @@ async function loadApi() {
 function engineValue(api, engine) {
   const engines = {
     idtt: api.SolverEngineEnum.Idtt,
-    pns: api.SolverEngineEnum.Pns,
-    dfpn: api.SolverEngineEnum.Dfpn,
     pdspn: api.SolverEngineEnum.Pdspn,
     "pdspn-shortest": api.SolverEngineEnum.Pdspn,
   };
@@ -89,7 +87,7 @@ self.onmessage = async (event) => {
   const message = event.data || {};
   if (message.type !== "solve" && message.type !== "verify") return;
   const requestId = message.requestId;
-  let solver, position, limits, outcome, proofOutcome, verification;
+  let solver, position, limits, optimizeLimits, outcome, proofOutcome, verification;
   try {
     const api = await loadApi();
     const input = message.position;
@@ -148,13 +146,28 @@ self.onmessage = async (event) => {
         }
       }
       if (certificateJson) {
-        outcome = solver.optimize_certificate(
-          position,
-          limits,
-          certificateJson,
-          message.width === "wide",
-        );
-        optimized = true;
+        const totalBudget = BigInt(message.nodeBudget);
+        const remainingBudget = totalBudget > initialNodes ? totalBudget - initialNodes : 0n;
+        if (remainingBudget === 0n && proofOutcome) {
+          // Stage one used the selected effort. Preserve its verified WIN rather
+          // than silently spending the same budget again in the shortest pass.
+          outcome = proofOutcome;
+          proofOutcome = null;
+        } else {
+          optimizeLimits = new api.SolverLimits(
+            message.depthCap,
+            remainingBudget,
+            engineValue(api, message.engine),
+          );
+          optimizeLimits.pn2_nodes = BigInt(message.leafNodeBudget || "50000");
+          outcome = solver.optimize_certificate(
+            position,
+            optimizeLimits,
+            certificateJson,
+            message.width === "wide",
+          );
+          optimized = true;
+        }
       }
     } else {
       outcome = message.width === "wide"
@@ -202,6 +215,7 @@ self.onmessage = async (event) => {
     freeQuietly(proofOutcome);
     freeQuietly(outcome);
     freeQuietly(solver);
+    freeQuietly(optimizeLimits);
     freeQuietly(limits);
     freeQuietly(position);
   }

@@ -47,9 +47,19 @@ pub struct InferConfig {
     pub use_jk_cat: bool,
     pub policy_hidden: usize,
     pub value_hidden: usize,
+    /// Q-head hidden width; 0 means the model has a scalar value head instead
+    /// (KLENT checkpoints carry a per-action Q head and no value head).
+    pub q_hidden: usize,
     pub prune_empty_edges: bool,
     pub threat_features: bool,
     pub relative_stones: bool,
+    /// D6-invariant lean axis schema (KLENT): `AxisRelationalConv` layers
+    /// consuming edge_type/edge_dist + a separate global relation.
+    pub axis_relational: bool,
+    pub axis_window: usize,
+    pub compact_stone_onehot: bool,
+    pub node_coords: bool,
+    pub moves_scope: String,
     pub source_checkpoint: String,
     pub metadata_json: String,
 }
@@ -64,6 +74,29 @@ pub struct GineLayer {
     pub norm_w: Vec<f32>, pub norm_b: Vec<f32>,     // (H), (H)
 }
 
+/// One `AxisRelationalConv` layer's weights (KLENT lean axis schema).
+///
+/// All dims are `H` (the conv is built with `in_dim = out_dim = edge_dim =
+/// mlp_hidden = hidden_dim`). `dist_embed` is the per-hop embedding table
+/// (window rows), `axis_conv`/`global_conv` are tied/untied GINE blocks, and
+/// `node_update` combines the residual node features with the summed messages.
+#[derive(Debug, Clone)]
+pub struct AxisRelationalLayer {
+    pub dist_embed: Vec<f32>,                       // (window, H)
+    pub axis_eps: f32,
+    pub axis_lin_w: Vec<f32>, pub axis_lin_b: Vec<f32>,   // (H,H), (H)
+    pub axis_nn0_w: Vec<f32>, pub axis_nn0_b: Vec<f32>,   // (H,H), (H)
+    pub axis_nn2_w: Vec<f32>, pub axis_nn2_b: Vec<f32>,   // (H,H), (H)
+    pub global_eps: f32,
+    pub global_lin_w: Vec<f32>, pub global_lin_b: Vec<f32>, // (H,H), (H)
+    pub global_nn0_w: Vec<f32>, pub global_nn0_b: Vec<f32>, // (H,H), (H)
+    pub global_nn2_w: Vec<f32>, pub global_nn2_b: Vec<f32>, // (H,H), (H)
+    pub global_edge_embed: Vec<f32>,                // (H)
+    pub node_update0_w: Vec<f32>, pub node_update0_b: Vec<f32>, // (H,2H), (H)
+    pub node_update2_w: Vec<f32>, pub node_update2_b: Vec<f32>, // (H,H), (H)
+    pub norm_w: Vec<f32>, pub norm_b: Vec<f32>,     // (H), (H)
+}
+
 /// All loaded weights + resolved config.
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
@@ -71,11 +104,14 @@ pub struct ModelWeights {
     pub input_proj_w: Vec<f32>, pub input_proj_b: Vec<f32>,   // (H, node_dim), (H)
     pub edge_proj_w: Vec<f32>, pub edge_proj_b: Vec<f32>,     // (H, 5), (H)
     pub layers: Vec<GineLayer>,
+    pub rel_layers: Vec<AxisRelationalLayer>,                 // empty unless axis_relational
     pub final_norm_w: Vec<f32>, pub final_norm_b: Vec<f32>,   // (H), (H)
     pub policy0_w: Vec<f32>, pub policy0_b: Vec<f32>,         // (P, D), (P)  D = L*H (cat) or H
     pub policy2_w: Vec<f32>, pub policy2_b: Vec<f32>,         // (1, P), (1)
     pub value0_w: Vec<f32>, pub value0_b: Vec<f32>,           // (V, D), (V)
     pub value2_w: Vec<f32>, pub value2_b: Vec<f32>,           // (1, V), (1)
+    pub q0_w: Vec<f32>, pub q0_b: Vec<f32>,                   // (Q, D), (Q)  empty unless q_hidden>0
+    pub q2_w: Vec<f32>, pub q2_b: Vec<f32>,                   // (1, Q), (1)
 }
 
 impl ModelWeights {
@@ -110,39 +146,94 @@ impl ModelWeights {
         let d = if config.use_jk_cat { l * h } else { h }; // head input dim
         let nd = config.node_dim;
         let (ph, vh) = (config.policy_hidden, config.value_hidden);
+        let qh = config.q_hidden;
+        let axis_relational = config.axis_relational;
 
         let mut layers = Vec::with_capacity(l);
-        for i in 0..l {
-            layers.push(GineLayer {
-                eps: tensor_f32(&st, &format!("representation.convs.{i}.eps"), &[1])?[0],
-                lin_w: tensor_f32(&st, &format!("representation.convs.{i}.lin.weight"), &[h, h])?,
-                lin_b: tensor_f32(&st, &format!("representation.convs.{i}.lin.bias"), &[h])?,
-                nn0_w: tensor_f32(&st, &format!("representation.convs.{i}.nn.0.weight"), &[h, h])?,
-                nn0_b: tensor_f32(&st, &format!("representation.convs.{i}.nn.0.bias"), &[h])?,
-                nn2_w: tensor_f32(&st, &format!("representation.convs.{i}.nn.2.weight"), &[h, h])?,
-                nn2_b: tensor_f32(&st, &format!("representation.convs.{i}.nn.2.bias"), &[h])?,
-                norm_w: tensor_f32(&st, &format!("representation.norms.{i}.weight"), &[h])?,
-                norm_b: tensor_f32(&st, &format!("representation.norms.{i}.bias"), &[h])?,
-            });
+        let mut rel_layers = Vec::with_capacity(l);
+        if axis_relational {
+            let w = config.axis_window;
+            for i in 0..l {
+                rel_layers.push(AxisRelationalLayer {
+                    dist_embed: tensor_f32(&st, &format!("representation.convs.{i}.dist_embed.weight"), &[w, h])?,
+                    axis_eps: tensor_f32(&st, &format!("representation.convs.{i}.axis_conv.eps"), &[1])?[0],
+                    axis_lin_w: tensor_f32(&st, &format!("representation.convs.{i}.axis_conv.lin.weight"), &[h, h])?,
+                    axis_lin_b: tensor_f32(&st, &format!("representation.convs.{i}.axis_conv.lin.bias"), &[h])?,
+                    axis_nn0_w: tensor_f32(&st, &format!("representation.convs.{i}.axis_conv.nn.0.weight"), &[h, h])?,
+                    axis_nn0_b: tensor_f32(&st, &format!("representation.convs.{i}.axis_conv.nn.0.bias"), &[h])?,
+                    axis_nn2_w: tensor_f32(&st, &format!("representation.convs.{i}.axis_conv.nn.2.weight"), &[h, h])?,
+                    axis_nn2_b: tensor_f32(&st, &format!("representation.convs.{i}.axis_conv.nn.2.bias"), &[h])?,
+                    global_eps: tensor_f32(&st, &format!("representation.convs.{i}.global_conv.eps"), &[1])?[0],
+                    global_lin_w: tensor_f32(&st, &format!("representation.convs.{i}.global_conv.lin.weight"), &[h, h])?,
+                    global_lin_b: tensor_f32(&st, &format!("representation.convs.{i}.global_conv.lin.bias"), &[h])?,
+                    global_nn0_w: tensor_f32(&st, &format!("representation.convs.{i}.global_conv.nn.0.weight"), &[h, h])?,
+                    global_nn0_b: tensor_f32(&st, &format!("representation.convs.{i}.global_conv.nn.0.bias"), &[h])?,
+                    global_nn2_w: tensor_f32(&st, &format!("representation.convs.{i}.global_conv.nn.2.weight"), &[h, h])?,
+                    global_nn2_b: tensor_f32(&st, &format!("representation.convs.{i}.global_conv.nn.2.bias"), &[h])?,
+                    global_edge_embed: tensor_f32(&st, &format!("representation.convs.{i}.global_edge_embed"), &[h])?,
+                    node_update0_w: tensor_f32(&st, &format!("representation.convs.{i}.node_update.0.weight"), &[h, 2 * h])?,
+                    node_update0_b: tensor_f32(&st, &format!("representation.convs.{i}.node_update.0.bias"), &[h])?,
+                    node_update2_w: tensor_f32(&st, &format!("representation.convs.{i}.node_update.2.weight"), &[h, h])?,
+                    node_update2_b: tensor_f32(&st, &format!("representation.convs.{i}.node_update.2.bias"), &[h])?,
+                    norm_w: tensor_f32(&st, &format!("representation.norms.{i}.weight"), &[h])?,
+                    norm_b: tensor_f32(&st, &format!("representation.norms.{i}.bias"), &[h])?,
+                });
+            }
+        } else {
+            for i in 0..l {
+                layers.push(GineLayer {
+                    eps: tensor_f32(&st, &format!("representation.convs.{i}.eps"), &[1])?[0],
+                    lin_w: tensor_f32(&st, &format!("representation.convs.{i}.lin.weight"), &[h, h])?,
+                    lin_b: tensor_f32(&st, &format!("representation.convs.{i}.lin.bias"), &[h])?,
+                    nn0_w: tensor_f32(&st, &format!("representation.convs.{i}.nn.0.weight"), &[h, h])?,
+                    nn0_b: tensor_f32(&st, &format!("representation.convs.{i}.nn.0.bias"), &[h])?,
+                    nn2_w: tensor_f32(&st, &format!("representation.convs.{i}.nn.2.weight"), &[h, h])?,
+                    nn2_b: tensor_f32(&st, &format!("representation.convs.{i}.nn.2.bias"), &[h])?,
+                    norm_w: tensor_f32(&st, &format!("representation.norms.{i}.weight"), &[h])?,
+                    norm_b: tensor_f32(&st, &format!("representation.norms.{i}.bias"), &[h])?,
+                });
+            }
         }
+
+        // Value head (standard) vs Q head (KLENT). The Q head is a per-action
+        // MLP; its state value is reconstructed downstream as
+        // sum_a softmax(logits)_a * Q_a. The discriminator is axis_relational
+        // (KLENT always uses a Q head and no value head), NOT q_hidden — the
+        // ModelConfig q_hidden field defaults to 64 even for value-head models.
+        let (value0_w, value0_b, value2_w, value2_b, q0_w, q0_b, q2_w, q2_b) = if axis_relational {
+            (
+                Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+                tensor_f32(&st, "q_head.mlp.0.weight", &[qh, d])?,
+                tensor_f32(&st, "q_head.mlp.0.bias", &[qh])?,
+                tensor_f32(&st, "q_head.mlp.2.weight", &[1, qh])?,
+                tensor_f32(&st, "q_head.mlp.2.bias", &[1])?,
+            )
+        } else {
+            (
+                tensor_f32(&st, "value_head.mlp.0.weight", &[vh, d])?,
+                tensor_f32(&st, "value_head.mlp.0.bias", &[vh])?,
+                tensor_f32(&st, "value_head.mlp.2.weight", &[1, vh])?,
+                tensor_f32(&st, "value_head.mlp.2.bias", &[1])?,
+                Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            )
+        };
 
         Ok(ModelWeights {
             config,
             input_proj_w: tensor_f32(&st, "representation.input_proj.weight", &[h, nd])?,
             input_proj_b: tensor_f32(&st, "representation.input_proj.bias", &[h])?,
-            edge_proj_w: tensor_f32(&st, "representation.edge_proj.weight", &[h, 5])?,
-            edge_proj_b: tensor_f32(&st, "representation.edge_proj.bias", &[h])?,
+            edge_proj_w: if axis_relational { Vec::new() } else { tensor_f32(&st, "representation.edge_proj.weight", &[h, 5])? },
+            edge_proj_b: if axis_relational { Vec::new() } else { tensor_f32(&st, "representation.edge_proj.bias", &[h])? },
             layers,
+            rel_layers,
             final_norm_w: tensor_f32(&st, "representation.final_norm.weight", &[h])?,
             final_norm_b: tensor_f32(&st, "representation.final_norm.bias", &[h])?,
             policy0_w: tensor_f32(&st, "policy_head.mlp.0.weight", &[ph, d])?,
             policy0_b: tensor_f32(&st, "policy_head.mlp.0.bias", &[ph])?,
             policy2_w: tensor_f32(&st, "policy_head.mlp.2.weight", &[1, ph])?,
             policy2_b: tensor_f32(&st, "policy_head.mlp.2.bias", &[1])?,
-            value0_w: tensor_f32(&st, "value_head.mlp.0.weight", &[vh, d])?,
-            value0_b: tensor_f32(&st, "value_head.mlp.0.bias", &[vh])?,
-            value2_w: tensor_f32(&st, "value_head.mlp.2.weight", &[1, vh])?,
-            value2_b: tensor_f32(&st, "value_head.mlp.2.bias", &[1])?,
+            value0_w, value0_b, value2_w, value2_b,
+            q0_w, q0_b, q2_w, q2_b,
         })
     }
 }
@@ -182,6 +273,12 @@ fn parse_config(
     let threat = bool_of("threat_features", false);
     let relative = bool_of("relative_stone_encoding", false);
     let prune = bool_of("prune_empty_edges", true);
+    let axis_relational = bool_of("axis_relational", false);
+    let axis_window = usize_of("axis_window", 8);
+    let q_hidden = usize_of("q_hidden", 0);
+    let compact_stone_onehot = bool_of("compact_stone_onehot", false);
+    let node_coords = bool_of("node_coords", true);
+    let moves_scope = str_of("moves_scope", "node");
 
     // Loud rejection of unsupported configs (the parity suite only covers what ships).
     if conv_type != "gine" {
@@ -200,12 +297,28 @@ fn parse_config(
     if use_jk && jk_mode != "cat" {
         return Err(InferError::UnsupportedConfig(format!("jk_mode={jk_mode:?} (only 'cat' supported when use_jk)")));
     }
+    // The native lean graph builder only implements moves_scope="node"; "graph"
+    // (a per-graph move-count feature) is not yet available in Rust.
+    if axis_relational && moves_scope != "node" {
+        return Err(InferError::UnsupportedConfig(format!(
+            "moves_scope={moves_scope:?} (only 'node' supported when axis_relational)"
+        )));
+    }
 
     let hidden_dim = usize_of("hidden_dim", 256);
     let num_layers = usize_of("num_layers", 3);
     let policy_hidden = usize_of("policy_hidden", 128);
     let value_hidden = usize_of("value_hidden", 128);
-    let node_dim = (if relative { 7 } else { 8 }) + (if threat { 4 } else { 0 });
+    // Node feature width. Legacy schema: relative(7)/absolute(8) + threat(4).
+    // Lean schema (axis_relational) additionally drops the compact stone one-hot
+    // (-1), drops node coords (-2), and drops the graph-scoped move count (-1).
+    let mut node_dim = if relative { 7 } else { 8 };
+    if axis_relational {
+        if compact_stone_onehot { node_dim -= 1; }
+        if !node_coords { node_dim -= 2; }
+        if moves_scope == "graph" { node_dim -= 1; }
+    }
+    node_dim += if threat { 4 } else { 0 };
     let use_jk_cat = use_jk && jk_mode == "cat";
 
     Ok(InferConfig {
@@ -215,9 +328,15 @@ fn parse_config(
         use_jk_cat,
         policy_hidden,
         value_hidden,
+        q_hidden,
         prune_empty_edges: prune,
         threat_features: threat,
         relative_stones: relative,
+        axis_relational,
+        axis_window,
+        compact_stone_onehot,
+        node_coords,
+        moves_scope,
         source_checkpoint: custom.get("source_checkpoint").cloned().unwrap_or_default(),
         metadata_json: serde_json::to_string(custom).unwrap_or_default(),
     })

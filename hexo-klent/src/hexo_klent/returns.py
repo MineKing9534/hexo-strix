@@ -19,6 +19,7 @@ def lambda_returns(
     rewards: Sequence[float],
     state_values: Sequence[float],
     trace_decay: float,
+    gamma: float = 1.0,
     bootstrap_player: str | None = None,
     bootstrap_value: float | None = None,
 ) -> list[float]:
@@ -34,7 +35,8 @@ def lambda_returns(
     ``bootstrap_value`` and ends at its final reward. A truncated trajectory
     supplies both values. Its final action target then bootstraps from the
     frozen network's value of the non-terminal successor state rather than
-    injecting a fictitious draw.
+    injecting a fictitious draw. ``gamma`` discounts every non-terminal
+    continuation but never discounts the terminal reward at its own step.
     """
 
     size = len(players)
@@ -44,6 +46,8 @@ def lambda_returns(
         raise ValueError("players, rewards, and state_values must align")
     if not 0.0 <= trace_decay <= 1.0:
         raise ValueError("trace_decay must be in [0, 1]")
+    if not 0.0 < gamma <= 1.0:
+        raise ValueError("gamma must be in (0, 1]")
     if (bootstrap_player is None) != (bootstrap_value is None):
         raise ValueError(
             "bootstrap_player and bootstrap_value must be supplied together"
@@ -54,12 +58,16 @@ def lambda_returns(
         returns[-1] = float(rewards[-1])
     else:
         sign = transition_sign(players[-1], bootstrap_player)
-        returns[-1] = float(rewards[-1]) + sign * float(bootstrap_value)
+        returns[-1] = (
+            float(rewards[-1]) + sign * gamma * float(bootstrap_value)
+        )
     for index in range(size - 2, -1, -1):
         sign = transition_sign(players[index], players[index + 1])
         continuation = (
             (1.0 - trace_decay) * float(state_values[index + 1])
             + trace_decay * returns[index + 1]
         )
-        returns[index] = float(rewards[index]) + sign * continuation
+        returns[index] = (
+            float(rewards[index]) + sign * gamma * continuation
+        )
     return returns

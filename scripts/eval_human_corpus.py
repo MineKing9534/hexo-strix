@@ -59,26 +59,43 @@ N_CALIBRATION_BINS = 10
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--config", default=None,
-                   help="curriculum TOML with a [model] section; fallback for checkpoints "
-                        "without an embedded model_config")
+    p.add_argument(
+        "--config",
+        default=None,
+        help="curriculum TOML with a [model] section; fallback for checkpoints "
+        "without an embedded model_config",
+    )
     p.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     p.add_argument("--results", type=Path, default=DEFAULT_RESULTS)
-    p.add_argument("--max-games", type=int, default=None,
-                   help="seeded random sample of games (default: all)")
-    p.add_argument("--batch-size", type=int, default=128,
-                   help="max positions per forward (count cap; the edge budget "
-                        "is usually what triggers the flush on deep positions)")
-    p.add_argument("--edge-budget", type=int, default=500_000,
-                   help="flush when the estimated (upper-bound) edge count of "
-                        "pending graphs exceeds this (bounds peak activation "
-                        "memory; 0 = off). Mirrors [training].edge_budget — "
-                        "deep r8 positions reach ~100k unpruned edges each, so "
-                        "unbudgeted 1024-position batches cost tens of GiB of "
-                        "transient activations")
+    p.add_argument(
+        "--max-games",
+        type=int,
+        default=None,
+        help="seeded random sample of games (default: all)",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=128,
+        help="max positions per forward (count cap; the edge budget "
+        "is usually what triggers the flush on deep positions)",
+    )
+    p.add_argument(
+        "--edge-budget",
+        type=int,
+        default=500_000,
+        help="flush when the estimated (upper-bound) edge count of "
+        "pending graphs exceeds this (bounds peak activation "
+        "memory; 0 = off). Mirrors [training].edge_budget — "
+        "deep r8 positions reach ~100k unpruned edges each, so "
+        "unbudgeted 1024-position batches cost tens of GiB of "
+        "transient activations",
+    )
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--json", action="store_true", help="also dump the summary record to stdout")
+    p.add_argument(
+        "--json", action="store_true", help="also dump the summary record to stdout"
+    )
     return p.parse_args()
 
 
@@ -98,7 +115,6 @@ def load_model(ckpt_path: str, config_path: str | None):
     """Build HeXONet from the checkpoint's embedded model_config (authoritative —
     graft scripts update it in place), falling back to the TOML's [model] section."""
     import torch
-
     from hexo_a0 import config as config_mod
     from hexo_a0 import model as model_mod
 
@@ -127,8 +143,11 @@ def make_batch_graph_fn(mc):
     rel = getattr(mc, "relative_stone_encoding", False)
     if mc.graph_type == "axis":
         return lambda gs: game_to_axis_graph_batch(
-            gs, prune_empty_edges=prune, threat_features=threat, relative_stones=rel)
-    return lambda gs: game_to_graph_batch(gs, threat_features=threat, relative_stones=rel)
+            gs, prune_empty_edges=prune, threat_features=threat, relative_stones=rel
+        )
+    return lambda gs: game_to_graph_batch(
+        gs, threat_features=threat, relative_stones=rel
+    )
 
 
 def derive_step(ckpt_path: str, ckpt: dict) -> int | None:
@@ -210,7 +229,11 @@ class ValueAcc:
     def row(self) -> dict:
         if self.n == 0:
             return {"n": 0, "mse": None, "sign_acc": None}
-        return {"n": self.n, "mse": self.sum_sq / self.n, "sign_acc": self.sign_ok / self.n}
+        return {
+            "n": self.n,
+            "mse": self.sum_sq / self.n,
+            "sign_acc": self.sign_ok / self.n,
+        }
 
 
 def iter_games(corpus_path: Path, max_games: int | None, seed: int):
@@ -233,7 +256,9 @@ def replay_positions(game: dict, game_config):
     gs = hexo_rs.GameState(game_config)
     moves = game["moves"]
     if moves[0] != [0, 0]:
-        raise SystemExit(f"game {game['game_hash']}: expected forced (0,0) opener, got {moves[0]}")
+        raise SystemExit(
+            f"game {game['game_hash']}: expected forced (0,0) opener, got {moves[0]}"
+        )
     winner = "P1" if game["winner"] == 1 else "P2"
 
     for j, (q, r) in enumerate(moves[1:]):
@@ -242,7 +267,12 @@ def replay_positions(game: dict, game_config):
         value_target = None
         if j % 2 == 0:  # turn boundary: side-to-move has a full 2-stone turn ahead
             value_target = 1.0 if gs.current_player() == winner else -1.0
-        yield gs.clone(), (q, r), value_target, j + 1  # j+1 stones incl. pre-seeded origin
+        yield (
+            gs.clone(),
+            (q, r),
+            value_target,
+            j + 1,
+        )  # j+1 stones incl. pre-seeded origin
         gs.apply_move(q, r)
 
     if not gs.is_terminal():
@@ -259,10 +289,9 @@ def main() -> None:
     # read once at HIP/CUDA context init).
     configure_cuda_alloc()
 
+    import hexo_rs
     import torch
     from torch_geometric.data import Batch
-
-    import hexo_rs
 
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -282,15 +311,22 @@ def main() -> None:
     game_config = hexo_rs.GameConfig(win_length=6, placement_radius=8, max_moves=1000)
 
     games = iter_games(args.corpus, args.max_games, args.seed)
-    print(f"evaluating {len(games)} games on {device} "
-          f"(graph_type={mc.graph_type}, threat_features={getattr(mc, 'threat_features', False)}, "
-          f"relative_stone_encoding={getattr(mc, 'relative_stone_encoding', False)})")
+    print(
+        f"evaluating {len(games)} games on {device} "
+        f"(graph_type={mc.graph_type}, threat_features={getattr(mc, 'threat_features', False)}, "
+        f"relative_stone_encoding={getattr(mc, 'relative_stone_encoding', False)})"
+    )
 
-    policy_acc = {(s, e): PolicyAcc() for s in range(len(STONE_BUCKETS))
-                  for e in range(len(ELO_BUCKETS))}
+    policy_acc = {
+        (s, e): PolicyAcc()
+        for s in range(len(STONE_BUCKETS))
+        for e in range(len(ELO_BUCKETS))
+    }
     value_acc = {s: ValueAcc() for s in range(len(STONE_BUCKETS))}
     # Calibration bins over predicted v in [-1, 1]
-    cal = [{"n": 0, "sum_pred": 0.0, "sum_outcome": 0.0} for _ in range(N_CALIBRATION_BINS)]
+    cal = [
+        {"n": 0, "sum_pred": 0.0, "sum_outcome": 0.0} for _ in range(N_CALIBRATION_BINS)
+    ]
 
     pending: list = []  # (state_clone, (q, r), value_target, stone_bucket, elo_bucket)
     pending_edges = 0  # estimated; bounds peak activation memory per flush
@@ -311,8 +347,10 @@ def main() -> None:
             device=device,
         )
         logits, _counts, values = model._forward_batch_core(
-            batch, legal_idx=aux.legal_idx,
-            stone_idx=aux.stone_idx, stone_batch=aux.stone_batch,
+            batch,
+            legal_idx=aux.legal_idx,
+            stone_idx=aux.stone_idx,
+            stone_batch=aux.stone_batch,
         )
         seg = batch.batch[aux.legal_idx]
         legal_coords = aux.coords[aux.legal_idx]
@@ -336,7 +374,9 @@ def main() -> None:
             return
         n = len(pending)
         states = [p[0] for p in pending]
-        moves_t = torch.tensor([p[1] for p in pending], dtype=torch.int32, device=device)
+        moves_t = torch.tensor(
+            [p[1] for p in pending], dtype=torch.int32, device=device
+        )
 
         with torch.inference_mode():
             fwd = _forward_axis_bytes if use_axis_fast_path else _forward_pyg
@@ -349,23 +389,37 @@ def main() -> None:
             if human_flat.numel() != n or not torch.equal(
                 seg[human_flat], torch.arange(n, device=device)
             ):
-                raise SystemExit("human move lookup failed: != 1 legal match in some graph")
+                raise SystemExit(
+                    "human move lookup failed: != 1 legal match in some graph"
+                )
 
             # Segment log-softmax NLL + rank, all on device, synced at the end.
             seg_max = torch.full((n,), float("-inf"), device=device).scatter_reduce_(
-                0, seg, logits, "amax")
-            log_z = torch.zeros(n, device=device).index_add_(
-                0, seg, torch.exp(logits - seg_max[seg])).log() + seg_max
+                0, seg, logits, "amax"
+            )
+            log_z = (
+                torch.zeros(n, device=device)
+                .index_add_(0, seg, torch.exp(logits - seg_max[seg]))
+                .log()
+                + seg_max
+            )
             nll = (log_z - logits[human_flat]).tolist()
-            rank = torch.zeros(n, dtype=torch.long, device=device).index_add_(
-                0, seg, (logits > logits[human_flat][seg]).long()).tolist()
+            rank = (
+                torch.zeros(n, dtype=torch.long, device=device)
+                .index_add_(0, seg, (logits > logits[human_flat][seg]).long())
+                .tolist()
+            )
             values = values.tolist()
 
-        for (_, _, value_target, sb, eb), nll_i, rank_i, pred in zip(pending, nll, rank, values):
+        for (_, _, value_target, sb, eb), nll_i, rank_i, pred in zip(
+            pending, nll, rank, values
+        ):
             policy_acc[(sb, eb)].add(nll_i, rank_i)
             if value_target is not None:
                 value_acc[sb].add(pred, value_target)
-                b = min(int((pred + 1.0) / 2.0 * N_CALIBRATION_BINS), N_CALIBRATION_BINS - 1)
+                b = min(
+                    int((pred + 1.0) / 2.0 * N_CALIBRATION_BINS), N_CALIBRATION_BINS - 1
+                )
                 cal[b]["n"] += 1
                 cal[b]["sum_pred"] += pred
                 cal[b]["sum_outcome"] += value_target
@@ -397,7 +451,8 @@ def main() -> None:
     n_cal = sum(b["n"] for b in cal)
     ece = sum(
         b["n"] / n_cal * abs(b["sum_pred"] / b["n"] - b["sum_outcome"] / b["n"])
-        for b in cal if b["n"] > 0
+        for b in cal
+        if b["n"] > 0
     )
 
     # ---- print tables ----
@@ -407,9 +462,13 @@ def main() -> None:
     po = policy_overall.row()
     vo = value_overall.row()
     print(f"\n== Overall ==")
-    print(f"policy: n={po['n']}  perplexity={po['perplexity']:.3f}  "
-          f"top1={po['top1']:.3f}  top{TOP_K}={po[f'top{TOP_K}']:.3f}")
-    print(f"value:  n={vo['n']}  mse={vo['mse']:.4f}  sign_acc={vo['sign_acc']:.3f}  ece={ece:.4f}")
+    print(
+        f"policy: n={po['n']}  perplexity={po['perplexity']:.3f}  "
+        f"top1={po['top1']:.3f}  top{TOP_K}={po[f'top{TOP_K}']:.3f}"
+    )
+    print(
+        f"value:  n={vo['n']}  mse={vo['mse']:.4f}  sign_acc={vo['sign_acc']:.3f}  ece={ece:.4f}"
+    )
 
     def fmt(x, spec):
         return format(x, spec) if x is not None else "-"
@@ -424,16 +483,22 @@ def main() -> None:
         for e in range(len(ELO_BUCKETS)):
             r = policy_acc[(s, e)].row()
             row_all.merge(policy_acc[(s, e)])
-            cells.append(f"{fmt(r['perplexity'], '8.2f')} ({fmt(r['top1'], '.2f')}/{fmt(r[f'top{TOP_K}'], '.2f')})")
+            cells.append(
+                f"{fmt(r['perplexity'], '8.2f')} ({fmt(r['top1'], '.2f')}/{fmt(r[f'top{TOP_K}'], '.2f')})"
+            )
         r = row_all.row()
-        cells.append(f"{fmt(r['perplexity'], '8.2f')} ({fmt(r['top1'], '.2f')}/{fmt(r[f'top{TOP_K}'], '.2f')})")
+        cells.append(
+            f"{fmt(r['perplexity'], '8.2f')} ({fmt(r['top1'], '.2f')}/{fmt(r[f'top{TOP_K}'], '.2f')})"
+        )
         print(f"{s_labels[s]:>8} | " + " | ".join(f"{c:>24}" for c in cells))
 
     print("\n== Value by stones ==")
     print(f"{'stones':>8} | {'n':>7} | {'mse':>7} | {'sign_acc':>8}")
     for s in range(len(STONE_BUCKETS)):
         r = value_acc[s].row()
-        print(f"{s_labels[s]:>8} | {r['n']:>7} | {fmt(r['mse'], '7.4f')} | {fmt(r['sign_acc'], '8.3f')}")
+        print(
+            f"{s_labels[s]:>8} | {r['n']:>7} | {fmt(r['mse'], '7.4f')} | {fmt(r['sign_acc'], '8.3f')}"
+        )
 
     print("\n== Value calibration (10 bins over predicted v) ==")
     print(f"{'bin':>12} | {'n':>7} | {'mean_pred':>9} | {'mean_outcome':>12}")
@@ -443,8 +508,10 @@ def main() -> None:
         if b["n"] == 0:
             print(f"{lo:>5.1f},{hi:>5.1f} | {0:>7} | {'-':>9} | {'-':>12}")
         else:
-            print(f"{lo:>5.1f},{hi:>5.1f} | {b['n']:>7} | {b['sum_pred'] / b['n']:>9.3f} | "
-                  f"{b['sum_outcome'] / b['n']:>12.3f}")
+            print(
+                f"{lo:>5.1f},{hi:>5.1f} | {b['n']:>7} | {b['sum_pred'] / b['n']:>9.3f} | "
+                f"{b['sum_outcome'] / b['n']:>12.3f}"
+            )
 
     # ---- append summary record ----
     record = {
@@ -459,13 +526,18 @@ def main() -> None:
         "value": {**vo, "ece": ece},
         "policy_buckets": {
             f"{s_labels[s]}|{e_labels[e]}": policy_acc[(s, e)].row()
-            for s in range(len(STONE_BUCKETS)) for e in range(len(ELO_BUCKETS))
+            for s in range(len(STONE_BUCKETS))
+            for e in range(len(ELO_BUCKETS))
         },
-        "value_buckets": {s_labels[s]: value_acc[s].row() for s in range(len(STONE_BUCKETS))},
+        "value_buckets": {
+            s_labels[s]: value_acc[s].row() for s in range(len(STONE_BUCKETS))
+        },
         "calibration_bins": [
-            {"n": b["n"],
-             "mean_pred": b["sum_pred"] / b["n"] if b["n"] else None,
-             "mean_outcome": b["sum_outcome"] / b["n"] if b["n"] else None}
+            {
+                "n": b["n"],
+                "mean_pred": b["sum_pred"] / b["n"] if b["n"] else None,
+                "mean_outcome": b["sum_outcome"] / b["n"] if b["n"] else None,
+            }
             for b in cal
         ],
     }

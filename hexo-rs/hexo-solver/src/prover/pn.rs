@@ -9,8 +9,9 @@
 //! node `(INF, 0)`, an unexpanded unknown `(1, 1)`.
 
 use super::kernel::{AndEval, KernelCtx, Node, OrEval};
-use crate::forcing::CellSet2;
+use crate::forcing::{CellSet2, WinDepthHints};
 use rustc_hash::FxHashSet;
+use std::rc::Rc;
 
 /// The proof/disproof "infinity". Kept well below `u32::MAX` so saturating sums of
 /// several children never wrap; any pn/dn `>= INF` is treated as infinite.
@@ -249,11 +250,30 @@ pub(crate) struct PnSearch {
     arena: Vec<PnNode>,
     max_nodes: u64,
     expansions: u64,
+    /// Certificate-derived win-depth hints (guided probes only). A hit closes a
+    /// node at its current horizon without expansion, mirroring the level-1
+    /// `Dfpn::hint_val` check.
+    hints: Option<Rc<WinDepthHints>>,
 }
 
 impl PnSearch {
     pub(crate) fn new(max_nodes: u64) -> PnSearch {
-        PnSearch { arena: Vec::new(), max_nodes: max_nodes.max(1), expansions: 0 }
+        PnSearch {
+            arena: Vec::new(),
+            max_nodes: max_nodes.max(1),
+            expansions: 0,
+            hints: None,
+        }
+    }
+
+    /// Attach certificate-derived win-depth hints for a guided probe.
+    pub(crate) fn set_hints(&mut self, hints: Option<Rc<WinDepthHints>>) {
+        self.hints = hints;
+    }
+
+    /// Override the per-call node cap (used by adaptive leaf-budget schemes).
+    pub(crate) fn set_max_nodes(&mut self, max_nodes: u64) {
+        self.max_nodes = max_nodes.max(1);
     }
 
     /// Number of nodes expanded by the most recent [`Self::search`] call.
@@ -390,7 +410,24 @@ impl PnSearch {
             } else {
                 k.place_defender(&mv);
             }
-            let (pn, dn, terminal) = eval_child_at(k, child_node, child_remaining);
+            // Certificate-derived hint cutoff before the ordinary immediate
+            // evaluation: a guided probe closes nodes the certificate already
+            // resolved at this horizon without expanding them.
+            let (pn, dn, terminal) = if let (Some(hints), Some(turns)) =
+                (&self.hints, child_remaining)
+            {
+                let (is_or, placements) = child_node.tag();
+                let hash = k.hash();
+                if hints.proves_within(hash, is_or, placements, turns) {
+                    (0, INF, true)
+                } else if hints.disproves_within(hash, is_or, placements, turns) {
+                    (INF, 0, true)
+                } else {
+                    eval_child_at(k, child_node, child_remaining)
+                }
+            } else {
+                eval_child_at(k, child_node, child_remaining)
+            };
             let key = node_key_at(k.hash(), child_node, child_remaining);
             k.unplace(&mv);
             let idx = self.arena.len();

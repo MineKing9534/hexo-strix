@@ -70,6 +70,9 @@ def _metrics(
         "training/policy_target_top1_agreement_after": 0.81,
         "training/policy_target_top1_agreement_delta": 0.09,
         "training/q_loss": 0.18,
+        "training/critic_loss": 0.18,
+        "training/critic_ce": 0.18,
+        "training/q_mse": 0.07,
         "training/total_loss": 2.59,
         "training/search_q_teacher_q_mse_before": 0.20,
         "training/search_q_teacher_q_mse_after_fit": 0.28,
@@ -548,6 +551,7 @@ def test_dashboard_renders_cockpit_and_loads_metric_history(tmp_path):
     )
     dashboard = _dashboard(tmp_path)
     dashboard.begin_run(1, 4)
+    dashboard.update_metrics(_metrics())
     dashboard.set_phase("EVAL", 2, "sealbot_mcts24/8 // 16 games")
 
     stream = io.StringIO()
@@ -612,3 +616,19 @@ def test_dashboard_renders_cockpit_and_loads_metric_history(tmp_path):
     assert "SEARCH-Q B/F/A" in compact_output
     assert "Q ANCHOR RET" in compact_output
     assert "SAFE HALT" in compact_output
+
+
+def test_categorical_critic_losses_are_explicit_in_tui(tmp_path):
+    dashboard = _dashboard(tmp_path)
+    metrics = _metrics()
+    for key in list(metrics):
+        if key.startswith("training/search_q_teacher_"):
+            del metrics[key]
+    dashboard.update_metrics(metrics)
+
+    stream = io.StringIO()
+    Console(file=stream, width=80).print(dashboard._optimization_panel())
+    output = stream.getvalue()
+
+    assert "CRITIC CE" in output
+    assert "Q MSE" in output

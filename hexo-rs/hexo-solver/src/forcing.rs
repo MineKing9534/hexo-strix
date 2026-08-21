@@ -74,7 +74,7 @@ impl WinDepthHints {
     }
 
     #[inline]
-    fn proves_within(&self, hash: u64, is_or: bool, placements: u8, budget: u8) -> bool {
+    pub(crate) fn proves_within(&self, hash: u64, is_or: bool, placements: u8, budget: u8) -> bool {
         self.wins
             .get(&(hash, is_or, placements))
             .is_some_and(|&depth| depth <= budget)
@@ -85,7 +85,7 @@ impl WinDepthHints {
     }
 
     #[inline]
-    fn disproves_within(&self, hash: u64, is_or: bool, placements: u8, budget: u8) -> bool {
+    pub(crate) fn disproves_within(&self, hash: u64, is_or: bool, placements: u8, budget: u8) -> bool {
         self.no_win_within
             .get(&(hash, is_or, placements))
             .is_some_and(|&depth| depth >= budget)
@@ -112,6 +112,41 @@ impl WinDepthHints {
         self.defender_order.get(&hash).map(Vec::as_slice)
     }
 }
+
+/// Depth-preferred forcing bounds cached per (position, side, placements).
+///
+/// An entry records the strongest facts known about the node, each reusable
+/// across a RANGE of probe budgets:
+/// - `win != 0`: the attacker won within `win` attacker turns; reusable for any
+///   probe with budget >= win (more remaining depth can only help the attacker).
+/// - `no != 0`: the attacker has provably no win within `no` turns (an exhaustive
+///   non-cut failure); reusable for any probe with budget <= no (a win in fewer
+///   turns would imply a win in `no`).
+/// - `cut_below != 0`: a probe at budget `cut_below` hit the depth horizon with
+///   no win found; reusable as (false, cut) for any probe with budget <=
+///   cut_below (a shallower horizon can only cut sooner). This is a give-up
+///   marker, not a fact: it never answers a deeper probe and never proves No.
+///
+/// One slot per node replaces up to depth-cap duplicate entries of the legacy
+/// per-budget TT, while retaining the legacy cut entries' intra-iteration
+/// transposition pruning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Bounds {
+    win: u8,
+    no: u8,
+    cut_below: u8,
+}
+
+/// Hard entry caps for the per-search caches. The search retains every distinct
+/// node for the run's lifetime, so an unbounded very-long run climbs past tens
+/// of GiB — and on wasm32 the allocator aborts at the 4 GiB ceiling, surfacing
+/// as an unhelpful "unreachable executed" runtime trap in the browser. Caps keep
+/// the worst case in the hundreds of MiB; reaching one drops the map wholesale
+/// (verdicts are position truths, so a cold cache only forces recomputes).
+const TT_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 21 } else { 1 << 23 };
+const GENCACHE_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 17 } else { 1 << 19 };
+const COMPS_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 18 } else { 1 << 20 };
+const WINNING_MOVES_CAP: usize = if cfg!(target_arch = "wasm32") { 1 << 17 } else { 1 << 19 };
 
 const WIN_AXES: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
 /// Max supported win_length: strip-scan buffers are stack arrays of 2*MAX_WL-1.
@@ -222,9 +257,12 @@ impl CellSet2 {
     }
 }
 
-/// Mutable board for make/unmake search — dense grid + stone list, no per-node
-/// clone. Cells outside the grid are empty by construction (the grid always
-/// covers every stone with `GRID_PAD` slack).
+/// Mutable board for make/unmake search — dense grid + stone list. Nodes are
+/// NOT cloned per-search-node; the only clone is a single per-leaf copy for
+/// PDS-PN's disposable level-2 context (`KernelCtx::isolated`). Cells outside
+/// the grid are empty by construction (the grid always covers every stone with
+/// `GRID_PAD` slack).
+#[derive(Clone)]
 pub struct SolverBoard {
     grid: Vec<u8>, // 0 empty, 1 P1, 2 P2
     /// Per-cell count of stones within `reach_radius` (tight regime only).
@@ -498,7 +536,7 @@ impl WindowState {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct WindowIndex {
     wl: u8,
     enabled: bool,
@@ -1371,7 +1409,10 @@ enum SolveResult { Win { depth: u8 }, No, BudgetExceeded }
 type NodeComps = (Vec<CellSet2>, Vec<CellSet2>);
 
 struct SearchState {
-    tt: FxHashMap<(u64, bool, u8, u8), (bool, bool)>, // (hash, is_or, placements, budget) -> (won, cutoff)
+    /// (hash, is_or, placements) -> best-known win/no-win bounds (see `Bounds`).
+    /// One slot answers a whole budget range; legacy versions keyed on the
+    /// remaining budget and kept up to depth-cap duplicate entries per node.
+    tt: FxHashMap<(u64, bool, u8), Bounds>,
     // Per-position memo: forcing move list, budget-independent (mirrors the Python
     // prototype's `state["gencache"]`). Keyed by (board.hash, placements).
     gencache: FxHashMap<(u64, u8), Rc<Vec<CellSet2>>>,
@@ -1413,9 +1454,17 @@ struct SearchState {
     hint_hits: u64,
     guided_lower: u8,
     guided_upper: Option<u8>,
-    /// Winning attacker action discovered for an exact threshold. Guided PV
-    /// recovery consumes this instead of repeating the threshold search.
-    winning_moves: FxHashMap<(u64, u8, u8), CellSet2>,
+    /// Winning attacker action discovered at the SMALLEST proven budget, per
+    /// (position, placements). PV recovery probes query at budgets >= the
+    /// proven one (a win within fewer turns is still a win within more), so
+    /// one shallowest entry answers them all.
+    winning_moves: FxHashMap<(u64, u8), (u8, CellSet2)>,
+    /// Per-cache entry caps (defaults: TT_CAP/GENCACHE_CAP/COMPS_CAP…).
+    /// Fields so tests can shrink them and exercise the drop path cheaply.
+    tt_cap: usize,
+    gen_cap: usize,
+    comps_cap: usize,
+    wm_cap: usize,
 }
 
 impl SearchState {
@@ -1440,6 +1489,10 @@ impl SearchState {
             guided_lower: 0,
             guided_upper: None,
             winning_moves: FxHashMap::default(),
+            tt_cap: TT_CAP,
+            gen_cap: GENCACHE_CAP,
+            comps_cap: COMPS_CAP,
+            wm_cap: WINNING_MOVES_CAP,
         }
     }
 
@@ -1498,6 +1551,68 @@ impl SearchState {
     }
 }
 
+/// Probe the bounds TT: a proven win within `b.win <= budget`, or a proven
+/// give-up-free failure covering `b.no >= budget`. `None` = recompute.
+#[inline]
+fn tt_get(s: &SearchState, key: (u64, bool, u8), budget: u8) -> Option<(bool, bool)> {
+    let &b = s.tt.get(&key)?;
+    if b.win != 0 && b.win <= budget {
+        return Some((true, false));
+    }
+    if b.no != 0 && b.no >= budget {
+        return Some((false, false));
+    }
+    if b.cut_below >= budget {
+        return Some((false, true));
+    }
+    None
+}
+
+/// Merge a result into the bounds TT: wins tighten the win bound, clean
+/// failures raise the no bound, and horizon give-ups raise cut_below (sound to
+/// replay at shallower budgets only — see `Bounds`). Reaching TT_CAP drops the
+/// table: verdicts never change, only recompute cost. Reassigning releases the
+/// allocation — `clear` would keep it, which defeats the point on wasm's
+/// 4 GiB ceiling.
+#[inline]
+fn tt_store(s: &mut SearchState, key: (u64, bool, u8), budget: u8, res: (bool, bool)) {
+    if s.tt.len() >= s.tt_cap {
+        s.tt = FxHashMap::default();
+    }
+    let b = s.tt.entry(key).or_default();
+    if res.0 {
+        if b.win == 0 || budget < b.win {
+            b.win = budget;
+        }
+    } else if !res.1 {
+        if budget > b.no {
+            b.no = budget;
+        }
+    } else if budget > b.cut_below {
+        b.cut_below = budget;
+    }
+}
+
+/// The first winning attacker move proven at any budget <= `budget`, if known.
+#[inline]
+fn winning_move(s: &SearchState, hash: u64, placements: u8, budget: u8) -> Option<CellSet2> {
+    let &(d, mv) = s.winning_moves.get(&(hash, placements))?;
+    (d <= budget).then_some(mv)
+}
+
+/// Record `mv` as winning at `budget`, keeping the smallest (i.e. fastest,
+/// strongest) proven win per (position, placements).
+#[inline]
+fn winning_move_store(s: &mut SearchState, hash: u64, placements: u8, budget: u8, mv: CellSet2) {
+    if s.winning_moves.len() >= s.wm_cap {
+        s.winning_moves = FxHashMap::default();
+    }
+    let e = s.winning_moves.entry((hash, placements)).or_insert((budget, mv));
+    if budget < e.0 {
+        *e = (budget, mv);
+    }
+}
+
 fn tick(s: &mut SearchState) -> bool {
     s.nodes += 1;
     if s.nodes > s.budget {
@@ -1530,6 +1645,9 @@ fn node_comps(board: &SolverBoard, s: &mut SearchState) -> Rc<NodeComps> {
     let atk_c = completions(board, s.atk, s.wl, s.radius);
     let dfn_c = completions(board, s.dfn, s.wl, s.radius);
     let v = Rc::new((atk_c, dfn_c));
+    if s.comps.len() >= s.comps_cap {
+        s.comps = FxHashMap::default(); // release the allocation, not just the entries
+    }
     s.comps.insert(board.hash, Rc::clone(&v));
     v
 }
@@ -1565,6 +1683,9 @@ fn attacker_turns_memo(
         });
     }
     let moves = Rc::new(moves);
+    if s.gencache.len() >= s.gen_cap {
+        s.gencache = FxHashMap::default(); // release the allocation, not just the entries
+    }
     s.gencache.insert(key, Rc::clone(&moves));
     moves
 }
@@ -1595,8 +1716,8 @@ fn atk_within(board: &mut SolverBoard, placements: u8, budget: u8, s: &mut Searc
         return (false, true);
     }
     if budget < 2 { return (false, true); }
-    let key = (board.hash, true, placements, budget);
-    if let Some(&v) = s.tt.get(&key) { return v; }
+    let key = (board.hash, true, placements);
+    if let Some(v) = tt_get(s, key, budget) { return v; }
     let (mut won, mut cut) = (false, false);
     // (winning move, its proven child's support) when capture is enabled.
     let mut won_support: Option<Vec<Coord>> = None;
@@ -1618,7 +1739,7 @@ fn atk_within(board: &mut SolverBoard, placements: u8, budget: u8, s: &mut Searc
         for &c in mv.cells() { board.remove(c); }
         cut |= subcut;
         if w {
-            s.winning_moves.insert((board.hash, placements, budget), mv);
+            winning_move_store(s, board.hash, placements, budget, mv);
             won = true;
             break;
         }
@@ -1627,7 +1748,7 @@ fn atk_within(board: &mut SolverBoard, placements: u8, budget: u8, s: &mut Searc
         s.record_support((board.hash, true, placements), cells);
     }
     let res = if won { (true, false) } else { (false, cut) };
-    if !s.exceeded { s.tt.insert(key, res); }
+    if !s.exceeded { tt_store(s, key, budget, res); }
     res
 }
 
@@ -1672,8 +1793,8 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
             preferred.iter().position(|hinted| hinted == cover).unwrap_or(usize::MAX)
         });
     }
-    let key = (board.hash, false, 0, budget);
-    if let Some(&v) = s.tt.get(&key) { return v; }
+    let key = (board.hash, false, 0);
+    if let Some(v) = tt_get(s, key, budget) { return v; }
     // The all-covers-fail loop below defaults to a win; that is only sound if
     // B == 2 guarantees at least one enumerable cover (a size-2 hitting set
     // implies one). Make the cross-function dependency on min_covers2 explicit,
@@ -1722,7 +1843,7 @@ fn def_within(board: &mut SolverBoard, budget: u8, s: &mut SearchState) -> (bool
     if result.0 && let Some(cells) = support_acc {
         s.record_support((board.hash, false, 0), cells);
     }
-    if !s.exceeded { s.tt.insert(key, result); }
+    if !s.exceeded { tt_store(s, key, budget, result); }
     result
 }
 
@@ -2387,7 +2508,7 @@ fn first_winning_move(board: &mut SolverBoard, placements: u8, depth: u8,
             return c.first();
         }
     }
-    if let Some(mv) = s.winning_moves.get(&(board.hash, placements, depth)) {
+    if let Some(mv) = winning_move(s, board.hash, placements, depth) {
         return mv.first();
     }
     let moves = pv_attacker_turns(board, placements, s);
@@ -2470,10 +2591,7 @@ fn extract_pv(board: &mut SolverBoard, mut placements: u8, depth: u8,
             break;
         }
         // find a winning forcing move
-        let mut chosen = s
-            .winning_moves
-            .get(&(board.hash, placements, remaining))
-            .copied();
+        let mut chosen = winning_move(s, board.hash, placements, remaining);
         if chosen.is_none() {
             let moves = pv_attacker_turns(board, placements, s);
             for &mv in moves.iter() {
@@ -4289,6 +4407,54 @@ mod tests {
             Outcome::No => panic!("wl<5 must never report a proven No"),
             Outcome::Win(w) => panic!("one placement can't win here: {w:?}"),
             Outcome::BudgetExceeded => {}
+        }
+    }
+
+    /// Regression for the browser "unreachable executed" trap. The per-search
+    /// caches retained every node for the whole run, so a `Very long` (100M
+    /// nodes) browser solve climbed past the wasm32 4 GiB allocator ceiling and
+    /// aborted (a trap V8 surfaces as "unreachable executed"). The bounds TT +
+    /// hard cache caps bound memory instead; shrinking the caps exercises the
+    /// drop-and-rebuild path mid-search, and the verdict must be unchanged —
+    /// dropping a cache only forces recomputes, never different truths.
+    ///
+    /// Position: strongloss_a prefix 6, flipped — P2's proven win-in-5 (see
+    /// defense_tests::solve_threat_flips_to_the_opponent).
+    #[test]
+    fn tiny_cache_caps_still_solve_and_never_change_verdicts() {
+        let stones = [
+            ((0, 0), Player::P1), ((1, 2), Player::P2), ((2, 3), Player::P2),
+            ((3, -1), Player::P1), ((2, 1), Player::P1), ((1, 4), Player::P2),
+            ((1, 3), Player::P2),
+        ];
+        let build = || {
+            let mut b = SolverBoard::new();
+            for &(c, p) in &stones {
+                b.place(c, p);
+            }
+            b
+        };
+
+        // Every cache capped at 32 entries: drop-and-rebuild fires constantly.
+        let mut board = build();
+        let mut s = SearchState::new(6, 8, Player::P2, Player::P1, 100_000, false);
+        s.tt_cap = 32;
+        s.gen_cap = 32;
+        s.comps_cap = 32;
+        s.wm_cap = 32;
+        match solve_from_state(&mut board, 2, 10, &mut s) {
+            SolveResult::Win { depth } => {
+                assert_eq!(depth, 5, "cache pressure must not change the verdict")
+            }
+            other => panic!("tiny-capped solve must still find the win-in-5: {other:?}"),
+        }
+
+        // Uncapped control reports the same win.
+        let mut board = build();
+        let mut s = SearchState::new(6, 8, Player::P2, Player::P1, 100_000, false);
+        match solve_from_state(&mut board, 2, 10, &mut s) {
+            SolveResult::Win { depth } => assert_eq!(depth, 5, "uncapped control"),
+            other => panic!("uncapped solve must find the win-in-5: {other:?}"),
         }
     }
 }

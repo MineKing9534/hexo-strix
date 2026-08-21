@@ -75,6 +75,42 @@ _MIN_COMPILER_NOFILE = 65_536
 _BEST_SO_FAR_FORMAT = "hexo-klent-best-so-far-v1"
 
 
+def _critic_losses(
+    output,
+    target_q: torch.Tensor,
+    *,
+    chosen: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the trained critic objective and scalar-Q MSE diagnostic."""
+
+    predicted_q = output.q_values
+    critic_logits = getattr(output, "critic_logits", None)
+    if chosen is not None:
+        predicted_q = predicted_q.index_select(0, chosen)
+        if critic_logits is not None:
+            critic_logits = critic_logits.index_select(0, chosen)
+    predicted_q = predicted_q.float()
+    target_q = target_q.float()
+    q_mse = F.mse_loss(predicted_q, target_q)
+    if critic_logits is None:
+        return q_mse, q_mse
+    if bool((target_q.abs() > 1.0 + 1e-6).any()):
+        raise ValueError("categorical critic targets must lie in [-1, 1]")
+    target_q = target_q.clamp(-1.0, 1.0)
+    target_distribution = torch.stack(
+        (
+            target_q.clamp_min(0.0),
+            (-target_q).clamp_min(0.0),
+            1.0 - target_q.abs(),
+        ),
+        dim=-1,
+    )
+    critic_ce = -(
+        target_distribution * critic_logits.float().log_softmax(dim=-1)
+    ).sum(dim=-1).mean()
+    return critic_ce, q_mse
+
+
 def _checkpoint_iteration_from_path(path: str | Path) -> int | None:
     """Return the KLENT generation encoded in a checkpoint filename."""
 
@@ -934,15 +970,12 @@ def _measure_policy_q_trunk_gradients(
                         policy_loss = (
                             -(target_policy * log_policy).sum() / count
                         )
-                        predicted_q = (
-                            output.q_values
-                            if fit_q_is_selected
-                            else output.q_values.index_select(0, chosen)
-                        ).float()
-                        weighted_q_loss = q_loss_weight * F.mse_loss(
-                            predicted_q,
+                        critic_loss, _q_mse = _critic_losses(
+                            output,
                             target_q,
+                            chosen=None if fit_q_is_selected else chosen,
                         )
+                        weighted_q_loss = q_loss_weight * critic_loss
                     return policy_loss, weighted_q_loss
 
                 policy_loss, unused_q_loss = component_losses()
@@ -1152,7 +1185,7 @@ def _seed_fit_compilation(
                     int(segment_lengths_cpu.max().item()),
                 )
                 policy_loss = -(target_policy * log_policy).sum() / count
-                q_loss = F.mse_loss(output.q_values.float(), target_q)
+                q_loss, _q_mse = _critic_losses(output, target_q)
                 total_loss = policy_loss + q_loss_weight * q_loss
             total_loss.backward()
         model._fit_compile_seeded = True
@@ -1192,6 +1225,7 @@ def train_epoch(
     totals = {
         "policy_loss": torch.zeros((), device=device),
         "q_loss": torch.zeros((), device=device),
+        "q_mse": torch.zeros((), device=device),
     }
     grad_norms: list[torch.Tensor] = []
     update_norms: list[torch.Tensor] = []
@@ -1283,6 +1317,7 @@ def train_epoch(
             group_totals = {
                 "policy_loss": torch.zeros((), device=device),
                 "q_loss": torch.zeros((), device=device),
+                "q_mse": torch.zeros((), device=device),
             }
             group_target_top1 = 0
 
@@ -1322,12 +1357,11 @@ def train_epoch(
                     policy_loss = (
                         -(target_policy * log_policy).sum() / count
                     )
-                    predicted_q = (
-                        output.q_values
-                        if fit_q_is_selected
-                        else output.q_values.index_select(0, chosen)
-                    ).float()
-                    q_loss = F.mse_loss(predicted_q, target_q)
+                    q_loss, q_mse = _critic_losses(
+                        output,
+                        target_q,
+                        chosen=None if fit_q_is_selected else chosen,
+                    )
                     total_loss = q_loss_weight * q_loss
                     if optimize_policy:
                         total_loss = policy_loss + total_loss
@@ -1357,6 +1391,7 @@ def train_epoch(
                     policy_loss.detach() * count
                 )
                 group_totals["q_loss"].add_(q_loss.detach() * q_count)
+                group_totals["q_mse"].add_(q_mse.detach() * q_count)
                 group_target_top1 += target_top1
                 del (
                     batch,
@@ -1368,8 +1403,8 @@ def train_epoch(
                     output,
                     log_policy,
                     policy_loss,
-                    predicted_q,
                     q_loss,
+                    q_mse,
                     total_loss,
                     backward_loss,
                 )
@@ -1397,6 +1432,7 @@ def train_epoch(
                             grad_norm.detach().float(),
                             group_totals["policy_loss"].float(),
                             group_totals["q_loss"].float(),
+                            group_totals["q_mse"].float(),
                         )
                     )
                 )
@@ -1449,12 +1485,20 @@ def train_epoch(
         )
 
     summary = torch.cat(
-        (torch.stack([totals["policy_loss"], totals["q_loss"]]),
-         torch.stack(grad_norms))
+        (
+            torch.stack(
+                [
+                    totals["policy_loss"],
+                    totals["q_loss"],
+                    totals["q_mse"],
+                ]
+            ),
+            torch.stack(grad_norms),
+        )
     ).cpu()
-    policy_loss_total, q_loss_total = summary[:2].tolist()
+    policy_loss_total, q_loss_total, q_mse_total = summary[:3].tolist()
     gradient_stats = _gradient_clip_statistics(
-        summary[2:],
+        summary[3:],
         max_grad_norm,
     )
     update_stats = _optimizer_update_statistics(
@@ -1465,6 +1509,7 @@ def train_epoch(
 
     mean_policy_loss = policy_loss_total / updated_examples
     mean_q_loss = q_loss_total / updated_q_labels
+    mean_q_mse = q_mse_total / updated_q_labels
     return {
         "examples": float(seen),
         "updated_examples": float(updated_examples),
@@ -1484,7 +1529,14 @@ def train_epoch(
         "elapsed_seconds": elapsed_seconds,
         "examples_per_second": seen / elapsed_seconds,
         "policy_loss": mean_policy_loss,
+        "critic_loss": mean_q_loss,
+        **(
+            {"critic_ce": mean_q_loss}
+            if getattr(model, "critic_type", "scalar") == "categorical"
+            else {}
+        ),
         "q_loss": mean_q_loss,
+        "q_mse": mean_q_mse,
         "total_loss": (
             (mean_policy_loss if optimize_policy else 0.0)
             + q_loss_weight * mean_q_loss
@@ -1635,9 +1687,7 @@ def _refit_search_q_head(
                     batch = move_batch_to_device(batch_cpu, device)
                     with _autocast(device, precision):
                         output = model.forward_fit(batch, chosen)
-                        q_loss = F.mse_loss(
-                            output.q_values.float(), target_q
-                        )
+                        q_loss, _q_mse = _critic_losses(output, target_q)
                     q_count = target_q.numel()
                     (q_loss * (q_count / group_q_labels)).backward()
                     group_loss_sum.add_(q_loss.detach() * q_count)
@@ -1919,11 +1969,6 @@ class Trainer:
             "moves_scope",
         )
         if checkpoint.get("format") == "hexo-klent-v1":
-            if not isinstance(self.model, PersistentRayKlentNet):
-                raise ValueError(
-                    "a KLENT checkpoint may be used with --init-from only "
-                    "to graft persistent_ray_axis from graph or dense_axis"
-                )
             raw_config = checkpoint.get("model_config", {})
             if not isinstance(raw_config, dict):
                 raise ValueError(
@@ -1941,6 +1986,54 @@ class Trainer:
                 }
             )
             source_architecture = source_config.architecture
+            if isinstance(self.model, KlentNet):
+                if source_architecture != "graph":
+                    raise ValueError(
+                        "graph KLENT initialization requires a graph KLENT "
+                        "source checkpoint"
+                    )
+                mismatches = [
+                    f"{name}: source={getattr(source_config, name)!r}, "
+                    f"target={getattr(self.config.model, name)!r}"
+                    for name in compatibility_fields
+                    if getattr(source_config, name)
+                    != getattr(self.config.model, name)
+                ]
+                if mismatches:
+                    raise ValueError(
+                        "graph KLENT checkpoint does not match target: "
+                        + "; ".join(mismatches)
+                    )
+                copied = load_production_graph_weights(
+                    self.model,
+                    checkpoint,
+                )
+                self.initial_checkpoint = {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "iteration": checkpoint.get("iteration"),
+                    "copied_tensors": len(copied),
+                    "graft": "graph",
+                    "source_architecture": source_architecture,
+                    "source_critic": source_config.critic,
+                    "target_critic": self.config.model.critic,
+                }
+                logger.info(
+                    "initialized graph KLENT (%s -> %s critic) from %s "
+                    "(%d tensors, source iteration=%s); optimizer starts "
+                    "fresh",
+                    source_config.critic,
+                    self.config.model.critic,
+                    path,
+                    len(copied),
+                    checkpoint.get("iteration", "?"),
+                )
+                return
+            if not isinstance(self.model, PersistentRayKlentNet):
+                raise ValueError(
+                    "KLENT checkpoint initialization supports graph-to-graph "
+                    "or persistent_ray_axis grafting"
+                )
             if source_architecture not in {"graph", "dense_axis"}:
                 raise ValueError(
                     "persistent-ray graft source must use model.architecture="

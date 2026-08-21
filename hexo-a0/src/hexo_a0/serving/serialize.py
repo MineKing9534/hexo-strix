@@ -48,5 +48,6 @@ def state_to_dict(rec: GameRecord, *, placement_radius: int, win_length: int,
         "winner": winner,
         "result_type": result_type,
         "difficulty": rec.difficulty,
+        "model_id": rec.model_id,
         "htttx": serialize_htttx(rec.move_log) if (terminal and include_htttx) else None,
     }

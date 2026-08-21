@@ -1,0 +1,98 @@
+# Categorical-critic revival of the strength-validated KLENT checkpoint 10.
+# The scalar critic is mapped to (+, -, 0) logits as (x, -x, 0), the trunk
+# remains frozen, and the optimizer starts fresh.  Raw categorical Q supplies
+# V-hat and the critic diagnostic; only pi' construction uses Q/max(max_a M,.2).
+#
+#   .venv/bin/hexo-klent train \
+#     --config configs/klent/axis-gine/s4-from-lean-d6-186000-categorical-gamma099-massnorm.toml \
+#     --init-from runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00186000.pt \
+#     --tui
+
+
+[model]
+architecture = "graph"
+critic = "categorical"
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 8
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.01
+beta = 0.10
+tau = 16.0
+gamma = 0.99
+critic_mass_floor = 0.20
+
+[collection]
+# Roughly 4k complete games at the observed 65-move mean, while retaining the
+# current position-budget contract and 64 effective optimizer steps per FIT.
+positions_per_iteration = 262_144
+parallel_games = 512
+inference_batch_size = 256
+inference_edge_budget = 500_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 4_096
+edge_budget = 500_000
+policy_diagnostic_samples = 2_048
+grad_accumulation = true
+prefetch_batches = true
+fit_max_autotune = true
+fit_compile_seed_nodes = 16_384
+learning_rate = 1e-4
+learning_rate_warmup_iterations = 20
+learning_rate_warmup_start_factor = 0.2
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 0.0
+critic_head_only = false
+heads_only = false
+
+[evaluation]
+interval = 5
+opening_plies = 6
+opening_temperature = 0.5
+opening_generator = "alternate"
+
+[[evaluation.opponents]]
+name = "checkpoint186000_anchor"
+kind = "checkpoint"
+checkpoint = "runs/gine-mini/4l-128p32v-lean-d6-qhead/checkpoints/checkpoint_00186000.pt"
+games = 128
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[run]
+iterations = 60
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/axis-gine/s4-from-lean-d6-186000-categorical-gamma099-massnorm"
+checkpoint_interval = 1
+seed = 0

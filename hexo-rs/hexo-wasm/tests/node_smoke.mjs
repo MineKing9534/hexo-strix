@@ -65,3 +65,16 @@ assert.throws(() => bot.best_move(JSON.stringify({ config, stones: [], to_move: 
 
 const label = realWeights ? "REAL" : "tiny";
 console.log(`OK [${label}]: move (${res.move.q},${res.move.r}) value ${ev.value.toFixed(4)} in ${dt.toFixed(0)}ms @ sims=64`);
+
+// KLENT (axis-relational + Q-head) end-to-end: the wasm build must load the lean
+// architecture and reconstruct V = Σ softmax(logits)·Q to match the fixture.
+if (!realWeights) {
+  const klentWeights = readFileSync(join(here, "..", "..", "hexo-infer", "tests", "fixtures", "tiny_klent.safetensors"));
+  const klentFixture = JSON.parse(readFileSync(join(here, "..", "..", "hexo-infer", "tests", "fixtures", "tiny_klent_initial.json"), "utf8"));
+  const klentBot = new StrixBot(klentWeights);
+  const klentEv = JSON.parse(klentBot.evaluate(position));
+  assert.ok(Math.abs(klentEv.value - klentFixture.expected.value) < 1e-4,
+    `klent value ${klentEv.value} != fixture ${klentFixture.expected.value}`);
+  assert.ok(Math.abs(klentEv.policy.reduce((s, e) => s + e.p, 0) - 1.0) < 1e-5, "klent policy sums to 1");
+  console.log(`OK [klent]: value ${klentEv.value.toFixed(4)} (fixture ${klentFixture.expected.value.toFixed(4)})`);
+}

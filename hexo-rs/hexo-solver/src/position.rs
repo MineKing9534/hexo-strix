@@ -449,6 +449,8 @@ fn prover_config(
         // while retaining a useful deep-prover table on desktop browsers.
         tt_mb: if cfg!(target_arch = "wasm32") { 128 } else { 512 },
         pn2_nodes: pn2_nodes.max(1),
+        pn2_scale: 0,
+        pn2_scale_inverse: false,
         leaf_budget: 1_000_000,
         leaf_budget_max: 10_000_000,
         root_screen_budget: 0,

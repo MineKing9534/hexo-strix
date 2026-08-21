@@ -175,6 +175,13 @@ pub struct Stats {
     /// exhaustively excluded (0 = none).
     #[serde(default)]
     pub excluded_through_depth: u8,
+    /// Guided optimizer only: `true` when the saved `certificate` was produced
+    /// by a probe that re-verified at the tightened upper bound. `false` means
+    /// the saved certificate is the original (longer) one and the new upper
+    /// bound is only a verified search upper — the caller should NOT advertise
+    /// the new bound as a proven shortest win in that case.
+    #[serde(default)]
+    pub cert_tightened: bool,
     /// PDS-PN root-screen accounting for the guided shortest-win path.
     #[serde(default)]
     pub screened_attacks: u64,

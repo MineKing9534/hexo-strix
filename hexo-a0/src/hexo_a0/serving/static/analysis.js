@@ -39,7 +39,26 @@ async function convertHds() {
   }
 }
 
+function loadAnalysisHash() {
+  if (currentPathView() !== "analysis") return false;
+  let deepMoves = null;
+  if (location.hash.startsWith("#c=")) deepMoves = decodeMovesCompact(location.hash.slice(3));
+  else if (location.hash.startsWith("#a=")) deepMoves = decodeMovesHash(location.hash.slice(3));
+  if (!deepMoves?.length) return false;
+  document.getElementById("analysis-htttx").value = serializeHtttx([[0, 0], ...deepMoves]);
+  loadGame();
+  return true;
+}
+
+// Following a share link while Analysis is already open is a same-document
+// navigation: DOMContentLoaded does not fire, so consume the new hash explicitly.
+window.addEventListener("hashchange", loadAnalysisHash);
+
 window.addEventListener("DOMContentLoaded", async () => {
+  const modelField = document.getElementById("analysis-model-field");
+  const modelSelect = document.getElementById("analysis-model");
+  if (modelField) modelField.hidden = STRIX_MODELS.length <= 1;
+  populateModelSelect(modelSelect, selectedAnalysisModel);
   restoreAnalysisPreferences();
   updateForcingSolverUi();
   // The path selects the screen; the hash carries the line/game. Old share links
@@ -60,13 +79,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       return;
     }
     // Deep link into a specific line: #c=<compact> (or legacy #a=<decimal>).
-    let deepMoves = null;
-    if (location.hash.startsWith("#c=")) deepMoves = decodeMovesCompact(location.hash.slice(3));
-    else if (location.hash.startsWith("#a=")) deepMoves = decodeMovesHash(location.hash.slice(3));
-    if (deepMoves && deepMoves.length) {
-      document.getElementById("analysis-htttx").value = serializeHtttx([[0, 0], ...deepMoves]);
-      loadGame();
-    }
+    loadAnalysisHash();
     return;
   }
 
@@ -103,42 +116,56 @@ let analysisMode = false;
 let analysisMoves = [];          // loaded mainline move list incl. [0,0] seed
 let analysisTrajectory = null;   // /analyze_game result (drives the eval bar)
 const analysisCfg = window.__HEXO_CFG__ || {};
+let selectedAnalysisModel = localStorage.getItem("hexo_analysis_model") || DEFAULT_MODEL_ID;
+if (!STRIX_MODELS.some(model => model.id === selectedAnalysisModel)) {
+  selectedAnalysisModel = DEFAULT_MODEL_ID;
+}
 const DEFAULT_ANALYSIS_FORCING_DEPTH = 12;
 const MAX_ANALYSIS_FORCING_DEPTH = 60;
+// Sim counts are UNIFIED with Play: they come from the server's difficulty
+// config (__HEXO_CFG__.difficultySims — the same value that drives the Play
+// tiers via --difficulty-sims), so Play and Analysis always agree on what a
+// tier's sim count means. Only the Analysis-specific forcing params stay
+// local; the fallback literals mirror DEFAULT_DIFFICULTY_SIMS in game.py.
+const PLAY_SIMS = analysisCfg.difficultySims || {};
 const ANALYSIS_STRENGTHS = {
-  network: {sims: 0, forcingDepth: 10, forcingBudget: "20000"},
-  quick: {sims: 16, forcingDepth: 8, forcingBudget: "20000"},
-  standard: {sims: 64, forcingDepth: 10, forcingBudget: "20000"},
-  strong: {sims: 128, forcingDepth: 12, forcingBudget: "250000"},
-  deep: {sims: 256, forcingDepth: 16, forcingBudget: "1000000"},
+  network: {sims: 0, forcingDepth: 25, forcingBudget: "20000"},
+  quick: {sims: Number(PLAY_SIMS.quick ?? 0), forcingDepth: 25, forcingBudget: "20000"},
+  standard: {sims: Number(PLAY_SIMS.standard ?? 64), forcingDepth: 25, forcingBudget: "20000"},
+  strong: {sims: Number(PLAY_SIMS.strong ?? 128), forcingDepth: 25, forcingBudget: "250000"},
+  deep: {sims: Number(PLAY_SIMS.deep ?? 512), forcingDepth: 25, forcingBudget: "1000000"},
 };
 const FORCING_ENGINE_INFO = {
   idtt: {
     label: "IDTT",
     help: "Finds the shortest win, up to the maximum number of turns you set. It counts only turns taken by the side trying to win.",
   },
-  dfpn: {
-    label: "DFPN",
-    help: "Looks for any forced win. Search effort controls how long it tries. The turn limit affects only the example line shown after a win is found.",
-  },
   pdspn: {
     label: "PDS-PN",
-    help: "Looks for a forced win and saves the opponent's replies so you can explore them. Search effort controls how long it tries. The turn limit affects only the example line.",
+    help: "Finds and verifies a forced win, saving every checked reply for exploration. It does not prove that the win is the shortest possible.",
   },
   "pdspn-shortest": {
     label: "PDS-PN shortest",
-    help: "First finds a forced win, then checks whether the same player can force it sooner. It calls the result shortest only after ruling out every shorter win.",
-  },
-  pns: {
-    label: "PNS",
-    help: "Provides a second yes-or-no check. It does not show a winning line or say how many turns the win takes.",
+    help: "First finds and verifies a forced win. Then it reuses that proof to rule out every shorter win. The saved best-defence line chooses the reply that delays the win longest.",
   },
 };
-let forcingUiEngine = "idtt";
+let forcingUiEngine = "pdspn-shortest";
 let forcingIdttDepth = DEFAULT_ANALYSIS_FORCING_DEPTH;
 let forcingDeepRecoveryDepth = MAX_ANALYSIS_FORCING_DEPTH;
 let forcingShortestDepth = 25;
-let forcingWorker = null;
+// One user-facing effort scale controls both layers of PDS-PN. Internally each
+// PDS-PN run races complementary PN² branch budgets; users should not need to
+// understand or tune those algorithm-specific limits.
+const FORCING_EFFORT_LEVELS = [
+  {label: "Quick", hint: "A fast check for simple positions.", nodeBudget: 20_000},
+  {label: "Standard", hint: "Good default for most positions.", nodeBudget: 250_000},
+  {label: "Thorough", hint: "More time for difficult positions.", nodeBudget: 1_000_000},
+  {label: "Deep", hint: "A long search that may keep your device busy.", nodeBudget: 5_000_000},
+  {label: "Extended", hint: "For stubborn positions; expect a long wait.", nodeBudget: 25_000_000},
+  {label: "Maximum", hint: "The longest local search. Your device may stay busy for a while.", nodeBudget: 100_000_000},
+];
+const PDS_PORTFOLIO_BRANCH_BUDGETS = [2000, 5000, 50000];
+let forcingWorkers = [];
 let forcingRun = null;
 let forcingRequestSerial = 0;
 let analysisView = { x: 0, y: 0, scale: 1 };
@@ -225,7 +252,7 @@ function updateProofLabPosition() {
   const label = document.getElementById("proof-lab-position");
   if (!label || !analysisCurrent) return;
   const side = analysisCurrent.result?.current_player || "side to move";
-  label.textContent = `Position ${analysisCurrent.depth + 1} · ${side} to move`;
+  label.textContent = `${positionWord()} ${positionNumber(analysisCurrent.depth)} · ${side} to move`;
 }
 
 document.addEventListener("keydown", event => {
@@ -278,6 +305,11 @@ function saveDisplayPreferences() {
   rerenderCurrentAnalysis();
 }
 
+function savePositionNumbering() {
+  localStorage.setItem("hexo_analysis_numbering", positionNumbering());
+  rerenderCurrentAnalysis();
+}
+
 function updateAnalysisSettingsStatus() {
   const status = document.getElementById("analysis-settings-status");
   if (!status) return;
@@ -306,6 +338,9 @@ function restoreAnalysisPreferences() {
     const input = document.getElementById(id);
     if (input && saved !== null) input.checked = saved === "true";
   }
+  const savedNumbering = localStorage.getItem("hexo_analysis_numbering");
+  const numbering = document.getElementById("analysis-numbering");
+  if (numbering && savedNumbering) numbering.value = savedNumbering;
   updateAnalysisSettingsStatus();
 }
 
@@ -356,11 +391,26 @@ function localInference(type, payload, progress, estimate) {
   const requestId = ++inferenceRequestSerial;
   return new Promise((resolve, reject) => {
     inferencePending.set(requestId, {resolve, reject, progress, estimate});
+    const modelId = payload.modelId || selectedAnalysisModel;
     getInferenceWorker().postMessage({
-      type, requestId, modelUrl: (window.__HEXO_CFG__ || {}).modelUrl,
+      type, requestId, modelUrl: strixModelUrl(modelId),
       ...payload,
     });
   });
+}
+
+function selectAnalysisModel() {
+  const select = document.getElementById("analysis-model");
+  if (!select) return;
+  const next = strixModel(select.value).id;
+  if (next === selectedAnalysisModel) return;
+  selectedAnalysisModel = next;
+  localStorage.setItem("hexo_analysis_model", next);
+  if (analysisCancel) analysisCancel.abort();
+  positionAnalysisSequence++;
+  cancelLocalInference();
+  if (analysisMoves.length) loadGame();
+  updateAnalysisSettingsStatus();
 }
 
 function _newNode(move, player, parent, result) {
@@ -382,6 +432,35 @@ function playerAtDepth(depth) {
   return ((depth - 1) % 4) < 2 ? "P2" : "P1";
 }
 
+// Position numbering: "ply" numbers each placement uniquely (1,2,3,...);
+// "round" groups each full round (one turn from each side). The seed (depth 0)
+// is P1's (0,0) opening stone; under standard rules P2 then opens round 1 with
+// their first placement, so round 1 holds 4 placements (P2:2 + P1:2 = depths
+// 1..4) and every subsequent round also holds 4 (1,1,1,1,2,2,2,2,...).
+function positionNumbering() {
+  const select = document.getElementById("analysis-numbering");
+  return select?.value || localStorage.getItem("hexo_analysis_numbering") || "ply";
+}
+
+function positionNumber(depth) {
+  // "ply" mode: each placement is a unique number starting at 1 (depth 0 is the
+  // seed, which has no placement).
+  if (positionNumbering() !== "round") return depth + 1;
+  // "round" mode: a round spans one full turn from each side. The seed (depth 0)
+  // is P1's (0,0) opening stone; P2 then opens round 1 with their first placement.
+  // Under standard HeXO rules (every turn places 2 stones, every player), round 1
+  // holds 4 placements (P2's 1st+2nd, P1's 1st+2nd = depths 1..4) and every
+  // subsequent round also holds 4. The previous formula (depth+1)/4 made round 1
+  // three placements wide, which only matches a non-standard 1-stone opener; the
+  // standard game starts with P2 having moves_left=2.
+  if (depth <= 0) return 0;
+  return Math.floor((depth + 3) / 4);
+}
+
+function positionWord() {
+  return positionNumbering() === "round" ? "Round" : "Position";
+}
+
 function forcingDepthFromUi() {
   const input = document.getElementById("analysis-forcing-depth");
   let depth = Number(input ? input.value : DEFAULT_ANALYSIS_FORCING_DEPTH);
@@ -389,6 +468,21 @@ function forcingDepthFromUi() {
   depth = Math.max(1, Math.min(MAX_ANALYSIS_FORCING_DEPTH, depth));
   if (input) input.value = String(depth);
   return depth;
+}
+
+function forcingEffortFromUi() {
+  const input = document.getElementById("analysis-forcing-effort");
+  const index = Math.max(0, Math.min(FORCING_EFFORT_LEVELS.length - 1,
+    Number.parseInt(input && input.value, 10) || 0));
+  return FORCING_EFFORT_LEVELS[index];
+}
+
+function updateForcingEffortUi() {
+  const effort = forcingEffortFromUi();
+  const label = document.getElementById("analysis-forcing-effort-label");
+  const hint = document.getElementById("analysis-forcing-effort-hint");
+  if (label) label.textContent = effort.label;
+  if (hint) hint.textContent = effort.hint;
 }
 
 function updateForcingSolverUi() {
@@ -399,31 +493,19 @@ function updateForcingSolverUi() {
   if (next !== forcingUiEngine) {
     if (forcingUiEngine === "idtt") forcingIdttDepth = forcingDepthFromUi();
     else if (forcingUiEngine === "pdspn-shortest") forcingShortestDepth = forcingDepthFromUi();
-    else if (forcingUiEngine !== "pns") forcingDeepRecoveryDepth = forcingDepthFromUi();
+    else forcingDeepRecoveryDepth = forcingDepthFromUi();
     depthInput.value = String(next === "idtt" ? forcingIdttDepth
       : next === "pdspn-shortest" ? forcingShortestDepth : forcingDeepRecoveryDepth);
     forcingUiEngine = next;
   }
-  const isPns = next === "pns";
   const isIdtt = next === "idtt";
   const isShortest = next === "pdspn-shortest";
-  const isPds = next === "pdspn" || isShortest;
-  document.getElementById("analysis-forcing-depth-row").hidden = isPns;
-  document.getElementById("analysis-forcing-leaf-row").hidden = !isPds;
+  document.getElementById("analysis-forcing-depth-row").hidden = false;
   document.getElementById("analysis-forcing-depth-label").textContent = isShortest
     ? "Longest win to check"
     : isIdtt ? "Maximum turns by the winning side" : "Maximum turns in the example line";
-  document.getElementById("analysis-forcing-budget-label").textContent = "Search effort";
   document.getElementById("analysis-solver-help").textContent = FORCING_ENGINE_INFO[next].help;
-
-  // Best-first PNS retains its whole tree. Very large budgets can exhaust a
-  // browser tab before the counter is reached; DFPN/PDS-PN are the long-run
-  // engines and keep the larger steps available.
-  const budget = document.getElementById("analysis-forcing-budget");
-  for (const option of budget.options) {
-    option.disabled = isPns && Number(option.value) > 1_000_000;
-  }
-  if (isPns && Number(budget.value) > 1_000_000) budget.value = "1000000";
+  updateForcingEffortUi();
 }
 
 function setForcingStatus(message, state = "") {
@@ -450,11 +532,11 @@ function restoreForcingStatusForNode(node) {
   const label = engine ? engine.label : search.engine;
   const width = search.width === "wide" ? "Broad search" : "Direct-only search";
   const elapsed = formatSolverElapsed(search.elapsed_ms);
-  const work = formatSolverNodes(search.nodes, search.engine);
+  const effort = search.effort_label ? `${search.effort_label} effort · ` : "";
   if (search.kind === "win") {
     if (search.engine === "pdspn-shortest" && search.shortest_certified) {
       setForcingStatus(
-        `Shortest forced win: ${search.best_upper_depth} turns by the winning side. The search ruled out every win in ${search.excluded_through_depth} turns or fewer. ${width} · ${work} · ${elapsed}.`,
+        `Shortest forced win: ${search.best_upper_depth} turns by the winning side. The search ruled out every win in ${search.excluded_through_depth} turns or fewer. ${width} · ${effort}${elapsed}.`,
         "win",
       );
       return;
@@ -466,18 +548,18 @@ function restoreForcingStatusForNode(node) {
     const certified = certificate
       ? ` · every saved reply checked; win within ${certificate.maxAttackerTurns} turns by the winning side`
       : "";
-    setForcingStatus(`Forced win proved (${proof}). ${label} · ${width} · ${work}${certified} · ${elapsed}.`, "win");
+    setForcingStatus(`Forced win proved (${proof}). ${label} · ${width} · ${effort}${elapsed}${certified}.`, "win");
   } else if (search.kind === "no") {
-    setForcingStatus(`No forced win exists within the selected settings. ${label} · ${width} · ${work} · ${elapsed}.`, "no");
+    setForcingStatus(`No forced win exists within the selected settings. ${label} · ${width} · ${effort}${elapsed}.`, "no");
   } else {
     if (search.engine === "pdspn-shortest" && search.best_upper_depth) {
       const lower = Number(search.excluded_through_depth || 0);
       const range = lower > 0
         ? `The shortest win takes between ${lower + 1} and ${search.best_upper_depth} turns by the winning side`
         : `A win within ${search.best_upper_depth} turns is proved, but it may be possible sooner`;
-      setForcingStatus(`The search stopped before it could prove the exact shortest win. ${range}. ${width} · ${work} · ${elapsed}.`, "budget");
+      setForcingStatus(`The search stopped before it could prove the exact shortest win. ${range}. ${width} · ${effort}${elapsed}.`, "budget");
     } else {
-      setForcingStatus(`The search used all the selected effort without reaching a conclusion. Choose more effort or another method. ${label} · ${width} · ${work} · ${elapsed}.`, "budget");
+      setForcingStatus(`The search used all the selected effort without reaching a conclusion. Increase search effort to continue. ${label} · ${width} · ${effort}${elapsed}.`, "budget");
     }
   }
 }
@@ -493,8 +575,7 @@ function setForcingControlsRunning(running) {
     if (button) button.disabled = running;
   }
   for (const id of ["analysis-forcing-engine", "analysis-forcing-width",
-                    "analysis-forcing-depth", "analysis-forcing-budget",
-                    "analysis-forcing-leaf-budget"]) {
+                    "analysis-forcing-depth", "analysis-forcing-effort"]) {
     document.getElementById(id).disabled = running;
   }
 }
@@ -549,19 +630,58 @@ function forcingWorkerUrl() {
   return `${URL_PREFIX}/static/solver-worker.js?v=${version}`;
 }
 
-function ensureForcingWorker() {
-  if (forcingWorker) return forcingWorker;
-  forcingWorker = new Worker(forcingWorkerUrl(), {type: "module", name: "strix-forced-win"});
-  forcingWorker.onmessage = (event) => {
-    const message = event.data || {};
-    if (!forcingRun || message.requestId !== forcingRun.id) return;
-    if (message.type === "result") finishForcingSolve(message.result);
-    else if (message.type === "error") failForcingSolve(message.error);
-  };
-  forcingWorker.onerror = (event) => {
-    if (forcingRun) failForcingSolve(event.message || "The solver worker crashed.");
-  };
-  return forcingWorker;
+function ensureForcingWorkers(leafBudgets) {
+  if (forcingWorkers.length) return forcingWorkers;
+  forcingWorkers = leafBudgets.map((leafBudget) => {
+    const worker = new Worker(forcingWorkerUrl(), {type: "module", name: "strix-forced-win"});
+    const entry = {worker, leafBudget, done: false, result: null};
+    worker.onmessage = (event) => {
+      const message = event.data || {};
+      if (!forcingRun || message.requestId !== forcingRun.id) return;
+      if (message.type === "result") handleForcingResult(entry, message.result);
+      else if (message.type === "error") failForcingSolve(message.error);
+    };
+    worker.onerror = (event) => {
+      if (forcingRun) failForcingSolve(event.message || "The solver worker crashed.");
+    };
+    return entry;
+  });
+  return forcingWorkers;
+}
+
+// A definitive result (win/no) from any racer ends the portfolio immediately; a
+// budget-exhausted result only ends it once every racer has exhausted its
+// budget, in which case the most thorough (largest leaf budget) result wins.
+function handleForcingResult(entry, result) {
+  if (!forcingRun) return;
+  entry.done = true;
+  entry.result = result;
+  // A staged shortest worker can prove a WIN before it has ruled out shorter
+  // wins. Let the other portfolio members continue unless this result is exact.
+  const definitive = result.kind === "no"
+    || (result.kind === "win"
+      && (forcingRun.engine !== "pdspn-shortest" || result.shortestCertified));
+  if (definitive) {
+    finishForcingSolve(result, entry.leafBudget);
+    return;
+  }
+  if (forcingWorkers.every((worker) => worker.done)) {
+    const quality = worker => {
+      const value = worker.result || {};
+      const upper = Number(value.bestUpperDepth || value.depth || Number.MAX_SAFE_INTEGER);
+      const lower = Number(value.excludedThroughDepth || 0);
+      return [Boolean(value.shortestCertified), Math.max(0, upper - lower - 1), upper, -lower];
+    };
+    const best = forcingWorkers.reduce((a, b) => {
+      const qa = quality(a), qb = quality(b);
+      if (qa[0] !== qb[0]) return qb[0] ? b : a;
+      for (let index = 1; index < qa.length; index++) {
+        if (qa[index] !== qb[index]) return qb[index] < qa[index] ? b : a;
+      }
+      return b.leafBudget > a.leafBudget ? b : a;
+    });
+    finishForcingSolve(best.result, best.leafBudget);
+  }
 }
 
 function formatSolverElapsed(ms) {
@@ -570,16 +690,6 @@ function formatSolverElapsed(ms) {
 
 function isPdsEngine(engine) {
   return engine === "pdspn" || engine === "pdspn-shortest";
-}
-
-function formatSolverNodes(nodes, engine = "") {
-  if (!nodes || nodes === "0") return "search-step count unavailable";
-  try { return `${BigInt(nodes).toLocaleString()} search steps`; }
-  catch (_error) { return `${nodes} search steps`; }
-}
-
-function formatSolverBudget(engine, budget) {
-  return `${budget.toLocaleString()} search steps`;
 }
 
 function formatForcingLine(engine, attackerTurns, placements) {
@@ -599,12 +709,12 @@ function settleForcingUi() {
   setForcingControlsRunning(false);
 }
 
-function releaseForcingWorker() {
-  if (forcingWorker) forcingWorker.terminate();
-  forcingWorker = null;
+function releaseForcingWorkers() {
+  for (const entry of forcingWorkers) entry.worker.terminate();
+  forcingWorkers = [];
 }
 
-function finishForcingSolve(result) {
+function finishForcingSolve(result, leafBudget) {
   if (!forcingRun) return;
   const run = forcingRun;
   settleForcingUi();
@@ -612,18 +722,19 @@ function finishForcingSolve(result) {
   // Rust allocations are freed by the worker, but WebAssembly linear memory
   // cannot shrink. End the one-shot worker so a deep proof's arena/TT is
   // actually returned to the browser after its serialized result arrives.
-  releaseForcingWorker();
+  releaseForcingWorkers();
   const engineInfo = FORCING_ENGINE_INFO[run.engine];
   const widthLabel = run.width === "wide" ? "Broad search" : "Direct-only search";
   const elapsed = formatSolverElapsed(result.elapsedMs);
-  const work = formatSolverNodes(result.nodes, run.engine);
+  const effortText = `${run.effort.label} effort`;
   run.node.result.forcing_search = {
     kind: result.kind,
     engine: run.engine,
     width: run.width,
     depth_cap: run.depth,
     node_budget: run.budget,
-    leaf_node_budget: isPdsEngine(run.engine) ? run.leafBudget : null,
+    effort_label: run.effort.label,
+    leaf_node_budget: isPdsEngine(run.engine) ? leafBudget : null,
     nodes: result.nodes,
     elapsed_ms: result.elapsedMs,
     proof_depth: result.depth,
@@ -692,12 +803,23 @@ function finishForcingSolve(result) {
       const upper = result.bestUpperDepth;
       const lower = result.excludedThroughDepth;
       setForcingStatus(
-        `Shortest forced win for ${run.position.toMove}: ${upper} turns by that player. The search ruled out every win in ${lower} turns or fewer. ${widthLabel} · ${work} · ${elapsed}.`,
+        `Shortest forced win for ${run.position.toMove}: ${upper} turns by that player. The search ruled out every win in ${lower} turns or fewer. ${widthLabel} · ${effortText} · ${elapsed}.`,
         "win",
       );
     } else {
+      // The solver returned Win but result.pv is empty — the budget ran out
+      // before the worker could save a sample line. Every checked reply is
+      // still in the saved certificate, so the user can open the proof
+      // explorer to see them. Be honest: the moves exist, the SAMPLE LINE
+      // is what's missing, and a higher search effort may unblock it.
+      const hasSavedReplies = Boolean(result.certificate && result.certificateSummary);
+      const lineNote = result.pv.length > 0
+        ? proof
+        : hasSavedReplies
+          ? "every saved reply is in the proof explorer (no example line was saved)"
+          : "the example line is not available";
       setForcingStatus(
-        `Forced win proved for ${run.position.toMove} (${proof}). ${engineInfo.label} · ${widthLabel} · ${work}${certified} · ${elapsed}.`,
+        `Forced win proved for ${run.position.toMove} (${lineNote}). ${engineInfo.label} · ${widthLabel} · ${effortText} · ${elapsed}${certified}.`,
         "win",
       );
     }
@@ -706,7 +828,7 @@ function finishForcingSolve(result) {
       ? `within ${run.depth} turns by that player`
       : `within the selected settings`;
     setForcingStatus(
-      `No forced win exists for ${run.position.toMove} ${scope}. ${engineInfo.label} · ${work} · ${elapsed}.`,
+      `No forced win exists for ${run.position.toMove} ${scope}. ${engineInfo.label} · ${effortText} · ${elapsed}.`,
       "no",
     );
   } else {
@@ -716,12 +838,12 @@ function finishForcingSolve(result) {
         ? `The shortest win takes between ${lower + 1} and ${result.bestUpperDepth} turns by the winning side.`
         : `A win within ${result.bestUpperDepth} turns is proved, but it may be possible sooner.`;
       setForcingStatus(
-        `The search stopped before it could prove the exact shortest win. ${range} ${widthLabel} · ${work} · ${elapsed}. Choose more search effort to continue.`,
+        `The search stopped before it could prove the exact shortest win. ${range} ${widthLabel} · ${effortText} · ${elapsed}. Choose more search effort to continue.`,
         "budget",
       );
     } else {
       setForcingStatus(
-        `The search used all ${formatSolverBudget(run.engine, run.budget)} without reaching a conclusion. Choose more effort or another method. ${engineInfo.label} · ${widthLabel} · ${elapsed}.`,
+        `The ${effortText.toLowerCase()} search ended without a conclusion. Increase search effort to continue. ${engineInfo.label} · ${widthLabel} · ${elapsed}.`,
         "budget",
       );
     }
@@ -751,7 +873,7 @@ function downloadForcingCertificate() {
 function failForcingSolve(error) {
   settleForcingUi();
   forcingRun = null;
-  releaseForcingWorker();
+  releaseForcingWorkers();
   setForcingStatus(`The search stopped because of an error: ${error}`, "error");
 }
 
@@ -760,7 +882,7 @@ function cancelForcingSolve(message = "Search cancelled. No result was recorded.
   settleForcingUi();
   forcingRun = null;
   forcingRequestSerial += 1;
-  releaseForcingWorker();
+  releaseForcingWorkers();
   setForcingStatus(message, "budget");
 }
 
@@ -772,9 +894,11 @@ function solveCurrentForcing() {
   if (forcingRun) return;
   const engine = document.getElementById("analysis-forcing-engine").value;
   const width = document.getElementById("analysis-forcing-width").value;
-  const depth = engine === "pns" ? MAX_ANALYSIS_FORCING_DEPTH : forcingDepthFromUi();
-  const budget = Number(document.getElementById("analysis-forcing-budget").value);
-  const leafBudget = Number(document.getElementById("analysis-forcing-leaf-budget").value);
+  const depth = forcingDepthFromUi();
+  const effort = forcingEffortFromUi();
+  const budget = effort.nodeBudget;
+  const isPortfolio = isPdsEngine(engine);
+  const leafBudgets = isPortfolio ? PDS_PORTFOLIO_BRANCH_BUDGETS : [2000];
   const node = analysisCurrent;
   let position;
   try {
@@ -783,33 +907,40 @@ function solveCurrentForcing() {
     const reusableCertificate = engine === "pdspn-shortest"
       && existingProof && existingProof.width === width
       ? existingProof.certificate : null;
-    const worker = ensureForcingWorker();
+    const workers = ensureForcingWorkers(leafBudgets);
     const id = ++forcingRequestSerial;
     forcingRun = {
-      id, node, position, engine, width, depth, budget, leafBudget,
-      reusedCertificate: Boolean(reusableCertificate), started: performance.now(),
+      id, node, position, engine, width, depth, budget, effort,
+      portfolio: isPortfolio, reusedCertificate: Boolean(reusableCertificate), started: performance.now(),
     };
     forcingRun.ticker = setInterval(() => {
       if (!forcingRun || forcingRun.id !== id) return;
       const seconds = Math.floor((performance.now() - forcingRun.started) / 1000);
       const depthText = engine === "idtt" ? ` for wins within ${depth} turns`
         : engine === "pdspn-shortest" ? ` for wins within ${depth} turns` : "";
+      const coresText = isPortfolio
+        ? `${leafBudgets.length} processor cores in parallel`
+        : "one processor core";
       setForcingStatus(
-        `Searching${depthText} with ${FORCING_ENGINE_INFO[engine].label}… ${seconds}s elapsed. This uses one processor core on your device.`,
+        `Searching${depthText} with ${FORCING_ENGINE_INFO[engine].label}… ${seconds}s elapsed. This uses ${coresText} on your device.`,
       );
     }, 1000);
     setForcingControlsRunning(true);
     const depthText = engine === "idtt" || engine === "pdspn-shortest"
       ? `, checking up to ${depth} turns by the winning side` : "";
     const proofText = reusableCertificate ? " The search will reuse the winning replies already saved for this position." : "";
+    const portfolioText = isPortfolio
+      ? " The solver will automatically race complementary search strategies." : "";
     setForcingStatus(
-      `Starting ${FORCING_ENGINE_INFO[engine].label}: ${width === "wide" ? "broad" : "direct-only"} search${depthText}, with ${formatSolverBudget(engine, budget)}.${proofText}`,
+      `Starting ${effort.label.toLowerCase()}-effort ${FORCING_ENGINE_INFO[engine].label}: ${width === "wide" ? "broad" : "direct-only"} search${depthText}.${portfolioText}${proofText}`,
     );
-    worker.postMessage({
-      type: "solve", requestId: id, position, engine, width,
-      depthCap: depth, nodeBudget: String(budget), leafNodeBudget: String(leafBudget),
-      certificate: reusableCertificate,
-    });
+    for (const entry of workers) {
+      entry.worker.postMessage({
+        type: "solve", requestId: id, position, engine, width,
+        depthCap: depth, nodeBudget: String(budget), leafNodeBudget: String(entry.leafBudget),
+        certificate: reusableCertificate,
+      });
+    }
   } catch (error) {
     failForcingSolve(error.message || error);
   }
@@ -999,6 +1130,36 @@ function loadGame() {
   }
 }
 
+async function copyAnalysisHtttx() {
+  if (!analysisMoves?.length) return;
+  const text = serializeHtttx(analysisMoves);
+  const button = document.getElementById("analysis-copy-htttx");
+  const original = button?.textContent || "Copy as HTTTX";
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
+    await navigator.clipboard.writeText(text);
+  } catch (_error) {
+    const fallback = document.createElement("textarea");
+    fallback.value = text;
+    fallback.setAttribute("readonly", "");
+    fallback.style.position = "fixed";
+    fallback.style.opacity = "0";
+    document.body.appendChild(fallback);
+    fallback.select();
+    const copied = document.execCommand("copy");
+    fallback.remove();
+    if (!copied) {
+      const info = document.getElementById("analysis-info");
+      if (info) info.textContent = "Could not copy the game record. Check the browser's clipboard permission.";
+      return;
+    }
+  }
+  if (button) {
+    button.textContent = "Copied";
+    window.setTimeout(() => { button.textContent = original; }, 2500);
+  }
+}
+
 async function analyzeWholeGame() {
   const text = document.getElementById("analysis-htttx").value;
   const moves = parseHtttx(text);
@@ -1070,7 +1231,9 @@ async function analyzeWholeGame() {
     showProgress(true, "This browser could not run the analysis. Trying the server…", 0, 0, null);
     try {
       let result = null;
-      await streamSSE(URL_PREFIX + "/analyze_game", {moves: analysisMoves}, (ev, data) => {
+      await streamSSE(URL_PREFIX + "/analyze_game", {
+        moves: analysisMoves, model_id: selectedAnalysisModel,
+      }, (ev, data) => {
         if (ev === "queued") showProgress(true, "Waiting for server analysis…", 0, 0, null);
         else if (ev === "progress") showProgress(true, "Analyzing on the server…", data.done, data.total, data.eta_seconds);
         else if (ev === "result") result = data;
@@ -1349,6 +1512,27 @@ function analysisUndo() {
   if (analysisCurrent && analysisCurrent.parent) setCurrent(analysisCurrent.parent);
 }
 
+function analysisStepForward() {
+  if (!analysisCurrent) return;
+  const mainChild = analysisMain[analysisCurrent.depth + 1];
+  if (mainChild?.parent === analysisCurrent) setCurrent(mainChild);
+  else if (analysisCurrent.children.length) setCurrent(analysisCurrent.children[0]);
+}
+
+function onAnalysisArrowKeydown(event) {
+  if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  if (currentPathView() !== "analysis" || !analysisTree) return;
+  const target = event.target;
+  if (target instanceof Element && (target.matches("input, textarea, select") || target.closest("[contenteditable=true]"))) return;
+  if (document.querySelector("dialog[open]")) return;
+  event.preventDefault();
+  if (event.key === "ArrowLeft") analysisUndo();
+  else analysisStepForward();
+}
+
+window.addEventListener("keydown", onAnalysisArrowKeydown);
+
 function forcingIsUnstoppable(forcing) {
   const d = forcing?.defense;
   return Boolean(d && !(d.killers?.length || d.pair_anchors?.length) && d.best_delay);
@@ -1467,8 +1651,8 @@ function renderEvalBar() {
     const entry = tr[si];
     const value = effectiveP1Eval(entry);
     canvas.setAttribute("aria-valuetext", entryHasEvaluation(entry)
-      ? `Position ${si + 1}, P1 ${value >= 0 ? "+" : ""}${value.toFixed(2)}`
-      : `Position ${si + 1}, not analyzed`);
+      ? `${positionWord()} ${positionNumber(si)}, P1 ${value >= 0 ? "+" : ""}${value.toFixed(2)}`
+      : `${positionWord()} ${positionNumber(si)}, not analyzed`);
   }
 }
 
@@ -1492,8 +1676,8 @@ function updateAnalysisEvalPreview(index) {
   }
   const value = effectiveP1Eval(entry);
   preview.textContent = entryHasEvaluation(entry)
-    ? `Position ${index + 1} · P1 ${value >= 0 ? "+" : ""}${value.toFixed(2)}`
-    : `Position ${index + 1} · not analyzed`;
+    ? `${positionWord()} ${positionNumber(index)} · P1 ${value >= 0 ? "+" : ""}${value.toFixed(2)}`
+    : `${positionWord()} ${positionNumber(index)} · not analyzed`;
   preview.hidden = false;
 }
 
@@ -1634,7 +1818,7 @@ async function analyzePosition(moves, onEstimate = null) {
     try {
       const resp = await fetch(URL_PREFIX + "/analyze", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({moves}),
+        body: JSON.stringify({moves, model_id: selectedAnalysisModel}),
       });
       return resp.ok ? await resp.json() : null;
     } catch (_fallbackError) { return null; }
@@ -1891,7 +2075,7 @@ function renderNode(node) {
 
     html =
       `<div class="vc-head"><div class="vc-glyph">${q.icon}</div>`
-      + `<div class="vc-label">${q.label === "forced" ? "No saving move" : q.label === "winning" ? "Winning move" : q.label[0].toUpperCase() + q.label.slice(1)}<small>Turn ${Math.ceil(node.depth / 2)} · ${turnPlayer}</small></div></div>`
+      + `<div class="vc-label">${q.label === "forced" ? "No saving move" : q.label === "winning" ? "Winning move" : q.label[0].toUpperCase() + q.label.slice(1)}<small>${positionWord()} ${positionNumber(node.depth)} · ${turnPlayer}</small></div></div>`
       + metric
       + `<div class="vc-sec"><div class="h">What happened</div><p>${board}</p></div>`
       + pickTier
@@ -1900,11 +2084,12 @@ function renderNode(node) {
     info.classList.remove("vc");
     info.style.removeProperty("--c");
     const positionTotal = analysisMain[node.depth] === node ? analysisMain.length : lineOf(node).length;
+    const totalLabel = positionNumbering() === "round" ? positionNumber(positionTotal - 1) : positionTotal;
     html = `<div class="position-readout"><span class="position-turn"><b>${cp}</b> to move</span>`
          + (evalStr == null
            ? `<span class="ro-eval ro-unanalysed">Not analyzed</span>`
            : `<span class="ro-eval"><small>P1 ${result.estimate_pending ? "estimate" : "score"}</small><b>${evalStr}</b></span>`)
-         + `<span class="ro-pos" title="Position ${node.depth + 1} of ${positionTotal}">${node.depth + 1}/${positionTotal}</span></div>`
+         + `<span class="ro-pos" title="${positionWord()} ${positionNumber(node.depth)} of ${totalLabel}">${positionNumber(node.depth)}/${totalLabel}</span></div>`
          + renderTopMovesHtml(result);
   }
   info.innerHTML = html;
@@ -2093,10 +2278,10 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
       const fontSize = Math.round(S * 0.42);
       if (isAttacker) {
         body += `<circle class="${cls}" cx="${p.x}" cy="${p.y}" r="${S * 0.42}" fill="${attackerColor}"/>`;
-        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}">${i + 1}</text>`;
+        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}">${positionNumber(i)}</text>`;
       } else {
         body += `<circle class="${cls}" cx="${p.x}" cy="${p.y}" r="${S * 0.42}" stroke="${defenderColor}"/>`;
-        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}" fill="${defenderColor}">${i + 1}</text>`;
+        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}" fill="${defenderColor}">${positionNumber(i)}</text>`;
       }
     });
   }
@@ -2189,8 +2374,15 @@ function updateForcingBanner(forcing) {
   const depthText = forcing.depth != null
     ? `example takes ${forcing.depth} turn${forcing.depth === 1 ? "" : "s"} by the winning side`
     : "number of turns unavailable";
+  // Same situation as the proof-lab status above: result.pv can be empty
+  // (verdict_only || !hasLine) while a saved certificate still exists.
+  // Don't lie about the moves being unavailable — point the user at the
+  // saved replies and suggest a higher budget when the sample line is the
+  // only thing missing.
   const proofText = forcing.verdict_only || !hasLine
-    ? "win proved; moves not available"
+    ? forcing.certificate_summary
+      ? "win proved; every reply checked is in the saved certificate (no example line was saved)"
+      : "win proved; moves not available"
     : `${depthText} · ${placements} placement${placements === 1 ? "" : "s"}`;
   const certified = forcing.certificate_summary
     ? ` · every saved reply checked; win within ${forcing.certificate_summary.maxAttackerTurns} turns by the winning side`
@@ -2318,22 +2510,6 @@ function discardSideLine(parent, child, message) {
 }
 
 // --- PGN-style move tree rendering -----------------------------------------
-function _moveLink(node) {
-  const active = node === analysisCurrent ? " move-active" : "";
-  // missed_win is per placement (computed after a whole-game analysis), so
-  // side-line nodes from a single-position analysis do not carry it. Check it
-  // here
-  // rather than once per turn: whichever of the turn's (up to 2) move links
-  // squandered the win gets the badge, not necessarily the turn-end one.
-  const mw = node.result && node.result.missed_win;
-  const badge = mw
-    ? ` <span class="missed-win-badge" onclick="showMissedWin(${node._id})" `
-    + `title="This move gave up a forced win. Show the winning line.">&#9889; Win missed</span>`
-    : "";
-  return `<span class="move-link${active}" onclick="scrubToNodeId(${node._id})">`
-       + `[${node.move[0]},${node.move[1]}]</span>${badge}`;
-}
-
 // Selected missed-win callout: the {by, at_prefix, first_move, pv, pv_len,
 // pv_owners} dict from the badge that's currently pinned open, or null.
 let missedWinSelected = null;
@@ -2421,89 +2597,93 @@ function _turnsOf(nodes) {
 }
 
 // A turn cell: its (up to 2) move links + the end-of-turn verdict icon.
-function _turnCellHtml(turn) {
-  if (!turn) return "";
-  const q = qualityOf(turn.endNode);
-  const icon = q ? ` <span class="mv-q" style="color:${q.color}" title="${q.label}">${q.icon}</span>` : "";
-  return turn.nodes.map(_moveLink).join(" ") + icon;
+function _moveListMoveData(node, quality = null) {
+  return {
+    id: String(node._id), q: node.move[0], r: node.move[1],
+    missedWin: Boolean(node.result && node.result.missed_win),
+    quality: quality ? {icon: quality.icon, label: quality.label, color: quality.color} : null,
+  };
 }
 
-// Render the move list as a chess.com-style grid: one row per ROUND (a P1 turn
-// + the following P2 turn), with the round number, then each side's turn cell.
-// Side lines branch as indented sub-rows under the round they diverge from.
-function renderMoveTree() {
-  const el = document.getElementById("analysis-movetree");
-  if (!el || !analysisTree) return;
-  _nodeId = 0; for (const k in _nodeById) delete _nodeById[k];
-  _idify(analysisTree);
+function _moveListTurnData(turn) {
+  if (!turn) return [];
+  const quality = qualityOf(turn.endNode);
+  return turn.nodes.map(node => _moveListMoveData(node, node === turn.endNode ? quality : null));
+}
 
-  const mainNodes = analysisMain.slice(1);  // drop the seed (depth 0)
-  const turns = _turnsOf(mainNodes);
-  // HeXO opens with P1's seed then P2 moves first, so the first real turn is P2.
-  // Pair turns into rounds [P1?, P2?]. We lead each round with P1's turn; the
-  // very first round has no P1 turn (just the seed), so it shows P2 only.
-  // Simplest robust pairing: walk turns, start a new round whenever we hit a P1
-  // turn (or at the start), and slot P1/P2 by the turn's player.
-  const rounds = [];
-  let round = null;
-  for (const t of turns) {
-    if (t.player === "P1") { round = {P1: t, P2: null}; rounds.push(round); }
-    else { // P2
-      if (!round || round.P2) { round = {P1: null, P2: t}; rounds.push(round); }
-      else round.P2 = t;
+// Build one variation plus nested alternatives. The custom element owns all
+// visual layout; this adapter only translates analysis-tree nodes into data.
+function _moveListVariationData(startNode, nesting) {
+  const nodes = [];
+  let node = startNode;
+  while (node && node.move) { nodes.push(node); node = node.children[0]; }
+  const turns = _turnsOf(nodes);
+  const branchPosition = (startNode.parent?.depth || 0) + 1;
+  const result = [{
+    label: `Alternative from ${positionWord().toLowerCase()} ${positionNumber(branchPosition - 1)}`,
+    nesting,
+    turns: turns.map(turn => ({player: turn.player, moves: _moveListTurnData(turn)})),
+  }];
+  for (const current of nodes) {
+    for (const child of current.children.slice(1)) {
+      result.push(..._moveListVariationData(child, nesting + 1));
     }
   }
+  return result;
+}
 
-  // Variations: a side line starts at a node whose parent's mainline child is a
-  // different node. Render each as an indented block of its own mini move list.
-  function variationRows(startNode, nesting) {
-    // Build the side line's own spine (following first-child).
-    const nodes = [];
-    let n = startNode;
-    while (n && n.move) { nodes.push(n); n = n.children[0]; }
-    const vturns = _turnsOf(nodes);
-    const turnsHtml = vturns.map(t =>
-      `<div class="variation-turn"><span class="var-side">${t.player}</span><span>${_turnCellHtml(t)}</span></div>`
-    ).join("");
-    const branchPosition = (startNode.parent?.depth || 0) + 1;
-    let html = `<div class="variation" style="--variation-indent:${Math.min(nesting, 3) * 8}px">` +
-      `<div class="variation-heading">Alternative from position ${branchPosition}</div>${turnsHtml}</div>`;
-    // nested variations off any node in this side line
-    for (const nd of nodes) for (const c of nd.children.slice(1)) html += variationRows(c, nesting + 1);
-    return html;
+function renderMoveTree() {
+  const el = document.getElementById("analysis-movetree");
+  if (!el || !analysisTree || !customElements.get("hexo-move-list")) return;
+  _nodeId = 0; for (const key in _nodeById) delete _nodeById[key];
+  _idify(analysisTree);
+
+  const mainNodes = analysisMain.slice(1);
+  const turns = _turnsOf(mainNodes);
+  const rounds = [];
+  let round = null;
+  for (const turn of turns) {
+    if (turn.player === "P1") { round = {P1: turn, P2: null}; rounds.push(round); }
+    else if (!round || round.P2) { round = {P1: null, P2: turn}; rounds.push(round); }
+    else round.P2 = turn;
   }
-  // Collect variation HTML keyed by the mainline depth they branch from, so we
-  // can drop them right after the relevant round.
-  const varByDepth = {};
-  const addVar = (parentNode) => {
+
+  const variationsByDepth = {};
+  const addVariations = parentNode => {
     const mainChild = analysisMain[parentNode.depth + 1];
-    for (const c of parentNode.children) {
-      if (c !== mainChild && c.move) {
-        (varByDepth[parentNode.depth] = varByDepth[parentNode.depth] || []).push(variationRows(c, 0));
+    for (const child of parentNode.children) {
+      if (child !== mainChild && child.move) {
+        const items = _moveListVariationData(child, 0);
+        (variationsByDepth[parentNode.depth] ||= []).push(...items);
       }
     }
   };
-  addVar(analysisTree);
-  for (const node of mainNodes) addVar(node);
+  addVariations(analysisTree);
+  for (const node of mainNodes) addVariations(node);
 
-  // Emit the grid.
-  let html = `<div class="mv-grid">`;
-  html += `<div class="mv-h">#</div><div class="mv-h">P1</div><div class="mv-h">P2</div>`;
-  rounds.forEach((rd, i) => {
-    const alt = i % 2 === 1 ? " mv-row-alt" : "";
-    html += `<div class="mv-num${alt}">${i + 1}.</div>`;
-    html += `<div class="mv-cell${alt}">${rd.P1 ? _turnCellHtml(rd.P1) : "<span class='mv-dim'>…</span>"}</div>`;
-    html += `<div class="mv-cell${alt}">${rd.P2 ? _turnCellHtml(rd.P2) : "<span class='mv-dim'>…</span>"}</div>`;
-    // Variations branching from any node within this round's turns.
-    let vhtml = "";
-    for (const t of [rd.P1, rd.P2]) if (t) for (const n of t.nodes)
-      if (varByDepth[n.depth]) vhtml += varByDepth[n.depth].join("");
-    if (vhtml) html += `<div class="mv-varspan">${vhtml}</div>`;
+  const data = rounds.map((item, index) => {
+    const variations = [];
+    for (const turn of [item.P1, item.P2]) {
+      if (!turn) continue;
+      for (const node of turn.nodes) {
+        if (variationsByDepth[node.depth]) variations.push(...variationsByDepth[node.depth]);
+      }
+    }
+    return {
+      number: index + 1,
+      P1: _moveListTurnData(item.P1),
+      P2: _moveListTurnData(item.P2),
+      variations,
+    };
   });
-  // Variations off the seed (root) appear before round 1.
-  html += `</div>`;
-  let seedVar = varByDepth[0] ? `<div class="mv-grid"><div class="mv-varspan">${varByDepth[0].join("")}</div></div>` : "";
-  el.innerHTML = (seedVar + html) || "<span style='color:#5f635d'>No moves.</span>";
+
+  const list = document.createElement("hexo-move-list");
+  list.rounds = data;
+  list.leadingVariations = variationsByDepth[0] || [];
+  list.activeId = analysisCurrent ? String(analysisCurrent._id) : null;
+  list.addEventListener("move-select", event => scrubToNodeId(Number(event.detail.id)));
+  list.addEventListener("missed-win-select", event => showMissedWin(Number(event.detail.id)));
+  el.replaceChildren(list);
 }
 
 function serializeHtttx(moves) {
@@ -2527,21 +2707,27 @@ function serializeHtttx(moves) {
 // Pan/zoom for analysis board
 const analysisSvg = document.getElementById("analysis-board");
 let _analysisTouchDragged = false;
+let _analysisMouseDragged = false;
 let _analysisSuppressTapUntil = 0;
 analysisSvg.addEventListener("mousedown", e => {
   analysisPanning = true;
+  _analysisMouseDragged = false;
   analysisPanStart = { x: e.clientX, y: e.clientY, vx: analysisView.x, vy: analysisView.y };
   analysisSvg.classList.add("panning");
 });
 window.addEventListener("mousemove", e => {
   if (!analysisPanning) return;
-  analysisView.x = analysisPanStart.vx + (e.clientX - analysisPanStart.x);
-  analysisView.y = analysisPanStart.vy + (e.clientY - analysisPanStart.y);
+  const dx = e.clientX - analysisPanStart.x, dy = e.clientY - analysisPanStart.y;
+  if (Math.abs(dx) + Math.abs(dy) > 4) _analysisMouseDragged = true;
+  analysisView.x = analysisPanStart.vx + dx;
+  analysisView.y = analysisPanStart.vy + dy;
   updateAnalysisTransform();
 });
 window.addEventListener("mouseup", () => {
+  if (_analysisMouseDragged) _analysisSuppressTapUntil = Date.now() + 300;
   analysisPanning = false;
   analysisSvg.classList.remove("panning");
+  _analysisMouseDragged = false;
 });
 // Single-finger pan for phones. The desktop mouse path above is not promoted
 // consistently by mobile browsers, and without this explicit path a finger

@@ -11,15 +11,19 @@ let selectedSide = "random";
 const DIFFICULTY_SIMS = (window.__HEXO_CFG__ || {}).difficultySims || {};
 const DEFAULT_DIFFICULTY = (window.__HEXO_CFG__ || {}).defaultDifficulty || "";
 let selectedDifficulty = DEFAULT_DIFFICULTY;
+let selectedPlayModel = localStorage.getItem("hexo_play_model") || DEFAULT_MODEL_ID;
+if (!STRIX_MODELS.some(model => model.id === selectedPlayModel)) selectedPlayModel = DEFAULT_MODEL_ID;
 
+// Difficulty tier keys double as display names (shared 1:1 with the Analysis
+// strength tiers). The labels map is kept for a stable UI fallback.
 const DIFFICULTY_LABELS = {
-  casual: "Quick", easy: "Standard", standard: "Strong", strong: "Deep",
+  quick: "Quick", standard: "Standard", strong: "Strong", deep: "Deep",
 };
 const DIFFICULTY_DESCRIPTIONS = {
-  casual: "Responds fastest",
-  easy: "Balances speed and search",
-  standard: "Searches further",
-  strong: "Searches furthest",
+  quick: "Responds fastest",
+  standard: "Balances speed and search",
+  strong: "Searches further",
+  deep: "Searches furthest",
 };
 
 function renderDifficultyRow() {
@@ -42,6 +46,22 @@ function renderDifficultyRow() {
     );
   }
   row.innerHTML = buttons.join("");
+}
+
+function renderPlayModelSelect() {
+  const field = document.getElementById("play-model-field");
+  const select = document.getElementById("play-model");
+  if (!field || !select) return;
+  field.hidden = STRIX_MODELS.length <= 1;
+  populateModelSelect(select, selectedPlayModel);
+}
+
+function selectPlayModel() {
+  const select = document.getElementById("play-model");
+  if (!select) return;
+  selectedPlayModel = strixModel(select.value).id;
+  localStorage.setItem("hexo_play_model", selectedPlayModel);
+  loadBotStats();
 }
 
 function selectDifficulty(d) {
@@ -163,9 +183,12 @@ async function runLocalBotTurn() {
   document.getElementById("board").classList.add("disabled");
   try {
     const stateAtStart = gameState;
-    const sims = Number(DIFFICULTY_SIMS[stateAtStart.difficulty] || 64);
+    // `??` (not `||`) so a legitimate quick-tier value of 0 (argmax, no
+    // search) isn't mistaken for a missing key and coerced up to 64.
+    const sims = Number(DIFFICULTY_SIMS[stateAtStart.difficulty] ?? 64);
     const result = await localInference("bestMove", {
       position: localBotPosition(stateAtStart), sims, mActions: 16,
+      modelId: stateAtStart.model_id || selectedPlayModel,
     });
     if (!gameState || gameState.game_id !== stateAtStart.game_id) return;
     const resp = await fetch(URL_PREFIX + "/bot_move", {
@@ -374,6 +397,7 @@ function openModal() {
   document.getElementById("modal-bg").classList.add("show");
   document.getElementById("modal-name").focus();
   renderDifficultyRow();
+  renderPlayModelSelect();
   loadBotStats();
 }
 
@@ -385,7 +409,7 @@ let lastStats = null;
 
 async function loadBotStats() {
   try {
-    const r = await fetch(URL_PREFIX + "/stats");
+    const r = await fetch(`${URL_PREFIX}/stats?model=${encodeURIComponent(selectedPlayModel)}`);
     if (!r.ok) return;
     lastStats = await r.json();
     renderBotStats(lastStats);
@@ -393,25 +417,25 @@ async function loadBotStats() {
 }
 
 const TIER_TAGS = {
-  casual: {
+  quick: {
     hi:  "Quick search and I'm still finding the lines.",
     mid: "Quick search, close games. Want to give me more time to think?",
     lo:  "You're staying ahead of my fastest search.",
     vlo: "You're making quick work of Quick. Nicely done.",
   },
-  easy: {
+  standard: {
     hi:  "Standard gives me enough time to find plenty of lines.",
     mid: "Standard is producing close games. Best kind of fight.",
     lo:  "You're staying ahead of my Standard search.",
     vlo: "Standard isn't slowing you down. Try giving me more search time.",
   },
-  standard: {
+  strong: {
     hi:  "Strong search is finding its share of wins.",
     mid: "Strong search and we're trading punches.",
     lo:  "You're finding the gaps in my Strong search.",
     vlo: "You keep outplaying my Strong search. Nicely done.",
   },
-  strong: {
+  deep: {
     hi:  "Deep gives me the most time to search, and I'm using it.",
     mid: "At Deep, I'm holding the line. Mostly.",
     lo:  "Deep search, and you keep finding the gaps.",
@@ -517,6 +541,7 @@ async function startGame() {
         difficulty: selectedDifficulty,
         self_reported_elo: isFinite(elo) && elo >= 0 ? elo : null,
         local_bot: true,
+        model_id: selectedPlayModel,
       }),
     });
     if (!resp.ok) {

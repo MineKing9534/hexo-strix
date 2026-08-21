@@ -21,15 +21,17 @@ from hexo_a0.serving.model import make_graph_fn
 logger = logging.getLogger(__name__)
 
 
-# Search-effort tiers. Keys are stable API and storage values; display names
-# live in the frontend. Sim counts are tunable via --difficulty-sims at startup. See
-# docs/research/2026-05-14-sim-count-strength-curve.md for the Elo gaps.
-DIFFICULTY_ORDER = ("casual", "easy", "standard", "strong")
+# Search-effort tiers. Keys are stable API and storage values AND double as
+# the frontend display names (Quick/Standard/Strong/Deep), shared 1:1 with the
+# Analysis strength tiers. Sim counts are tunable via --difficulty-sims at
+# startup. See docs/research/2026-05-14-sim-count-strength-curve.md for the
+# Elo gaps.
+DIFFICULTY_ORDER = ("quick", "standard", "strong", "deep")
 DEFAULT_DIFFICULTY_SIMS: dict[str, int] = {
-    "casual":   16,
-    "easy":     32,
-    "standard": 64,
-    "strong": 128,
+    "quick":      0,
+    "standard":  64,
+    "strong":   128,
+    "deep":     512,
 }
 DEFAULT_DIFFICULTY = "standard"
 
@@ -38,7 +40,11 @@ DEFAULT_DIFFICULTY = "standard"
 # tiers get the SAME honest forcing tactics (own-win execution + defense, see
 # `_play`), but a shallower depth cap means weaker tiers only catch shallow
 # mates and let deeper ones through, same as a human of that strength would.
-# "casual" only executes/blocks depth-2 (a single-move) mate.
+# "quick" only executes/blocks depth-2 (a single-move) mate.
+#
+# deep raised to 25 (from 16) to let the top tier prove longer fully-forcing
+# lines; the intermediate tiers are unchanged from the prior standard 8 /
+# strong 16 split (see the 2026-07-05 sweep note below).
 #
 # standard 6->8 / strong 10->16 raised 2026-07-05: at the FLAT 20k node
 # budget, depth is wall-clock-free (p99 352-392 ms and max <750 ms at every
@@ -49,10 +55,10 @@ DEFAULT_DIFFICULTY = "standard"
 # longer fully-forcing lines, not the fix for those losses — that was the
 # pair-aware `hr.solve_defense` (see `_defensive_move`).
 DEFAULT_DIFFICULTY_FORCING_DEPTH: dict[str, int] = {
-    "casual":   2,
-    "easy":     4,
-    "standard": 8,
-    "strong":  16,
+    "quick":     2,
+    "standard":  4,
+    "strong":    8,
+    "deep":     25,
 }
 
 # Live-play forcing (VCF) search NODE budgets, re-tuned 2026-07-04 from r=8
@@ -110,8 +116,8 @@ DEF_NODE_BUDGET = 20_000
 VERIFY_NODE_BUDGET = 250_000
 # Fallback depth cap for a difficulty tier missing from the map (defensive;
 # should be unreachable given DEFAULT_DIFFICULTY_FORCING_DEPTH covers every
-# DIFFICULTY_ORDER entry) — the "strong"/full-measured-budget depth.
-FALLBACK_FORCING_DEPTH = DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]
+# DIFFICULTY_ORDER entry) — the "deep"/full-measured-budget depth.
+FALLBACK_FORCING_DEPTH = DEFAULT_DIFFICULTY_FORCING_DEPTH["deep"]
 # Wall-clock backstop for the defensive analysis (passed to
 # ``hr.solve_defense`` as its time limit): even at the tuned budget above, a
 # pathological position could stack enough candidate/pair re-solves to blow
@@ -119,16 +125,16 @@ FALLBACK_FORCING_DEPTH = DEFAULT_DIFFICULTY_FORCING_DEPTH["strong"]
 # returns whatever killers/anchors/survivors were verified so far.
 DEFENSE_DEADLINE_S = 3.0
 # Per-tier override of the defense deadline (tiers not listed use the flat
-# DEFENSE_DEADLINE_S). Raised for "strong" after the 2026-07-06 chao loss:
+# DEFENSE_DEADLINE_S). Raised for "deep" after the 2026-07-06 chao loss:
 # on the production host (Oracle Ampere, ~2-3x slower single-core than the
 # dev box) the 3 s deadline expired mid-verification, solve_defense returned
 # a partial result with no verified killers, and the bot played the max-delay
 # survivor into a proven loss. The full pair sweep on that position takes
-# ~5 s even on the dev box, so strong gets 10 s — at most twice per bot turn,
+# ~5 s even on the dev box, so deep gets 10 s — at most twice per bot turn,
 # still well inside the 60 s request timeout, and the pair-partner cache
 # (see `_forcing_move`) makes the 2nd-placement solve usually unnecessary.
 DIFFICULTY_DEFENSE_DEADLINE_S: dict[str, float] = {
-    "strong": 10.0,
+    "deep": 10.0,
 }
 
 # Rate-limit for the "forcing check failed" exception log (see
@@ -194,6 +200,9 @@ class GameRecord:
     terminal_recorded: bool = False  # set after Recorder.record_completed
     evicted: bool = False  # detached from GameManager._games; never re-persist
     difficulty: str = DEFAULT_DIFFICULTY
+    # Stable catalogue entry selected when the game starts. A game never
+    # changes model mid-play, even if the new-game selector changes later.
+    model_id: str = "default"
     # Cached forced-win PV from a previous solve_forcing call: the bot replays
     # it move-for-move as long as move_log stays in lockstep, without
     # re-invoking the solver. In-memory only — a restart just re-solves.
@@ -636,6 +645,8 @@ class GameManager:
         checkpoint_path: str,
         model_label: str = "unknown",
         model_step: int | None = None,
+        model_variants: dict[str, dict] | None = None,
+        default_model_id: str = "default",
         difficulty_sims: dict[str, int] | None = None,
         default_difficulty: str = DEFAULT_DIFFICULTY,
         max_games: int = 100,
@@ -654,6 +665,17 @@ class GameManager:
         self.checkpoint_path = checkpoint_path
         self.model_label = model_label
         self.model_step = model_step
+        self.default_model_id = default_model_id
+        self.model_variants = model_variants or {
+            default_model_id: {
+                "checkpoint_path": checkpoint_path,
+                "model_label": model_label,
+                "model_step": model_step,
+                "bot_turn_fn": bot_turn_fn,
+            },
+        }
+        if default_model_id not in self.model_variants:
+            raise ValueError(f"default model {default_model_id!r} is not configured")
         self.difficulty_sims = difficulty_sims  # None = single-tier legacy mode
         self.default_difficulty = default_difficulty
         self.max_games = max_games
@@ -725,6 +747,7 @@ class GameManager:
                     human_side=rec.human_side,
                     bot_side=rec.bot_side,
                     difficulty=rec.difficulty,
+                    model_id=rec.model_id,
                     opp_elo=rec.opp_elo,
                     elo_source=rec.elo_source,
                     opp_handle=rec.opp_handle,
@@ -799,6 +822,9 @@ class GameManager:
             difficulty = row["difficulty"]
             if self.difficulty_sims is not None and difficulty not in self.difficulty_sims:
                 difficulty = self.default_difficulty
+            model_id = row.get("model_id") or self.default_model_id
+            if model_id not in self.model_variants:
+                model_id = self.default_model_id
             return GameRecord(
                 game_id=row["game_id"],
                 created_at=datetime.fromisoformat(row["created_at"]),
@@ -809,6 +835,7 @@ class GameManager:
                 human_name=row["human_name"],
                 move_log=move_log,
                 difficulty=difficulty,
+                model_id=model_id,
                 opp_elo=row["opp_elo"],
                 elo_source=row["elo_source"],
                 opp_handle=row["opp_handle"],
@@ -825,6 +852,7 @@ class GameManager:
         difficulty: str | None = None,
         self_reported_elo: float | None = None,
         local_bot: bool = False,
+        model_id: str | None = None,
     ) -> GameRecord:
         if human_side_request not in ("P1", "P2", "random"):
             raise GameError(
@@ -840,6 +868,7 @@ class GameManager:
             chosen = self.default_difficulty
         else:
             chosen = difficulty if difficulty in self.difficulty_sims else self.default_difficulty
+        chosen_model = model_id if model_id in self.model_variants else self.default_model_id
 
         cfg = self._hr.GameConfig(**self.game_kwargs)
         state = self._hr.GameState(cfg)
@@ -855,6 +884,7 @@ class GameManager:
             human_name=_sanitize_name(name),
             move_log=move_log,
             difficulty=chosen,
+            model_id=chosen_model,
             opp_elo=self_reported_elo,
             elo_source="self_reported" if self_reported_elo is not None else None,
         )
@@ -880,7 +910,7 @@ class GameManager:
                 # visible in self._games, so concurrent /state or /move must not
                 # observe a half-applied bot move. Matches apply_human_move's
                 # discipline of holding rec.lock across bot_turn_fn.
-                self.bot_turn_fn(rec)
+                self._run_bot_turn(rec)
                 rec.last_active_at = _now_utc()
                 # An opening bot move could (pathologically) end the game; record
                 # it the same way apply_human_move does after a bot turn.
@@ -943,6 +973,7 @@ class GameManager:
                     "moves_remaining": int(rec.state.moves_remaining_this_turn()),
                     "n_moves": len(rec.move_log),
                     "difficulty": rec.difficulty,
+                    "model_id": rec.model_id,
                 })
         return out
 
@@ -961,6 +992,7 @@ class GameManager:
             return
         sims = (self.difficulty_sims.get(rec.difficulty, self.mcts_sims)
                 if self.difficulty_sims is not None else self.mcts_sims)
+        variant = self.model_variants.get(rec.model_id, self.model_variants[self.default_model_id])
         self.recorder.record_completed(
             game_id=rec.game_id,
             created_at=_iso(rec.created_at),
@@ -975,9 +1007,9 @@ class GameManager:
             win_length=self.game_kwargs["win_length"],
             placement_radius=self.game_kwargs["placement_radius"],
             max_moves=self.game_kwargs["max_moves"],
-            checkpoint_path=self.checkpoint_path,
-            model_label=self.model_label,
-            step=self.model_step,
+            checkpoint_path=variant["checkpoint_path"],
+            model_label=variant["model_label"],
+            step=variant.get("model_step"),
             move_log=rec.move_log,
             opp_elo=rec.opp_elo,
             elo_source=rec.elo_source,
@@ -1020,7 +1052,7 @@ class GameManager:
                 and not rec.terminal_recorded
                 and rec.state.current_player() == rec.bot_side
             ):
-                self.bot_turn_fn(rec)
+                self._run_bot_turn(rec)
                 self._maybe_record_engine_terminal(rec)
             self._sync_active(rec)
         return rec
@@ -1059,11 +1091,15 @@ class GameManager:
                 raise GameAlreadyOverError("game already over")
             if rec.state.current_player() != rec.bot_side:
                 raise NotYourTurnError("not the bot's turn")
-            self.bot_turn_fn(rec)
+            self._run_bot_turn(rec)
             rec.last_active_at = _now_utc()
             self._maybe_record_engine_terminal(rec)
             self._sync_active(rec)
         return rec
+
+    def _run_bot_turn(self, rec: GameRecord) -> None:
+        variant = self.model_variants.get(rec.model_id, self.model_variants[self.default_model_id])
+        variant["bot_turn_fn"](rec)
 
     def resign(self, game_id: str) -> GameRecord:
         rec = self.get_game(game_id)

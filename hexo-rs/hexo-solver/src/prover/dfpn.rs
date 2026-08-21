@@ -28,9 +28,10 @@ use super::pn::{
     one_plus_eps, sat_add,
 };
 use super::{Ctl, DriverResult, ProverConfig};
-use crate::forcing::CellSet2;
+use crate::forcing::{CellSet2, WinDepthHints};
 use hexo_engine::types::Coord;
 use rustc_hash::FxHashSet;
+use std::rc::Rc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
@@ -68,13 +69,26 @@ pub struct Dfpn<'a> {
     pds_mode: bool,
     pn: PnSearch,
     pn2_nodes: u64,
+    pn2_scale: u64,
+    pn2_scale_inverse: bool,
     /// Node keys already level-2-seeded (so PN runs at most once per node).
     pn_seeded: FxHashSet<u64>,
     leaf_solves: u64,
+    /// Certificate-derived win-depth hints (guided probes only). A hit closes a
+    /// node at its current horizon without expansion: `proves_within` → `(0, INF)`,
+    /// `disproves_within` → `(INF, 0)`. Positive/negative facts are monotone in
+    /// the remaining-turn budget, so reuse across horizons is sound.
+    hints: Option<Rc<WinDepthHints>>,
 }
 
 impl<'a> Dfpn<'a> {
-    fn new(k: KernelCtx, cfg: &ProverConfig, ctl: &'a Ctl, pds_mode: bool) -> Dfpn<'a> {
+    fn new(
+        k: KernelCtx,
+        cfg: &ProverConfig,
+        ctl: &'a Ctl,
+        pds_mode: bool,
+        hints: Option<Rc<WinDepthHints>>,
+    ) -> Dfpn<'a> {
         Dfpn {
             k,
             tt: ProofTt::new(cfg.tt_mb),
@@ -88,8 +102,11 @@ impl<'a> Dfpn<'a> {
             pds_mode,
             pn: PnSearch::new(cfg.pn2_nodes),
             pn2_nodes: cfg.pn2_nodes,
+            pn2_scale: cfg.pn2_scale,
+            pn2_scale_inverse: cfg.pn2_scale_inverse,
             pn_seeded: FxHashSet::default(),
             leaf_solves: 0,
+            hints,
         }
     }
 
@@ -111,12 +128,32 @@ impl<'a> Dfpn<'a> {
         {
             return; // already resolved
         }
+        // Adaptive leaf budget: scale the level-2 node cap by the branching
+        // factor at the seed node ("number of options at this level"). The
+        // "1 and n" init already encodes the branching factor — OR nodes seed
+        // dn = m_moves, AND nodes seed pn = c_covers — so read it back from
+        // `eval_child_at` and normalize so a branching factor of `pn2_scale`
+        // keeps the configured `pn2_nodes` unchanged. 0 disables scaling.
+        if self.pn2_scale > 0 {
+            let (pn0, dn0, _terminal) = eval_child_at(&mut self.k, node, remaining);
+            let branching = if node.is_or() { dn0 } else { pn0 };
+            let branching = (branching as u64).clamp(1, 64);
+            let budget = if self.pn2_scale_inverse {
+                (self.pn2_nodes * self.pn2_scale / branching)
+                    .clamp(1, self.pn2_nodes * 4)
+            } else {
+                (self.pn2_nodes * branching / self.pn2_scale)
+                    .clamp(1, self.pn2_nodes * 2)
+            };
+            self.pn.set_max_nodes(budget);
+        }
         // WASM has a 4 GiB linear-address ceiling. PN²'s disposable level-2 tree
         // must therefore include its kernel memos: otherwise hundreds of leaves
         // retain gigabytes even after their PN arenas are cleared. Native keeps
         // the shared memo cache for speed (and has a much larger address space).
         // The isolated board has identical Zobrist/node keys, so its result is
         // directly reusable by level 1.
+        self.pn.set_hints(self.hints.clone());
         #[cfg(target_arch = "wasm32")]
         let (pn, dn) = {
             let mut leaf_k = self.k.isolated();
@@ -135,6 +172,30 @@ impl<'a> Dfpn<'a> {
         self.tt.store(key, pn, dn, self.pn2_nodes.min(INF as u64) as u32);
     }
 
+    /// Certificate-derived hint lookup for the node whose position the board
+    /// currently reflects. A positive hint (`wins within d <= remaining`) closes
+    /// the node as proved; a negative hint (`no win within d >= remaining`)
+    /// closes it as disproved. Both facts are monotone in the remaining-turn
+    /// budget, so reuse across horizons is sound. Returns `None` on no hit.
+    #[inline]
+    fn hint_val(&mut self, node: Node, remaining: Option<u8>) -> Option<(u32, u32)> {
+        let (hints, turns) = (self.hints.as_ref()?, remaining?);
+        let (is_or, placements) = node.tag();
+        let hash = self.k.hash();
+        if hints.proves_within(hash, is_or, placements, turns) {
+            let key = node_key_at(hash, node, remaining);
+            self.proven.insert(key);
+            self.tt.store(key, 0, INF, 1);
+            return Some((0, INF));
+        }
+        if hints.disproves_within(hash, is_or, placements, turns) {
+            let key = node_key_at(hash, node, remaining);
+            self.tt.store(key, INF, 0, 1);
+            return Some((INF, 0));
+        }
+        None
+    }
+
     /// The `(pn, dn)` of a child node whose position the board currently reflects,
     /// using **immediate evaluation with the "1 and n" initialization** (Allis;
     /// the paper's speed-critical heuristic): terminals resolve to `(0, INF)` /
@@ -148,6 +209,9 @@ impl<'a> Dfpn<'a> {
     fn child_val(&mut self, node: Node, remaining: Option<u8>) -> (u32, u32) {
         let key = node_key_at(self.k.hash(), node, remaining);
         if let Some(v) = self.tt.probe(key) {
+            return v;
+        }
+        if let Some(v) = self.hint_val(node, remaining) {
             return v;
         }
         let (pn, dn, _terminal) = eval_child_at(&mut self.k, node, remaining);
@@ -188,6 +252,13 @@ impl<'a> Dfpn<'a> {
         }
         let entry_nodes = self.nodes;
         let key = node_key_at(self.k.hash(), node, remaining);
+
+        // Certificate-derived hint cutoff: a guided probe can close a node at its
+        // current horizon without any expansion when the certificate already
+        // established the fact (monotone in the remaining-turn budget).
+        if let Some((pn, dn)) = self.hint_val(node, remaining) {
+            return (pn, dn);
+        }
 
         // Early TT cutoff (the paper's `lookUpTT` at the top of MID): if the stored
         // numbers already resolve the node or meet the caller's thresholds, return
@@ -546,7 +617,7 @@ pub(crate) fn screen_root_attacks(
     ) else {
         return empty();
     };
-    let mut d = Dfpn::new(ctx, cfg, ctl, true);
+    let mut d = Dfpn::new(ctx, cfg, ctl, true, None);
     let moves = match d.k.or_eval(pos.placements_remaining) {
         OrEval::Moves(moves) => moves,
         OrEval::WinNow | OrEval::Loss => return empty(),
@@ -640,6 +711,21 @@ fn solve_mode_at(
     pds_mode: bool,
     remaining: Option<u8>,
 ) -> DriverResult {
+    solve_mode_at_guided(pos, cfg, ctl, pds_mode, remaining, None)
+}
+
+/// Depth-bounded PDS/df-pn with certificate-derived win-depth hints. A hint hit
+/// closes a node at its current horizon without expansion (see [`Dfpn::hint_val`]),
+/// which turns a guided probe into a targeted re-search of only the nodes the
+/// certificate could not already resolve at the probe's horizon.
+pub(crate) fn solve_mode_at_guided(
+    pos: &super::io::Position,
+    cfg: &ProverConfig,
+    ctl: &Ctl,
+    pds_mode: bool,
+    remaining: Option<u8>,
+    hints: Option<Rc<WinDepthHints>>,
+) -> DriverResult {
     let wl = pos.config.win_length;
     if !KernelCtx::supported(wl) {
         return DriverResult::new(Verdict::BudgetExceeded);
@@ -654,7 +740,7 @@ fn solve_mode_at(
         Some(c) => c,
         None => return DriverResult::new(Verdict::BudgetExceeded),
     };
-    let mut d = Dfpn::new(ctx, cfg, ctl, pds_mode);
+    let mut d = Dfpn::new(ctx, cfg, ctl, pds_mode, hints);
     let root = Node::Or { placements: pos.placements_remaining };
     // `Instant::now()` traps at runtime on wasm32-unknown-unknown (no monotonic
     // clock in std for that target). The elapsed value is only used for the
@@ -693,16 +779,29 @@ fn solve_mode_at(
         // replay it before exposing it. A certificate failure never changes the
         // already-proved verdict; it is reported by absence and covered by tests.
         if pds_mode {
-            let rebuilt = match remaining {
-                Some(turns) => {
-                    super::certificate::reconstruct_bounded(pos, cfg.wide, &d.proven, turns)
+            let rebuilt = match (remaining, d.hints.as_deref()) {
+                (Some(turns), Some(hints)) => super::certificate::reconstruct_bounded_guided(
+                    pos, cfg.wide, &mut d.proven, turns, hints,
+                ),
+                (Some(turns), None) => {
+                    super::certificate::reconstruct_bounded(pos, cfg.wide, &mut d.proven, turns)
                 }
-                None => super::certificate::reconstruct(pos, cfg.wide, &d.proven),
+                (None, _) => super::certificate::reconstruct(pos, cfg.wide, &mut d.proven),
             };
             if let Ok(certificate) = rebuilt
                 && let Ok(summary) = super::certificate::verify(pos, &certificate)
             {
-                if remaining.is_some()
+                // Prefer the certificate's SHORTEST line as the sample PV: it is
+                // the most useful example for the UI (the fastest win the saved
+                // DAG can exhibit). Fall back to the worst-case (longest-defence)
+                // line, which attains the certified bound. Both are replayed
+                // through the engine before exposure.
+                if let Ok(pv) = super::certificate::shortest_pv(pos, &certificate)
+                    && pv_replays_win(pos, &pv)
+                {
+                    res.pv = pv;
+                    res.depth = u8::try_from(summary.max_attacker_turns).ok();
+                } else if remaining.is_some()
                     && let Ok(pv) = super::certificate::worst_case_pv(pos, &certificate)
                     && pv_replays_win(pos, &pv)
                 {

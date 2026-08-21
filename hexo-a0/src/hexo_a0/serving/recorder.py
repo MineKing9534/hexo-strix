@@ -96,8 +96,12 @@ def _m5_active_games(conn):
              moves_json TEXT NOT NULL)""")
 
 
+def _m6_active_game_model(conn):
+    add_column(conn, "active_games", "model_id", "TEXT NOT NULL DEFAULT 'default'")
+
+
 GAMES_MIGRATIONS = [_m0_base, _m1_model_label, _m2_opponent_elo, _m3_step,
-                    _m4_htttx_convention, _m5_active_games]
+                    _m4_htttx_convention, _m5_active_games, _m6_active_game_model]
 
 
 class Recorder:
@@ -174,18 +178,19 @@ class Recorder:
         placement_radius: int,
         max_moves: int,
         move_log: list[tuple[int, int, str]],
+        model_id: str = "default",
     ) -> None:
         """Upsert the write-through snapshot of an in-progress game."""
         moves_json = json.dumps([[q, r, p] for (q, r, p) in move_log])
         with self._lock:
             self._conn.execute(
                 """INSERT OR REPLACE INTO active_games (game_id, created_at,
-                       last_active_at, human_name, human_side, bot_side, difficulty,
+                       last_active_at, human_name, human_side, bot_side, difficulty, model_id,
                        opp_elo, elo_source, opp_handle, win_length, placement_radius,
                        max_moves, moves_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (game_id, created_at, last_active_at, human_name, human_side,
-                 bot_side, difficulty, opp_elo, elo_source, opp_handle,
+                 bot_side, difficulty, model_id, opp_elo, elo_source, opp_handle,
                  win_length, placement_radius, max_moves, moves_json),
             )
             self._conn.commit()
@@ -209,7 +214,7 @@ class Recorder:
         with self._lock:
             cur = self._conn.execute(
                 """SELECT game_id, created_at, last_active_at, human_name,
-                          human_side, bot_side, difficulty, opp_elo, elo_source,
+                          human_side, bot_side, difficulty, model_id, opp_elo, elo_source,
                           opp_handle, win_length, placement_radius, max_moves,
                           moves_json
                    FROM active_games ORDER BY last_active_at DESC""")

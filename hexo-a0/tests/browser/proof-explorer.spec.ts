@@ -48,6 +48,35 @@ async function openProof(page: Page) {
   await expect(page.locator("#proof-explorer")).toBeVisible();
 }
 
+// Bundle that includes a pdspn-shortest `optimization.sampleLine` so the
+// proof explorer's "Show winning line" toggle is enabled. Cells are chosen
+// from PROOF_BUNDLE so the board geometry stays compatible.
+const SAMPLE_LINE_BUNDLE = {
+  ...PROOF_BUNDLE,
+  engine: "pdspn-shortest",
+  optimization: {
+    method: "pdspn-shortest-v1",
+    shortestCertified: true,
+    bestUpperDepth: 2,
+    excludedThroughDepth: 1,
+    thresholdProbes: 3,
+    sampleLine: [
+      {turn: 0, player: "P1", cells: [[2, 0], [3, 0]]},
+      {turn: 1, player: "P2", cells: [[0, 1], [1, 1]]},
+      {turn: 2, player: "P1", cells: [[4, 0], [5, 0]]},
+    ],
+  },
+};
+
+async function openProofWithSampleLine(page: Page) {
+  await page.goto("/analysis");
+  await page.evaluate(bundle => {
+    (window as typeof window & {openProofExplorerBundle(value: unknown): void})
+      .openProofExplorerBundle(bundle);
+  }, SAMPLE_LINE_BUNDLE);
+  await expect(page.locator("#proof-explorer")).toBeVisible();
+}
+
 async function expectSelectedNodeCentered(page: Page) {
   const offset = await page.locator("#proof-tree").evaluate(tree => {
     const selected = tree.querySelector<HTMLElement>("[data-proof-selected]");
@@ -166,5 +195,130 @@ test.describe("proof explorer", () => {
     }));
     expect(overflow.root).toBeLessThanOrEqual(overflow.viewport + 1);
     expect(overflow.body).toBeLessThanOrEqual(overflow.viewport + 1);
+  });
+
+  test("copy-result-link falls back to execCommand when clipboard.writeText rejects", async ({page}) => {
+    // The async Clipboard API rejects on the live site whenever the user has
+    // blocked the site's clipboard permission, the document is not focused, or
+    // the call loses its user-activation window. The proof share button must
+    // still copy the link via the legacy textarea + execCommand fallback in
+    // that case; otherwise the user sees "Share failed: …" and nothing lands
+    // in the clipboard.
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        get: () => ({
+          writeText: () => Promise.reject(
+            new DOMException("Write permission denied.", "NotAllowedError"),
+          ),
+        }),
+      });
+      const w = window as unknown as {__execCommandCalls: string[]};
+      w.__execCommandCalls = [];
+      const original = document.execCommand.bind(document);
+      document.execCommand = (command: string): boolean => {
+        w.__execCommandCalls.push(command);
+        return original(command);
+      };
+    });
+    await openProof(page);
+    await page.locator("#proof-share-btn").click();
+    const status = page.locator("#proof-share-status");
+    await expect(status).toHaveAttribute("data-state", "ok", {timeout: 10_000});
+    await expect(status).toHaveText("Link copied");
+    const execCommandCalls = await page.evaluate(
+      () => (window as unknown as {__execCommandCalls: string[]}).__execCommandCalls,
+    );
+    expect(execCommandCalls).toContain("copy");
+  });
+
+  test("copy-result-link still works when clipboard.writeText succeeds", async ({page, context}) => {
+    // The happy path: when the modern Clipboard API succeeds, the legacy
+    // textarea fallback should not be used and the status should report
+    // success. Headless chromium refuses navigator.clipboard.writeText
+    // without an explicit grant, so we grant clipboard-write for the
+    // origin and stub the call to record its invocation.
+    await context.grantPermissions(
+      ["clipboard-read", "clipboard-write"],
+      {origin: "http://127.0.0.1:8766"},
+    );
+    await page.addInitScript(() => {
+      const w = window as unknown as {__modernCalls: string[]; __execCommandCalls: string[]};
+      w.__modernCalls = [];
+      w.__execCommandCalls = [];
+      const stub = {
+        writeText: (text: string) => {
+          w.__modernCalls.push(text);
+          return Promise.resolve();
+        },
+      };
+      Object.defineProperty(navigator, "clipboard", {configurable: true, get: () => stub});
+      const original = document.execCommand.bind(document);
+      document.execCommand = (command: string): boolean => {
+        w.__execCommandCalls.push(command);
+        return original(command);
+      };
+    });
+    await openProof(page);
+    await page.locator("#proof-share-btn").click();
+    const status = page.locator("#proof-share-status");
+    await expect(status).toHaveAttribute("data-state", "ok", {timeout: 10_000});
+    await expect(status).toHaveText("Link copied");
+    const [modernCalls, execCommandCalls] = await page.evaluate(() => {
+      const w = window as unknown as {__modernCalls: string[]; __execCommandCalls: string[]};
+      return [w.__modernCalls, w.__execCommandCalls];
+    });
+    expect(modernCalls.length).toBeGreaterThan(0);
+    expect(execCommandCalls).not.toContain("copy");
+  });
+
+  test("show-winning-line toggle draws and hides the sample line on the board", async ({page}) => {
+    // Bundle with a sample line enables the toggle; without one it is
+    // disabled (plain PDS-PN produces a cert but no sample line).
+    await openProofWithSampleLine(page);
+    const toggle = page.locator("#proof-show-line");
+    await expect(toggle).toBeEnabled();
+    await expect(toggle).toBeChecked();
+
+    // Every cell of the sample line renders as a numbered forcing-pv marker.
+    const initialMarkers = await page.locator("#proof-board .proof-sample-line .forcing-pv").count();
+    expect(initialMarkers).toBeGreaterThan(0);
+
+    // Flipping the toggle off removes the markers; flipping it back restores them.
+    await toggle.uncheck();
+    await expect(page.locator("#proof-board .proof-sample-line")).toHaveCount(0);
+    await toggle.check();
+    await expect(page.locator("#proof-board .proof-sample-line .forcing-pv")).toHaveCount(initialMarkers);
+  });
+
+  test("show-winning-line toggle is disabled when no sample line was saved", async ({page}) => {
+    // PROOF_BUNDLE has no optimization.sampleLine, so the toggle should be off.
+    await openProof(page);
+    const toggle = page.locator("#proof-show-line");
+    await expect(toggle).toBeDisabled();
+    await expect(toggle).not.toBeChecked();
+    await expect(page.locator("#proof-board .proof-sample-line")).toHaveCount(0);
+  });
+});
+
+
+test.describe("proof lab search method", () => {
+  test("defaults to staged shortest PDS-PN and retires PNS and DFPN", async ({page}) => {
+    await page.goto("/analysis");
+    const methods = page.locator("#analysis-forcing-engine");
+    await expect(methods).toHaveValue("pdspn-shortest");
+    await expect(methods.locator("option")).toHaveCount(3);
+    await expect(methods).not.toContainText("PNS");
+    await expect(methods).not.toContainText("DFPN");
+    await expect(page.locator("#analysis-forcing-budget, #analysis-forcing-leaf-budget")).toHaveCount(0);
+    const effort = page.locator("#analysis-forcing-effort");
+    await expect(effort).toHaveValue("1");
+    await expect(page.locator("#analysis-forcing-effort-label")).toHaveText("Standard");
+    await effort.evaluate((element: HTMLInputElement) => {
+      element.value = "3";
+      element.dispatchEvent(new Event("input", {bubbles: true}));
+    });
+    await expect(page.locator("#analysis-forcing-effort-label")).toHaveText("Deep");
+    await expect(page.locator("#analysis-forcing-effort-hint")).toContainText("keep your device busy");
   });
 });

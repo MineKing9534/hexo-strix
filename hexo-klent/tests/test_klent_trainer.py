@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import math
 import resource
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from hexo_klent.trainer import (
     Trainer,
     _CudaCachePressureGate,
     _attach_search_q_teacher_labels,
+    _critic_losses,
     _critic_head_only_scope,
     _ensure_compiler_nofile_limit,
     _flat_training_targets,
@@ -43,6 +45,77 @@ from hexo_klent.trainer import (
     train_epoch,
 )
 from hexo_klent.search_q_teacher import SearchQLabels
+
+
+def test_categorical_critic_uses_soft_outcome_targets_and_reports_q_mse():
+    logits = torch.tensor(
+        [[1.0, -0.5, 0.25], [-0.25, 0.75, 0.0]],
+        requires_grad=True,
+    )
+    probabilities = logits.softmax(dim=-1)
+    output = SimpleNamespace(
+        critic_logits=logits,
+        q_values=probabilities[:, 0] - probabilities[:, 1],
+    )
+    targets = torch.tensor([0.6, -0.25])
+
+    critic_loss, q_mse = _critic_losses(output, targets)
+
+    target_distribution = torch.tensor(
+        [[0.6, 0.0, 0.4], [0.0, 0.25, 0.75]]
+    )
+    expected_ce = -(
+        target_distribution * logits.log_softmax(dim=-1)
+    ).sum(dim=-1).mean()
+    expected_mse = F.mse_loss(output.q_values, targets)
+    torch.testing.assert_close(critic_loss, expected_ce)
+    torch.testing.assert_close(q_mse, expected_mse)
+    critic_loss.backward()
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_categorical_train_epoch_optimizes_cross_entropy_and_reports_q_mse():
+    config = KlentModelConfig(
+        **dataclasses.asdict(tiny_model_config()),
+        critic="categorical",
+    )
+    game_config = hexo_rs.GameConfig(2, 1, 4)
+    samples = [
+        TrajectoryStep(
+            state=hexo_rs.GameState(game_config),
+            target_policy=torch.full((6,), 1 / 6),
+            action_index=index,
+            player="P1",
+            state_value=0.0,
+            return_target=target,
+        )
+        for index, target in enumerate((0.5, -1.0))
+    ]
+    model = KlentNet(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    metrics = train_epoch(
+        model,
+        optimizer,
+        samples,
+        model_config=config,
+        device=torch.device("cpu"),
+        precision="float32",
+        batch_size=2,
+        edge_budget=0,
+        grad_accumulation=True,
+        q_loss_weight=1.0,
+        max_grad_norm=0.0,
+        seed=3,
+        prefetch_batches=False,
+    )
+
+    assert metrics["critic_loss"] == pytest.approx(math.log(3.0))
+    assert metrics["q_loss"] == pytest.approx(metrics["critic_loss"])
+    assert metrics["q_mse"] == pytest.approx(0.625)
+    assert metrics["total_loss"] == pytest.approx(
+        math.log(6.0) + math.log(3.0)
+    )
 
 
 def test_learning_rate_warmup_reaches_target_on_fifth_generation():
@@ -1412,6 +1485,83 @@ def test_persistent_trainer_grafts_graph_klent_checkpoint(tmp_path):
     assert any(
         key.startswith("ray_mixers.")
         for key in target.model.state_dict()
+    )
+    target.close()
+
+
+def test_graph_trainer_revives_scalar_klent_as_categorical(tmp_path):
+    model_config = KlentModelConfig(
+        **dataclasses.asdict(tiny_model_config()),
+        critic="scalar",
+    )
+    source_config = Config(
+        model=model_config,
+        game=GameConfig(
+            win_length=2,
+            placement_radius=1,
+            rollout_horizon=4,
+        ),
+        collection=CollectionConfig(
+            positions_per_iteration=4,
+            parallel_games=2,
+            inference_batch_size=2,
+        ),
+        training=TrainingConfig(batch_size=4),
+        evaluation=EvaluationConfig(interval=0, opponents=[]),
+        run=RunConfig(
+            iterations=1,
+            device="cpu",
+            precision="float32",
+            output_dir=str(tmp_path / "scalar"),
+            checkpoint_interval=0,
+        ),
+    )
+    source = Trainer(source_config, tensorboard=False)
+    with torch.no_grad():
+        source.model.q_head.mlp[2].weight.normal_(mean=0.0, std=0.2)
+        source.model.q_head.mlp[2].bias.fill_(0.1)
+    source_state = {
+        key: value.detach().clone()
+        for key, value in source.model.state_dict().items()
+    }
+    source.iteration = 10
+    source_checkpoint = source.save_checkpoint(final=True)
+    source.close()
+
+    target_config = dataclasses.replace(
+        source_config,
+        model=dataclasses.replace(model_config, critic="categorical"),
+        run=dataclasses.replace(
+            source_config.run,
+            output_dir=str(tmp_path / "categorical"),
+        ),
+    )
+    target = Trainer(
+        target_config,
+        tensorboard=False,
+        init_from=source_checkpoint,
+    )
+
+    assert target.iteration == 0
+    assert not target.optimizer.state_dict()["state"]
+    assert target.initial_checkpoint is not None
+    assert target.initial_checkpoint["iteration"] == 10
+    assert target.initial_checkpoint["source_critic"] == "scalar"
+    assert target.initial_checkpoint["target_critic"] == "categorical"
+    target_state = target.model.state_dict()
+    for key, value in source_state.items():
+        if key in {"q_head.mlp.2.weight", "q_head.mlp.2.bias"}:
+            continue
+        torch.testing.assert_close(target_state[key], value)
+    old_weight = source_state["q_head.mlp.2.weight"]
+    old_bias = source_state["q_head.mlp.2.bias"]
+    torch.testing.assert_close(
+        target_state["q_head.mlp.2.weight"],
+        torch.cat((old_weight, -old_weight, torch.zeros_like(old_weight))),
+    )
+    torch.testing.assert_close(
+        target_state["q_head.mlp.2.bias"],
+        torch.cat((old_bias, -old_bias, torch.zeros_like(old_bias))),
     )
     target.close()
 

@@ -2,7 +2,7 @@
 // stays off the UI thread; terminating this worker cancels an analysis.
 
 let apiPromise;
-let botPromise;
+const botPromises = new Map();
 const ANALYSIS_CACHE_DB = "hexo-local-analysis";
 const ANALYSIS_CACHE_STORE = "positions";
 const ANALYSIS_CACHE_VERSION = 2;
@@ -27,15 +27,18 @@ async function loadApi() {
 }
 
 async function loadBot(modelUrl) {
-  if (!botPromise) {
-    botPromise = (async () => {
+  if (!botPromises.has(modelUrl)) {
+    botPromises.set(modelUrl, (async () => {
       const [api, response] = await Promise.all([loadApi(), fetch(modelUrl)]);
       if (!response.ok) throw new Error(`model download failed: HTTP ${response.status}`);
       const weights = new Uint8Array(await response.arrayBuffer());
       return new api.StrixBot(weights);
-    })();
+    })().catch(error => {
+      botPromises.delete(modelUrl);
+      throw error;
+    }));
   }
-  return botPromise;
+  return botPromises.get(modelUrl);
 }
 
 function openAnalysisCache() {

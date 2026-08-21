@@ -1,0 +1,91 @@
+# Larger-refresh companion to s4-from10-tau16-alpha001-heads-low-lr.
+# Positions and effective optimizer batch are both 4x larger, preserving about
+# 64 optimizer steps per FIT while testing whether broader fresh on-policy
+# coverage stabilizes the small late-stage KLENT correction.
+#
+#   .venv/bin/hexo-klent train \
+#     --config configs/klent/axis-gine/s4-from10-tau16-alpha001-heads-more-data.toml \
+#     --resume runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt \
+#     --resume-configured-lr \
+#     --tui
+
+[model]
+architecture = "graph"
+hidden_dim = 128
+num_layers = 4
+num_heads = 8
+conv_type = "gine"
+pre_norm = true
+dropout = 0.0
+use_jk = true
+jk_mode = "cat"
+policy_hidden = 128
+q_hidden = 64
+graph_type = "axis"
+prune_empty_edges = true
+threat_features = true
+relative_stone_encoding = true
+axis_relational = true
+axis_window = 8
+compact_stone_onehot = true
+node_coords = false
+moves_scope = "node"
+
+[game]
+win_length = 6
+placement_radius = 8
+rollout_horizon = 300
+
+[algorithm]
+alpha = 0.01
+beta = 0.10
+tau = 16.0
+
+[collection]
+positions_per_iteration = 524_288
+parallel_games = 512
+inference_batch_size = 256
+inference_edge_budget = 250_000
+workers = 4
+batch_timeout_ms = 2.0
+
+[training]
+batch_size = 8_192
+edge_budget = 250_000
+policy_diagnostic_samples = 2_048
+grad_accumulation = true
+prefetch_batches = true
+fit_max_autotune = true
+fit_compile_seed_nodes = 16_384
+learning_rate = 5e-6
+weight_decay = 1e-4
+q_loss_weight = 1.0
+max_grad_norm = 0.0
+critic_head_only = false
+heads_only = true
+
+[evaluation]
+interval = 5
+opening_plies = 8
+opening_temperature = 0.5
+opening_generator = "alternate"
+
+[[evaluation.opponents]]
+name = "checkpoint10_anchor"
+kind = "checkpoint"
+checkpoint = "runs/klent/axis-gine/s4-from-d6-qhead-tau16-alpha001-noclip/checkpoints/checkpoint_000010.pt"
+games = 128
+placement_radius = 8
+mcts_simulations = 24
+mcts_actions = 8
+opponent_mcts_simulations = 24
+opponent_mcts_actions = 8
+
+[run]
+iterations = 60
+device = "cuda"
+precision = "bf16"
+compile = true
+output_dir = "runs/klent/axis-gine/s4-from10-tau16-alpha001-heads-more-data"
+checkpoint_interval = 1
+seed = 0

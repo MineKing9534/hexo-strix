@@ -37,6 +37,63 @@ class BatchOutput:
     policy_logits: Tensor
     q_values: Tensor
     legal_counts: Tensor
+    critic_logits: Tensor | None = None
+    q_mass: Tensor | None = None
+
+
+def categorical_q(critic_logits: Tensor) -> tuple[Tensor, Tensor]:
+    """Compose three outcome logits into scalar Q and committed mass."""
+
+    if critic_logits.ndim < 1 or critic_logits.shape[-1] != 3:
+        raise ValueError("categorical critic logits must end in dimension 3")
+    # Spell out the fixed-width reduction. On ROCm, Inductor's generic
+    # split-reduction softmax can produce non-finite values for this dynamic
+    # legal-action dimension under bf16 autocast. Float32 shifted exponentials
+    # are both stable and compile into a simple three-lane pointwise kernel.
+    work = critic_logits.float()
+    positive_logit, negative_logit, zero_logit = work.unbind(dim=-1)
+    maximum = torch.maximum(
+        torch.maximum(positive_logit, negative_logit),
+        zero_logit,
+    )
+    positive_weight = (positive_logit - maximum).exp()
+    negative_weight = (negative_logit - maximum).exp()
+    zero_weight = (zero_logit - maximum).exp()
+    inverse_sum = (
+        positive_weight + negative_weight + zero_weight
+    ).reciprocal()
+    positive = positive_weight * inverse_sum
+    negative = negative_weight * inverse_sum
+    return positive - negative, positive + negative
+
+
+def acting_q_values(output: BatchOutput, *, mass_floor: float) -> Tensor:
+    """Return raw scalar Q or Mantis-style per-position normalized Q."""
+
+    if output.q_mass is None:
+        return output.q_values
+    if not 0.0 < mass_floor <= 1.0:
+        raise ValueError("mass_floor must be in (0, 1]")
+    counts = [int(count) for count in output.legal_counts.detach().cpu()]
+    q_chunks = output.q_values.split(counts)
+    mass_chunks = output.q_mass.split(counts)
+    normalized = [
+        q / mass.max().clamp_min(mass_floor)
+        for q, mass in zip(q_chunks, mass_chunks, strict=True)
+    ]
+    return torch.cat(normalized)
+
+
+class CategoricalQHead(nn.Module):
+    """Per-action three-outcome critic with the scalar Q head's hidden shape."""
+
+    def __init__(self, hidden_dim: int, q_hidden: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, q_hidden),
+            nn.ReLU(),
+            nn.Linear(q_hidden, 3),
+        )
 
 
 def improved_policy(
@@ -66,14 +123,19 @@ class KlentNet(nn.Module):
         )
         head_dim = self.representation.output_dim
         self.policy_head = PolicyHead(head_dim, config.policy_hidden)
-        self.q_head = QHead(head_dim, config.q_hidden)
+        self.critic_type = str(getattr(config, "critic", "scalar"))
+        self.q_head = (
+            CategoricalQHead(head_dim, config.q_hidden)
+            if self.critic_type == "categorical"
+            else QHead(head_dim, config.q_hidden)
+        )
         self.reset_output_heads()
 
     def reset_output_heads(self) -> None:
         """Start KLENT at a uniform policy with zero action values."""
 
         policy_out = self.policy_head.mlp[-1]
-        q_out = self.q_head.mlp[-2]
+        q_out = self.q_head.mlp[2]
         if not isinstance(policy_out, nn.Linear) or not isinstance(q_out, nn.Linear):
             raise TypeError("unexpected policy/Q head layout")
         nn.init.zeros_(policy_out.weight)
@@ -140,13 +202,18 @@ class KlentNet(nn.Module):
             policy_second.weight,
             policy_second.bias,
         ).squeeze(-1)
-        q_values = torch.tanh(
-            F.linear(
-                F.relu(q_hidden),
-                q_second.weight,
-                q_second.bias,
-            ).squeeze(-1)
+        critic_output = F.linear(
+            F.relu(q_hidden),
+            q_second.weight,
+            q_second.bias,
         )
+        if self.critic_type == "categorical":
+            critic_logits = critic_output
+            q_values, q_mass = categorical_q(critic_logits)
+        else:
+            critic_logits = None
+            q_values = torch.tanh(critic_output.squeeze(-1))
+            q_mass = None
 
         legal_counts = getattr(batch, "legal_counts", None)
         if legal_counts is None:
@@ -158,7 +225,13 @@ class KlentNet(nn.Module):
             legal_counts.scatter_add_(
                 0, batch.batch, batch.legal_mask.to(dtype=torch.long)
             )
-        return BatchOutput(policy_logits, q_values, legal_counts)
+        return BatchOutput(
+            policy_logits,
+            q_values,
+            legal_counts,
+            critic_logits=critic_logits,
+            q_mass=q_mass,
+        )
 
     def _forward_fit_core(
         self,
@@ -194,7 +267,14 @@ class KlentNet(nn.Module):
             chosen,
         )
         policy_logits = self.policy_head.mlp(legal_embeddings).squeeze(-1)
-        q_values = self.q_head.mlp(chosen_embeddings).squeeze(-1)
+        critic_output = self.q_head.mlp(chosen_embeddings)
+        if self.critic_type == "categorical":
+            critic_logits = critic_output
+            q_values, q_mass = categorical_q(critic_logits)
+        else:
+            critic_logits = None
+            q_values = critic_output.squeeze(-1)
+            q_mass = None
 
         legal_counts = getattr(batch, "legal_counts", None)
         if legal_counts is None:
@@ -206,7 +286,13 @@ class KlentNet(nn.Module):
             legal_counts.scatter_add_(
                 0, batch.batch, batch.legal_mask.to(dtype=torch.long)
             )
-        return BatchOutput(policy_logits, q_values, legal_counts)
+        return BatchOutput(
+            policy_logits,
+            q_values,
+            legal_counts,
+            critic_logits=critic_logits,
+            q_mass=q_mass,
+        )
 
     def forward_batch(self, batch) -> BatchOutput:
         """Evaluate all legal actions in a PyG batch."""
@@ -298,12 +384,21 @@ def _persistent_ray_config(config: ModelConfig) -> PersistentRayConfig:
 class _RasterKlentOutputMixin:
     """Legal-only KLENT heads shared by both dense raster backbones."""
 
-    def _configure_klent_outputs(self) -> None:
+    def _configure_klent_outputs(self, config: ModelConfig) -> None:
         # KLENT derives V from its improved policy and action Q values. The
         # production value and horizon heads therefore do not belong to this
         # network or its optimizer.
         del self.value_head
         del self.horizon_value_heads
+        self.critic_type = str(getattr(config, "critic", "scalar"))
+        if self.critic_type == "categorical":
+            old_output = self.q_head.fc2
+            self.q_head.fc2 = nn.Conv2d(
+                old_output.in_channels,
+                3,
+                kernel_size=1,
+            )
+            self.q_head.tanh = False
         self.reset_output_heads()
 
     def reset_output_heads(self) -> None:
@@ -327,11 +422,11 @@ class _RasterKlentOutputMixin:
             F.relu(hidden),
             second.weight[:, :, 0, 0],
             second.bias,
-        ).squeeze(-1)
+        )
         return (
-            torch.tanh(output)
+            torch.tanh(output.squeeze(-1))
             if bool(getattr(head, "tanh", False))
-            else output
+            else output.squeeze(-1) if output.shape[-1] == 1 else output
         )
 
     def _forward_batch_core(
@@ -360,12 +455,25 @@ class _RasterKlentOutputMixin:
             self.policy_head,
             legal_embeddings,
         )
-        q_values = self._legal_head(
+        critic_output = self._legal_head(
             self.q_head,
             legal_embeddings,
         )
+        if self.critic_type == "categorical":
+            critic_logits = critic_output
+            q_values, q_mass = categorical_q(critic_logits)
+        else:
+            critic_logits = None
+            q_values = critic_output
+            q_mass = None
         legal_counts = batch.legal_offsets[1:] - batch.legal_offsets[:-1]
-        return BatchOutput(policy_logits, q_values, legal_counts)
+        return BatchOutput(
+            policy_logits,
+            q_values,
+            legal_counts,
+            critic_logits=critic_logits,
+            q_mass=q_mass,
+        )
 
     def forward_batch(self, batch) -> BatchOutput:
         return self._forward_batch_core(batch)
@@ -376,7 +484,7 @@ class DenseAxisKlentNet(_RasterKlentOutputMixin, AxisGineCompatNet):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(_dense_axis_config(config))
-        self._configure_klent_outputs()
+        self._configure_klent_outputs(config)
 
 
 class PersistentRayKlentNet(
@@ -387,7 +495,7 @@ class PersistentRayKlentNet(
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(_persistent_ray_config(config))
-        self._configure_klent_outputs()
+        self._configure_klent_outputs(config)
 
 
 class HexCNNKlentNet(nn.Module):
@@ -396,6 +504,7 @@ class HexCNNKlentNet(nn.Module):
     def __init__(self, config: ModelConfig, backbone: nn.Module) -> None:
         super().__init__()
         self.config = config
+        self.critic_type = str(getattr(config, "critic", "scalar"))
         self.backbone = backbone
         self.policy_head = nn.Sequential(
             nn.Linear(config.hidden_dim, config.policy_hidden),
@@ -405,7 +514,10 @@ class HexCNNKlentNet(nn.Module):
         self.q_head = nn.Sequential(
             nn.Linear(config.hidden_dim, config.q_hidden),
             nn.SiLU(),
-            nn.Linear(config.q_hidden, 1),
+            nn.Linear(
+                config.q_hidden,
+                3 if self.critic_type == "categorical" else 1,
+            ),
         )
         self.reset_output_heads()
 
@@ -438,9 +550,22 @@ class HexCNNKlentNet(nn.Module):
             batch.legal_flat_indices.to(torch.long),
         )
         policy_logits = self.policy_head(legal).squeeze(-1)
-        q_values = torch.tanh(self.q_head(legal).squeeze(-1))
+        critic_output = self.q_head(legal)
+        if self.critic_type == "categorical":
+            critic_logits = critic_output
+            q_values, q_mass = categorical_q(critic_logits)
+        else:
+            critic_logits = None
+            q_values = torch.tanh(critic_output.squeeze(-1))
+            q_mass = None
         legal_counts = batch.legal_offsets[1:] - batch.legal_offsets[:-1]
-        return BatchOutput(policy_logits, q_values, legal_counts)
+        return BatchOutput(
+            policy_logits,
+            q_values,
+            legal_counts,
+            critic_logits=critic_logits,
+            q_mass=q_mass,
+        )
 
     def forward_batch(self, batch) -> BatchOutput:
         return self._forward_batch_core(batch)
@@ -933,12 +1058,45 @@ def load_production_graph_weights(
 
     source = extract_state_dict(checkpoint)
     target = model.state_dict()
-    missing = tuple(sorted(set(target) - set(source)))
+    converted_source = dict(source)
+    q_weight_key = "q_head.mlp.2.weight"
+    q_bias_key = "q_head.mlp.2.bias"
+    if (
+        model.critic_type == "categorical"
+        and q_weight_key in source
+        and q_bias_key in source
+        and q_weight_key in target
+        and q_bias_key in target
+        and tuple(source[q_weight_key].shape)
+        == (1, target[q_weight_key].shape[1])
+        and tuple(target[q_weight_key].shape)
+        == (3, source[q_weight_key].shape[1])
+        and tuple(source[q_bias_key].shape) == (1,)
+        and tuple(target[q_bias_key].shape) == (3,)
+    ):
+        # Map the old scalar preactivation x to (x, -x, 0).  Around the origin
+        # its committed mass is nearly action-independent, so acting-Q mass
+        # normalization approximately recovers tanh(x), while the finite zero
+        # logit lets intermediate-return targets train immediately.  Using a
+        # huge negative zero-class bias would preserve raw Q more exactly but
+        # would leave that class effectively frozen at the small revival LR.
+        old_weight = source[q_weight_key]
+        old_bias = source[q_bias_key]
+        converted_source[q_weight_key] = torch.cat(
+            (old_weight, -old_weight, torch.zeros_like(old_weight)),
+            dim=0,
+        )
+        converted_source[q_bias_key] = torch.cat(
+            (old_bias, -old_bias, torch.zeros_like(old_bias)),
+            dim=0,
+        )
+    missing = tuple(sorted(set(target) - set(converted_source)))
     mismatches = tuple(
         sorted(
-            f"{key} {tuple(source[key].shape)} -> {tuple(target[key].shape)}"
-            for key in set(target) & set(source)
-            if tuple(source[key].shape) != tuple(target[key].shape)
+            f"{key} {tuple(converted_source[key].shape)} -> "
+            f"{tuple(target[key].shape)}"
+            for key in set(target) & set(converted_source)
+            if tuple(converted_source[key].shape) != tuple(target[key].shape)
         )
     )
     if missing or mismatches:
@@ -947,7 +1105,7 @@ def load_production_graph_weights(
             f"missing={missing}, shape_mismatches={mismatches}"
         )
     converted = {
-        key: source[key].to(dtype=value.dtype)
+        key: converted_source[key].to(dtype=value.dtype)
         for key, value in target.items()
     }
     model.load_state_dict(converted, strict=True)

@@ -108,6 +108,36 @@ def test_collect_games_drains_to_terminal_games_with_fresh_targets():
     assert stats.mean_q_span == pytest.approx(0.0)
 
 
+def test_collect_games_uses_categorical_critic_acting_path():
+    model_config = tiny_model_config()
+    model_config.critic = "categorical"
+    model = KlentNet(model_config)
+
+    trajectories, stats = collect_games(
+        model,
+        model_config=model_config,
+        game_config=GameConfig(
+            win_length=2,
+            placement_radius=1,
+            rollout_horizon=4,
+        ),
+        algorithm=AlgorithmConfig(
+            gamma=0.99,
+            critic_mass_floor=0.2,
+        ),
+        positions=12,
+        parallel_games=2,
+        inference_batch_size=2,
+        device=torch.device("cpu"),
+        seed=17,
+    )
+
+    samples = flatten_trajectories(trajectories)
+    assert stats.positions >= 12
+    assert all(sample.return_target is not None for sample in samples)
+    assert all(abs(sample.return_target) <= 1.0 for sample in samples)
+
+
 def test_collect_games_confines_play_to_d6_symmetric_finite_board():
     model_config = tiny_model_config()
     model = KlentNet(model_config)
@@ -338,7 +368,7 @@ def test_dense_spatial_boundary_discards_wandering_games():
             state_logits[frontier] = 100.0
             logits.append(state_logits)
             q_values.append(torch.full((len(legal),), 0.25))
-        return logits, q_values
+        return logits, q_values, q_values
 
     trajectories, stats = _collect_with_inference(
         frontier_inference,
@@ -369,10 +399,10 @@ def test_dense_spatial_boundary_discards_wandering_games():
 
 def test_completed_trajectory_streaming_preserves_collection_semantics():
     def zero_inference(states):
-        return (
-            [torch.zeros(state.legal_move_count()) for state in states],
-            [torch.zeros(state.legal_move_count()) for state in states],
-        )
+        zeros = [
+            torch.zeros(state.legal_move_count()) for state in states
+        ]
+        return zeros, zeros, zeros
 
     arguments = dict(
         game_config=GameConfig(
