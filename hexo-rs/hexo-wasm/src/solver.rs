@@ -255,8 +255,9 @@ pub struct DefenseOutcome {
     /// proven threat; always present under `ThreatFound`, but its `pv` may be
     /// EMPTY when the PV re-derivation starved under `node_budget` (the win and
     /// its `depth` are still proven — retry with a larger budget to recover the
-    /// line; killers/pair_anchors/best_delay are empty in that case too, since
-    /// defense candidates are drawn from the PV cells). `nodes` is 0 (the
+    /// line. PV-blocking candidates may be unavailable in that case, but
+    /// counter-threat pairs are generated independently from the real mover's
+    /// position). `nodes` is 0 (the
     /// sub-solve's node count is not surfaced by `solve_defense`).
     pub threat: Option<SolveOutcome>,
     /// Single placements after which the threat is no longer provable (or which
@@ -265,6 +266,15 @@ pub struct DefenseOutcome {
     /// `(first, second)` placement pairs that jointly refute the threat.
     /// Searched only when the mover has 2 placements left and `killers` is empty.
     pub pair_anchors: Vec<PairAnchor>,
+    /// Pair defenses that work by creating the mover's own forcing threat and
+    /// taking initiative before the opponent can start its hypothetical line.
+    pub counter_threats: Vec<PairAnchor>,
+    /// Exact minimum-cover pairs for the immediate attack whose deeper
+    /// whole-line verification remains inconclusive.
+    pub tactical_pairs: Vec<PairAnchor>,
+    /// Candidate replies whose deeper verification exhausted the work budget.
+    /// They are not certified defenses, but remain tactically relevant.
+    pub unresolved: Vec<CoordW>,
     /// Max-delay fallback: the surviving candidate whose re-proven threat PV is
     /// longest. `None` when the threat PV offers no legal candidate.
     pub best_delay: Option<CoordW>,
@@ -605,6 +615,9 @@ impl StrixSolver {
             threat: None,
             killers: Vec::new(),
             pair_anchors: Vec::new(),
+            counter_threats: Vec::new(),
+            tactical_pairs: Vec::new(),
+            unresolved: Vec::new(),
             best_delay: None,
         };
         match verdict {
@@ -626,8 +639,8 @@ impl StrixSolver {
                 // only bound. A proven threat with no line is still a proven
                 // threat: report ThreatFound with `threat.pv` empty (retry with
                 // a larger node_budget to recover the line), never NoThreat —
-                // and note killers/pair_anchors/best_delay are necessarily
-                // empty too (defense candidates are drawn from the PV cells).
+                // PV-blocking candidates may be absent, while independently
+                // generated counter-threat pairs can still be available.
                 let threat_attacker = opponent(position.to_move);
                 let threat = Some(SolveOutcome {
                     kind: SolveKind::Win,
@@ -654,6 +667,22 @@ impl StrixSolver {
                             second: CoordW { q: b.0, r: b.1 },
                         })
                         .collect(),
+                    counter_threats: a
+                        .counter_threats
+                        .iter()
+                        .map(|&(a, b)| PairAnchor {
+                            first: CoordW { q: a.0, r: a.1 },
+                            second: CoordW { q: b.0, r: b.1 },
+                        })
+                        .collect(),
+                    tactical_pairs: a.tactical_pairs.iter()
+                        .map(|&(a, b)| PairAnchor {
+                            first: CoordW { q: a.0, r: a.1 },
+                            second: CoordW { q: b.0, r: b.1 },
+                        })
+                        .collect(),
+                    unresolved: a.unresolved.iter()
+                        .map(|&(q, r)| CoordW { q, r }).collect(),
                     best_delay: a.best_delay.map(|(q, r)| CoordW { q, r }),
                 })
             }
@@ -1091,6 +1120,87 @@ mod tests {
         assert_eq!(threat.pv[0].turn, 0);
         assert_eq!(threat.pv[0].player, Player::P1, "threat attacker is P1 (opponent)");
         assert!(threat.pv[0].cells.len() <= 2);
+    }
+
+    /// qietby7/9sldwvr after P2's round-8 turn: the actual mover P1 can
+    /// answer the hypothetical P2 threat by creating a forcing threat of its
+    /// own. The WASM boundary must retain that initiative evidence.
+    #[test]
+    fn solve_defense_wide_reports_qiet_counter_threat() {
+        #[derive(serde::Deserialize)]
+        struct Replay { moves: Vec<(i32, i32, String)> }
+        let replay: Replay = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/forcing_puzzles/qietby7_17_line.json"
+        )).unwrap();
+        let stones = replay.moves.into_iter().take(31).map(|(q, r, player)| Stone {
+            coord: CoordW { q, r },
+            player: if player == "P1" { Player::P1 } else { Player::P2 },
+        }).collect();
+        let pos = Position {
+            win_length: 6, placement_radius: 8, max_moves: 400,
+            to_move: Player::P1, moves_remaining: 2, stones,
+        };
+        let out = StrixSolver::new()
+            .solve_defense_wide(&pos, &limits_idtt(12, 100_000)).unwrap();
+        assert_eq!(out.kind, DefenseKind::ThreatFound);
+        let target = |pair: &PairAnchor| {
+            pair.first.q == 2 && pair.first.r == 0
+                && pair.second.q == 3 && pair.second.r == 0
+        };
+        assert!(out.pair_anchors.iter().any(target));
+        assert!(out.counter_threats.iter().any(target));
+    }
+
+    #[test]
+    fn solve_defense_wide_keeps_qiet_round10_tactical_pairs() {
+        #[derive(serde::Deserialize)]
+        struct Replay { moves: Vec<(i32, i32, String)> }
+        let replay: Replay = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/forcing_puzzles/qietby7_17_line.json"
+        )).unwrap();
+        let stones = replay.moves.into_iter().take(37).map(|(q, r, player)| Stone {
+            coord: CoordW { q, r },
+            player: if player == "P1" { Player::P1 } else { Player::P2 },
+        }).collect();
+        let pos = Position {
+            win_length: 6, placement_radius: 8, max_moves: 400,
+            to_move: Player::P2, moves_remaining: 2, stones,
+        };
+        let out = StrixSolver::new()
+            .solve_defense_wide(&pos, &limits_idtt(8, 50_000)).unwrap();
+        let has = |a, b| out.tactical_pairs.iter().any(|pair|
+            (pair.first.q, pair.first.r) == a && (pair.second.q, pair.second.r) == b);
+        assert!(has((3, -2), (3, 4)));
+        assert!(has((3, -1), (3, 4)));
+        assert!(has((3, -1), (3, 5)));
+        assert!(out.pair_anchors.is_empty());
+    }
+
+    #[test]
+    fn solve_defense_wide_keeps_qiet_midturn_block_unresolved() {
+        #[derive(serde::Deserialize)]
+        struct Replay { moves: Vec<(i32, i32, String)> }
+        let replay: Replay = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/forcing_puzzles/qietby7_17_line.json"
+        )).unwrap();
+        let mut stones: Vec<Stone> = replay.moves.into_iter().take(31).map(|(q, r, player)| Stone {
+            coord: CoordW { q, r },
+            player: if player == "P1" { Player::P1 } else { Player::P2 },
+        }).collect();
+        stones.extend([
+            Stone { coord: CoordW { q: 2, r: 0 }, player: Player::P1 },
+            Stone { coord: CoordW { q: 3, r: 0 }, player: Player::P1 },
+            Stone { coord: CoordW { q: -2, r: 0 }, player: Player::P2 },
+        ]);
+        let pos = Position {
+            win_length: 6, placement_radius: 8, max_moves: 400,
+            to_move: Player::P2, moves_remaining: 1, stones,
+        };
+        let out = StrixSolver::new()
+            .solve_defense_wide(&pos, &limits_idtt(8, 50_000)).unwrap();
+        assert!(out.unresolved.iter().any(|cell| cell.q == 4 && cell.r == 0));
+        assert!(!out.unresolved.iter().any(|cell| cell.q == -1 && cell.r == 0));
+        assert!(out.best_delay.is_none());
     }
 
     /// `solve_defense` on a position with no opponent threat reports `NoThreat`

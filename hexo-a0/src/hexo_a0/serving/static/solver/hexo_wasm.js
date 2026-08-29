@@ -176,6 +176,17 @@ export class DefenseOutcome {
         return ret === 0 ? undefined : CoordW.__wrap(ret);
     }
     /**
+     * Pair defenses that work by creating the mover's own forcing threat and
+     * taking initiative before the opponent can start its hypothetical line.
+     * @returns {PairAnchor[]}
+     */
+    get counter_threats() {
+        const ret = wasm.__wbg_get_defenseoutcome_counter_threats(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
      * Single placements after which the threat is no longer provable (or which
      * end the game outright).
      * @returns {CoordW[]}
@@ -216,14 +227,26 @@ export class DefenseOutcome {
         return v1;
     }
     /**
+     * Exact minimum-cover pairs for the immediate attack whose deeper
+     * whole-line verification remains inconclusive.
+     * @returns {PairAnchor[]}
+     */
+    get tactical_pairs() {
+        const ret = wasm.__wbg_get_defenseoutcome_tactical_pairs(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
      * The opponent's threat as a `SolveOutcome` (`kind: Win`), chunked into
      * turns the same way as `solve`: the threat is a fresh 2-placement turn
      * for the opponent, so the first turn has 2 cells. `None` when there is no
      * proven threat; always present under `ThreatFound`, but its `pv` may be
      * EMPTY when the PV re-derivation starved under `node_budget` (the win and
      * its `depth` are still proven — retry with a larger budget to recover the
-     * line; killers/pair_anchors/best_delay are empty in that case too, since
-     * defense candidates are drawn from the PV cells). `nodes` is 0 (the
+     * line. PV-blocking candidates may be unavailable in that case, but
+     * counter-threat pairs are generated independently from the real mover's
+     * position). `nodes` is 0 (the
      * sub-solve's node count is not surfaced by `solve_defense`).
      * @returns {SolveOutcome | undefined}
      */
@@ -241,6 +264,17 @@ export class DefenseOutcome {
         return ret;
     }
     /**
+     * Candidate replies whose deeper verification exhausted the work budget.
+     * They are not certified defenses, but remain tactically relevant.
+     * @returns {CoordW[]}
+     */
+    get unresolved() {
+        const ret = wasm.__wbg_get_defenseoutcome_unresolved(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
      * Max-delay fallback: the surviving candidate whose re-proven threat PV is
      * longest. `None` when the threat PV offers no legal candidate.
      * @param {CoordW | null} [arg0]
@@ -252,6 +286,16 @@ export class DefenseOutcome {
             ptr0 = arg0.__destroy_into_raw();
         }
         wasm.__wbg_set_defenseoutcome_best_delay(this.__wbg_ptr, ptr0);
+    }
+    /**
+     * Pair defenses that work by creating the mover's own forcing threat and
+     * taking initiative before the opponent can start its hypothetical line.
+     * @param {PairAnchor[]} arg0
+     */
+    set counter_threats(arg0) {
+        const ptr0 = passArrayJsValueToWasm0(arg0, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_defenseoutcome_counter_threats(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * Single placements after which the threat is no longer provable (or which
@@ -290,14 +334,25 @@ export class DefenseOutcome {
         wasm.__wbg_set_defenseoutcome_pair_anchors(this.__wbg_ptr, ptr0, len0);
     }
     /**
+     * Exact minimum-cover pairs for the immediate attack whose deeper
+     * whole-line verification remains inconclusive.
+     * @param {PairAnchor[]} arg0
+     */
+    set tactical_pairs(arg0) {
+        const ptr0 = passArrayJsValueToWasm0(arg0, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_defenseoutcome_tactical_pairs(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
      * The opponent's threat as a `SolveOutcome` (`kind: Win`), chunked into
      * turns the same way as `solve`: the threat is a fresh 2-placement turn
      * for the opponent, so the first turn has 2 cells. `None` when there is no
      * proven threat; always present under `ThreatFound`, but its `pv` may be
      * EMPTY when the PV re-derivation starved under `node_budget` (the win and
      * its `depth` are still proven — retry with a larger budget to recover the
-     * line; killers/pair_anchors/best_delay are empty in that case too, since
-     * defense candidates are drawn from the PV cells). `nodes` is 0 (the
+     * line. PV-blocking candidates may be unavailable in that case, but
+     * counter-threat pairs are generated independently from the real mover's
+     * position). `nodes` is 0 (the
      * sub-solve's node count is not surfaced by `solve_defense`).
      * @param {SolveOutcome | null} [arg0]
      */
@@ -316,6 +371,16 @@ export class DefenseOutcome {
      */
     set time_ms(arg0) {
         wasm.__wbg_set_defenseoutcome_time_ms(this.__wbg_ptr, arg0);
+    }
+    /**
+     * Candidate replies whose deeper verification exhausted the work budget.
+     * They are not certified defenses, but remain tactically relevant.
+     * @param {CoordW[]} arg0
+     */
+    set unresolved(arg0) {
+        const ptr0 = passArrayJsValueToWasm0(arg0, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_defenseoutcome_unresolved(this.__wbg_ptr, ptr0, len0);
     }
 }
 if (Symbol.dispose) DefenseOutcome.prototype[Symbol.dispose] = DefenseOutcome.prototype.free;

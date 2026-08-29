@@ -125,6 +125,10 @@ def test_static_serves_css_and_js():
         assert iw == 200 and iw_type == "text/javascript; charset=utf-8"
         assert b"StrixBot" in inference_js and b"analyzeGame" in inference_js
         assert (b"solve_defense_wide" in inference_js and b"analyzeDefense" in inference_js
+                and b"counter_threats" in inference_js and b"tactical_pairs" in inference_js
+                and b"unresolved" in inference_js
+                and b"ANALYSIS_CACHE_VERSION = 3" in inference_js
+                and b"self.location.search" in inference_js
                 and b"indexedDB" in inference_js)
         pe, pe_type, _, _, proof_js = _get(port, "/static/proof-explorer.js")
         assert pe == 200 and pe_type == "text/javascript; charset=utf-8"

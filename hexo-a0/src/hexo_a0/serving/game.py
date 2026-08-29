@@ -443,8 +443,10 @@ def make_bot_turn_fn(
         either — safe to fall through to normal MCTS in that case.
 
         The search itself lives in the solver (``hr.solve_defense``,
-        forcing.rs): single killers first, then killer PAIRS when no single
-        block refutes — the case the old Python max-delay survivor loop lost
+        forcing.rs): single killers first, then verified pairs when no single
+        block refutes. Pairs include both direct blocks and forcing
+        counter-threats that make the opponent answer first — the case the old
+        Python max-delay survivor loop could not see
         (strongloss_a, 2026-07-04: every killer pair was anchored on a cell
         the delay metric ranked below a far-away non-anchor, and the bot
         played the non-anchor). This wrapper only applies the NN policy
@@ -461,7 +463,18 @@ def make_bot_turn_fn(
                                int(deadline_s * 1000))
         if res is None:
             return None
-        killers, pair_anchors, best_delay, _threat_pv = res
+        if len(res) == 7:
+            (killers, pair_anchors, _counter_threats, tactical_pairs,
+             unresolved, best_delay, _threat_pv) = res
+        elif len(res) == 6:
+            killers, pair_anchors, _counter_threats, unresolved, best_delay, _threat_pv = res
+            tactical_pairs = []
+        elif len(res) == 5:
+            killers, pair_anchors, _counter_threats, best_delay, _threat_pv = res
+            tactical_pairs, unresolved = [], []
+        else:  # compatibility with older extensions and test doubles
+            killers, pair_anchors, best_delay, _threat_pv = res
+            tactical_pairs, unresolved = [], []
         # Escalated confirmation of the candidates below: one more deadline
         # window, checked before each (rare) rejection re-solve. On expiry the
         # policy-best remaining candidate is played UNVERIFIED — exactly the
@@ -493,22 +506,36 @@ def make_bot_turn_fn(
             # Every killer was a budget artifact: a pair may still hold.
         pairs = [(tuple(c1), tuple(c2)) for (c1, c2) in pair_anchors]
         while pairs:
-            # Any confirmed pair works: it was verified JOINTLY, so after
-            # playing the anchor its partner is a proven killer at this same
-            # turn's next placement. Cache it on the record — `_forcing_move`
-            # plays it directly instead of re-deriving it with a fresh solve
-            # that could hit the deadline (the 2026-07-06 chao loss).
+            # Pairs are unordered within a Hexo turn. Let policy choose either
+            # cell, then cache the other as the atomic partner.
             chosen = _policy_argmax(
-                state, restrict_to={c1 for (c1, _c2) in pairs})
-            partner = next(c2 for (c1, c2) in pairs if c1 == chosen)
+                state, restrict_to={cell for pair in pairs for cell in pair})
+            pair = next(pair for pair in pairs if chosen in pair)
+            partner = pair[1] if pair[0] == chosen else pair[0]
             timed_out = time.monotonic() >= verify_deadline
-            if timed_out or _verified_defense(rec, depth_cap, (chosen, partner)):
+            if timed_out or _verified_defense(rec, depth_cap, pair):
                 rec.defense_partner = partner
-                # After the anchor is appended to move_log, its length is
-                # len+1 — the partner applies at exactly that placement.
                 rec.defense_partner_base = len(rec.move_log) + 1
                 return chosen, ("pair-unverified" if timed_out else "pair")
-            pairs = [p for p in pairs if p != (chosen, partner)]
+            pairs.remove(pair)
+        tactical = [(tuple(c1), tuple(c2)) for (c1, c2) in tactical_pairs]
+        if tactical:
+            # These exact kernel covers stop the immediate forcing attack, even
+            # though the deeper whole-game re-check was inconclusive.
+            chosen = _policy_argmax(
+                state, restrict_to={cell for pair in tactical for cell in pair})
+            pair = next(pair for pair in tactical if chosen in pair)
+            partner = pair[1] if pair[0] == chosen else pair[0]
+            rec.defense_partner = partner
+            rec.defense_partner_base = len(rec.move_log) + 1
+            return chosen, "tactical-pair"
+        if state.moves_remaining_this_turn() == 1 and unresolved:
+            # A required sample-line block can exhaust the deeper global
+            # re-check. Never replace it with a reply already proved to lose on
+            # the opponent's next turn; keep the tactical reply and disclose
+            # that its full-game status is unresolved.
+            chosen = _policy_argmax(state, restrict_to={tuple(c) for c in unresolved})
+            return chosen, "tactical-unresolved"
         if best_delay is not None:
             # No refutation found this placement: play the survivor with the
             # longest surviving PV (max delay). The next placement re-runs
@@ -529,14 +556,17 @@ def make_bot_turn_fn(
         depth_cap = _forcing_depth_for(rec)
 
         # Pop the pair-partner cache (single-shot): it is only valid at the
-        # placement immediately after its anchor, in the same bot turn. It is
-        # consumed below AFTER the own-win solve — a proven own win preempts
-        # defending, same priority order as the rest of this function.
+        # placement immediately after its anchor, in the same bot turn. The
+        # verified pair is one atomic defensive choice: its required follow-up
+        # must preempt a fresh “own win” suggestion that can otherwise abandon
+        # the cover halfway through and lose immediately.
         partner, rec.defense_partner = rec.defense_partner, None
         if (partner is not None
                 and (len(rec.move_log) != rec.defense_partner_base
                      or partner not in legal)):
             partner = None
+        if partner is not None:
+            return partner, "partner"
 
         # 1. PV-cache replay: if the opponent has followed the cached forced
         # line so far, play the next PV move without calling the solver.
@@ -564,11 +594,6 @@ def make_bot_turn_fn(
                 "solve_forcing returned illegal first_move %r for game %s",
                 first_move, rec.game_id,
             )
-
-        # 2.5. Verified pair partner from this turn's anchor placement: a
-        # proven killer, played without any re-solve.
-        if partner is not None:
-            return partner, "partner"
 
         # 3. Defensive pre-emptive check (only when step 2 found nothing).
         return _defensive_move(rec, depth_cap)

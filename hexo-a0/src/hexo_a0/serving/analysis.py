@@ -401,13 +401,34 @@ def _solve_forcing(state, depth_cap=ANALYSIS_DEPTH_CAP,
                 d, d_wide = _solve_defense_wide_or_tight(
                     state, depth_cap, node_budget, ANALYSIS_DEFENSE_TIME_MS)
                 if d is not None:
-                    killers, pair_anchors, best_delay, _threat_pv = d
+                    if len(d) == 7:
+                        (killers, pair_anchors, counter_threats, tactical_pairs,
+                         unresolved, best_delay, _threat_pv) = d
+                    elif len(d) == 6:
+                        killers, pair_anchors, counter_threats, unresolved, best_delay, _threat_pv = d
+                        tactical_pairs = []
+                    elif len(d) == 5:
+                        killers, pair_anchors, counter_threats, best_delay, _threat_pv = d
+                        tactical_pairs, unresolved = [], []
+                    else:  # compatibility with older extensions and test doubles
+                        killers, pair_anchors, best_delay, _threat_pv = d
+                        counter_threats = []
+                        tactical_pairs, unresolved = [], []
                     defense = {
                         "killers": [[int(q), int(r)] for (q, r) in killers],
                         "pair_anchors": [
                             [[int(a[0]), int(a[1])], [int(b[0]), int(b[1])]]
                             for (a, b) in pair_anchors
                         ],
+                        "counter_threats": [
+                            [[int(a[0]), int(a[1])], [int(b[0]), int(b[1])]]
+                            for (a, b) in counter_threats
+                        ],
+                        "tactical_pairs": [
+                            [[int(a[0]), int(a[1])], [int(b[0]), int(b[1])]]
+                            for (a, b) in tactical_pairs
+                        ],
+                        "unresolved": [[int(q), int(r)] for (q, r) in unresolved],
                         "best_delay": ([int(best_delay[0]), int(best_delay[1])]
                                        if best_delay is not None else None),
                         "wide": d_wide,

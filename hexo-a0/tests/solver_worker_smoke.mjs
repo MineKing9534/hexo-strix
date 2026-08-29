@@ -41,7 +41,43 @@ const position = {
 // With a fixture argument, this doubles as a reproducible long-puzzle check of
 // the exact deployed worker/glue. Example:
 //   node solver_worker_smoke.mjs ../../scripts/fixtures/forcing_puzzles/0l4291i_live.json pdspn tight 60 100000000 5000
+// Slow counter-win certificate check: node solver_worker_smoke.mjs qiet-counter
 const fixturePath = process.argv[2];
+if (fixturePath === "qiet-counter") {
+  // Slow, explicit deployed-WASM regression (~4 minutes on the dev host): the
+  // opponent's hypothetical threat is not itself a forcing attack, but P1's
+  // real turn has a certificate-backed counter-win rooted at (2,0)+(3,0).
+  const replay = JSON.parse(await readFile(resolve(
+    here, "../../scripts/fixtures/forcing_puzzles/qietby7_17_line.json",
+  ), "utf8"));
+  posted.length = 0;
+  await self.onmessage({data: {
+    type: "rank-defenses",
+    requestId: "qiet-counter-win",
+    position: {
+      winLength: 6, placementRadius: 8, maxMoves: 400,
+      toMove: "P2", movesRemaining: 2,
+      stonesFlat: replay.moves.slice(0, 31).flatMap(([q, r, player]) => [
+        q, r, player === "P1" ? 1 : 2,
+      ]),
+    },
+    playedCover: [], baselineRemainingTurns: 9,
+    width: "wide", depthCap: 40,
+    nodeBudget: "4000000", leafNodeBudget: "1000000",
+  }});
+  const result = posted.find(message => message.type === "defense-result");
+  assert.equal(result?.status, "counter_win", result?.error || "counter-win proof failed");
+  assert.deepEqual(result.best.cover, [[2, 0], [3, 0]]);
+  assert.equal(result.best.result.kind, "win");
+  assert.ok(result.best.result.certificate, "counter-win must carry its own certificate");
+  console.log(JSON.stringify({
+    status: result.status,
+    cover: result.best.cover,
+    depth: result.best.result.depth,
+    verification: result.best.result.certificateSummary,
+  }, null, 2));
+  process.exit(0);
+}
 if (fixturePath) {
   const fixture = JSON.parse(await readFile(resolve(process.cwd(), fixturePath), "utf8"));
   if (process.argv[3] === "verify") {

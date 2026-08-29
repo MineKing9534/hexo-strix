@@ -2683,6 +2683,18 @@ pub struct DefenseAnalysis {
     /// refute; the caller plays it and the next placement's re-check finds
     /// `second` (or better).
     pub pair_anchors: Vec<(Coord, Coord)>,
+    /// Subset of `pair_anchors` that refute by creating the mover's own forcing
+    /// threat. The opponent must answer this pair before it can start the
+    /// hypothetical line, so initiative changes sides.
+    pub counter_threats: Vec<(Coord, Coord)>,
+    /// Exact two-cell minimum covers of the opponent's current forcing attack
+    /// whose deeper whole-line verification was not conclusive. They stop the
+    /// immediate attack, but are not advertised as global refutations.
+    pub tactical_pairs: Vec<(Coord, Coord)>,
+    /// Legal sample-line replies whose verification exhausted `node_budget`.
+    /// These are not proved safe, but must not be discarded in favour of a
+    /// reply that is proved to lose on the opponent's very next turn.
+    pub unresolved: Vec<Coord>,
     /// Max-delay fallback: the surviving candidate whose re-proven threat PV
     /// is longest (first such in PV order on ties, matching the old loop).
     /// `None` when the threat PV offers no legal candidate.
@@ -2694,6 +2706,25 @@ pub struct DefenseAnalysis {
 fn flipped_fresh_turn(game: &GameState, side: Player) -> GameState {
     let stones: Vec<(Coord, Player)> = game.stones().iter().map(|(&c, &p)| (c, p)).collect();
     GameState::from_state(&stones, side, 2, *game.config())
+}
+
+/// Forcing turns available to the actual mover before an opponent's
+/// hypothetical threat starts. These are offensive defenses: if one removes
+/// the opponent's forcing continuation, it wins the tempo race without having
+/// to occupy a cell from the opponent's sample PV.
+fn initiative_turns(game: &GameState, wide: bool) -> Vec<CellSet2> {
+    let Some(mover) = game.current_player() else { return Vec::new(); };
+    let Ok((board, _search, placements)) = prepare_search(
+        game, 1, wide, Limits::default(), false,
+    ) else { return Vec::new(); };
+    let cfg = game.config();
+    let defender_completions = completions(
+        &board, mover.opponent(), cfg.win_length, cfg.placement_radius,
+    );
+    attacker_turns_with(
+        &board, mover, placements, cfg.win_length, cfg.placement_radius,
+        &defender_completions, wide,
+    )
 }
 
 /// Forcing win for the OPPONENT of the side to move, as if it were their
@@ -2723,9 +2754,11 @@ pub fn solve_threat_wide(game: &GameState, depth_cap: u8, node_budget: u64) -> O
 ///
 /// Returns `None` when there is no proven opponent threat (nothing to defend;
 /// by threat monotonicity — the mover's stones only remove opponent threat
-/// cells — the caller can safely fall through to normal search). Candidates
-/// are the threat-PV cells the mover can legally take, in PV order; each
-/// killer/pair verification is one flipped re-`solve` at the same
+/// cells — the caller can safely fall through to normal search). Direct-block
+/// candidates come from legal threat-PV cells. The pair pass also generates
+/// the mover's own forcing turns: a verified counter-threat may take initiative
+/// without occupying the opponent's sample line. Each candidate verification
+/// is one flipped re-`solve` at the same
 /// `depth_cap`/`node_budget` as the threat solve (the SAME tier sees the SAME
 /// depth on both sides). `time_limit` bounds the whole analysis: on expiry
 /// the partial result is returned (unverified candidates are simply not
@@ -2785,17 +2818,45 @@ pub fn solve_defense_ex(game: &GameState, depth_cap: u8, node_budget: u64,
     };
     let threat_depth = threat.depth;
     let legal = game.legal_moves_set();
+    let initiative = initiative_turns(game, wide);
+    let mut tactical_pairs: Vec<(Coord, Coord)> = Vec::new();
+    if game.moves_remaining_this_turn() == 2 {
+        let cfg = game.config();
+        let position = crate::prover::io::Position {
+            stones: game.placed_stones(),
+            attacker: opp,
+            placements_remaining: 2,
+            config: crate::prover::io::PosConfig {
+                win_length: cfg.win_length,
+                placement_radius: cfg.placement_radius,
+                max_moves: cfg.max_moves,
+            },
+        };
+        if let Ok(crate::prover::DefenseReplies::Covers(covers)) =
+            crate::prover::minimum_defenses_after_attack(&position, wide)
+        {
+            tactical_pairs = covers.into_iter().map(|[a, b]| (a, b)).collect();
+        }
+    }
     let mut candidates: Vec<Coord> = Vec::new();
     for &c in &threat.pv {
         if legal.contains(&c) && !candidates.contains(&c) {
             candidates.push(c);
         }
     }
+    for turn in &initiative {
+        if let [c] = turn.cells()
+            && legal.contains(c) && !candidates.contains(c)
+        {
+            candidates.push(*c);
+        }
+    }
 
     let mut killers: Vec<Coord> = Vec::new();
     // Survivors keep the PV their re-solve proved: its length is the delay
     // metric, its cells are the second-placement candidates in the pair pass.
-    let mut survivors: Vec<(Coord, Vec<Coord>)> = Vec::new();
+    let mut survivors: Vec<(Coord, u8, Vec<Coord>)> = Vec::new();
+    let mut unresolved: Vec<Coord> = Vec::new();
     for &c in &candidates {
         #[cfg(not(target_arch = "wasm32"))]
         if t0.elapsed() > time_limit { break; }
@@ -2806,14 +2867,42 @@ pub fn solve_defense_ex(game: &GameState, depth_cap: u8, node_budget: u64,
             continue;
         }
         match solve_g(&flipped_fresh_turn(&trial, opp), depth_cap, node_budget) {
-            Outcome::Win(w) => survivors.push((c, w.pv)),
-            Outcome::No | Outcome::BudgetExceeded => killers.push(c),
+            Outcome::Win(w) => survivors.push((c, w.depth, w.pv)),
+            Outcome::No => killers.push(c),
+            Outcome::BudgetExceeded => unresolved.push(c),
         }
     }
 
     let mut pair_anchors: Vec<(Coord, Coord)> = Vec::new();
+    let mut counter_threats: Vec<(Coord, Coord)> = Vec::new();
     if killers.is_empty() && game.moves_remaining_this_turn() == 2 {
-        'anchors: for (c1, pv2) in &survivors {
+        // A defense need not touch the opponent's sample PV. A forcing turn by
+        // the actual mover can take the initiative first; verify it by giving
+        // the opponent its real next turn and requiring a genuine `No`.
+        for turn in initiative.iter().copied() {
+            #[cfg(not(target_arch = "wasm32"))]
+            if t0.elapsed() > time_limit { break; }
+            let [c1, c2] = match turn.cells() {
+                [a, b] => [*a, *b],
+                _ => continue,
+            };
+            let mut trial = game.clone();
+            if trial.apply_move(c1).is_err() || trial.apply_move(c2).is_err() { continue; }
+            let refuted = trial.is_terminal() || matches!(
+                solve_g(&flipped_fresh_turn(&trial, opp), depth_cap, node_budget),
+                Outcome::No,
+            );
+            if refuted {
+                let pair = (c1, c2);
+                if !pair_anchors.contains(&pair) { pair_anchors.push(pair); }
+                if !counter_threats.contains(&pair) { counter_threats.push(pair); }
+            }
+        }
+    }
+    if killers.is_empty() && pair_anchors.is_empty()
+        && game.moves_remaining_this_turn() == 2
+    {
+        'anchors: for (c1, _depth, pv2) in &survivors {
             #[cfg(not(target_arch = "wasm32"))]
             if t0.elapsed() > time_limit { break; }
             let mut trial = game.clone();
@@ -2831,9 +2920,9 @@ pub fn solve_defense_ex(game: &GameState, depth_cap: u8, node_budget: u64,
                 let mut trial2 = trial.clone();
                 if trial2.apply_move(c2).is_err() { continue; }
                 let refuted = trial2.is_terminal()
-                    || !matches!(
+                    || matches!(
                         solve_g(&flipped_fresh_turn(&trial2, opp), depth_cap, node_budget),
-                        Outcome::Win(_)
+                        Outcome::No,
                     );
                 if refuted {
                     // One verified completion per anchor: the caller only
@@ -2845,11 +2934,18 @@ pub fn solve_defense_ex(game: &GameState, depth_cap: u8, node_budget: u64,
         }
     }
 
+    tactical_pairs.retain(|pair| !pair_anchors.contains(pair));
+
     // First-in-PV-order on ties, like the old loop's max().
     let mut best_delay: Option<(Coord, usize)> = None;
-    for (c, pv) in &survivors {
-        if best_delay.as_ref().is_none_or(|(_, len)| pv.len() > *len) {
-            best_delay = Some((*c, pv.len()));
+    if unresolved.is_empty() {
+        for (c, depth, pv) in &survivors {
+            // A depth-1 continuation wins on the opponent's next turn. Calling
+            // that a useful “best delay” is misleading, especially when a
+            // tactical block merely ran out of verification budget.
+            if *depth > 1 && best_delay.as_ref().is_none_or(|(_, len)| pv.len() > *len) {
+                best_delay = Some((*c, pv.len()));
+            }
         }
     }
 
@@ -2858,6 +2954,9 @@ pub fn solve_defense_ex(game: &GameState, depth_cap: u8, node_budget: u64,
         threat_pv: threat.pv,
         killers,
         pair_anchors,
+        counter_threats,
+        tactical_pairs,
+        unresolved,
         best_delay: best_delay.map(|(c, _)| c),
     })
 }
@@ -2901,6 +3000,137 @@ mod defense_tests {
         (0, 0, "P1"), (1, 2, "P2"), (2, 3, "P2"), (2, 2, "P1"), (3, -2, "P1"),
         (3, 4, "P2"), (3, -1, "P2"), (2, -2, "P1"), (1, -2, "P1"),
     ];
+
+    // 9sldwvr/qietby7 after P2's round-8 turn. P1 is to move and can
+    // take the initiative with (2,0),(3,0), forcing P2 to answer instead of
+    // beginning the hypothetical P2 line shown by the old defense helper.
+    const QIET_ROUND8: &[(i32, i32, &str)] = &[
+        (0, 0, "P1"), (-1, 2, "P2"), (-3, 2, "P2"), (-2, 2, "P1"),
+        (1, 1, "P1"), (-5, 3, "P2"), (0, 3, "P2"), (2, 2, "P1"),
+        (3, 3, "P1"), (-3, 4, "P2"), (1, 4, "P2"), (4, 4, "P1"),
+        (5, 5, "P1"), (2, 5, "P2"), (0, 6, "P2"), (6, 6, "P1"),
+        (7, 7, "P1"), (3, 6, "P2"), (4, 7, "P2"), (5, 10, "P1"),
+        (6, 11, "P1"), (5, 8, "P2"), (3, 11, "P2"), (-1, 1, "P1"),
+        (1, -1, "P1"), (-3, 3, "P2"), (2, -2, "P2"), (1, 0, "P1"),
+        (1, -2, "P1"), (1, 2, "P2"), (1, -3, "P2"),
+    ];
+
+    #[test]
+    fn qiet_round8_initiative_generator_contains_counter_threat() {
+        let game = state(QIET_ROUND8, "P1", 2);
+        let turns = initiative_turns(&game, true);
+        let target = CellSet2::two((2, 0), (3, 0));
+        assert!(
+            turns.contains(&target),
+            "P1 counter-threat must be generated"
+        );
+    }
+
+    #[test]
+    fn qiet_round8_counter_threat_refutes_p2_initiative() {
+        let game = state(QIET_ROUND8, "P1", 2);
+        let analysis = match solve_defense_ex(
+            &game, 12, 100_000, Duration::from_secs(60), true,
+        ) {
+            DefenseVerdict::Threat(analysis) => analysis,
+            other => panic!("expected proved P2 threat, got {other:?}"),
+        };
+        let target = ((2, 0), (3, 0));
+        assert!(analysis.pair_anchors.contains(&target),
+            "counter-threat must be offered as a defensive pair: {:?}", analysis.pair_anchors);
+        assert!(analysis.counter_threats.contains(&target),
+            "counter-threat evidence must identify the offensive defense");
+
+        let mut after = game.clone();
+        after.apply_move(target.0).unwrap();
+        after.apply_move(target.1).unwrap();
+        assert!(matches!(solve_wide(&after, 12, 100_000), Outcome::No),
+            "P2 has no forcing continuation after P1 takes the initiative");
+        assert!(matches!(solve_threat_wide(&after, 12, 100_000), Outcome::Win(_)),
+            "P1's new threat forces P2 to answer");
+    }
+
+    #[test]
+    fn qiet_round10_preserves_exact_tactical_cover_pairs() {
+        let mut game = state(QIET_ROUND8, "P1", 2);
+        for cell in [(2, 0), (3, 0), (-1, 0), (4, 0), (3, 1), (3, 2)] {
+            game.apply_move(cell).unwrap();
+        }
+        assert_eq!(game.current_player(), Some(Player::P2));
+        assert_eq!(game.moves_remaining_this_turn(), 2);
+        let analysis = match solve_defense_ex(
+            &game, 8, 50_000, Duration::from_secs(60), true,
+        ) {
+            DefenseVerdict::Threat(analysis) => analysis,
+            other => panic!("expected P1 threat, got {other:?}"),
+        };
+        let expected = [
+            ((3, -2), (3, 4)),
+            ((3, -1), (3, 4)),
+            ((3, -1), (3, 5)),
+        ];
+        assert!(analysis.pair_anchors.is_empty());
+        for pair in expected {
+            assert!(analysis.tactical_pairs.contains(&pair),
+                "exact immediate cover must remain visible: {pair:?}");
+        }
+        assert_eq!(analysis.best_delay, None);
+    }
+
+    #[test]
+    fn qiet_round8_midturn_does_not_hide_required_block_behind_losing_delay() {
+        let mut game = state(QIET_ROUND8, "P1", 2);
+        game.apply_move((2, 0)).unwrap();
+        game.apply_move((3, 0)).unwrap();
+        game.apply_move((-2, 0)).unwrap();
+        assert_eq!(game.current_player(), Some(Player::P2));
+        assert_eq!(game.moves_remaining_this_turn(), 1);
+        let analysis = match solve_defense_ex(
+            &game, 8, 50_000, Duration::from_secs(60), true,
+        ) {
+            DefenseVerdict::Threat(analysis) => analysis,
+            other => panic!("expected P1 threat, got {other:?}"),
+        };
+        assert!(analysis.unresolved.contains(&(4, 0)),
+            "the only tactical block must remain visible when its deep re-check exhausts budget");
+        assert!(!analysis.unresolved.contains(&(-1, 0)),
+            "the proved next-turn loss is not an unresolved block");
+        assert_eq!(analysis.best_delay, None,
+            "never advertise a proved next-turn loss over an unresolved block");
+    }
+
+    #[test]
+    fn qiet_round8_recorded_first_cover_keeps_both_tactical_replies() {
+        let mut game = state(QIET_ROUND8, "P1", 2);
+        game.apply_move((2, 0)).unwrap();
+        game.apply_move((3, 0)).unwrap();
+        game.apply_move((-1, 0)).unwrap();
+        let analysis = match solve_defense_ex(
+            &game, 8, 50_000, Duration::from_secs(60), true,
+        ) {
+            DefenseVerdict::Threat(analysis) => analysis,
+            other => panic!("expected P1 threat, got {other:?}"),
+        };
+        assert!(analysis.unresolved.contains(&(4, 0)));
+        assert!(analysis.unresolved.contains(&(5, 0)));
+        assert_eq!(analysis.best_delay, None);
+    }
+
+    #[test]
+    fn qiet_round8_midturn_counter_threat_finishes_the_pair() {
+        let mut game = state(QIET_ROUND8, "P1", 2);
+        game.apply_move((2, 0)).unwrap();
+        assert_eq!(game.current_player(), Some(Player::P1));
+        assert_eq!(game.moves_remaining_this_turn(), 1);
+        let analysis = match solve_defense_ex(
+            &game, 12, 100_000, Duration::from_secs(60), true,
+        ) {
+            DefenseVerdict::Threat(analysis) => analysis,
+            other => panic!("expected proved P2 threat, got {other:?}"),
+        };
+        assert!(analysis.killers.contains(&(3, 0)),
+            "the second counter-threat placement must refute P2's initiative");
+    }
 
     /// Every reported pair must actually refute the threat: apply both
     /// placements, flip, re-solve — no proven win may remain.

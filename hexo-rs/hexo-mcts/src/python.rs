@@ -2031,10 +2031,13 @@ fn solve_threat(
 /// forcing win and reports which placements refute it.
 ///
 /// Returns `None` when the opponent has no proven threat; otherwise
-/// `(killers, pair_anchors, best_delay, threat_pv)` where `killers` are
-/// single refuting placements, `pair_anchors` are `(first, second)` pairs
-/// that jointly refute (play `first`, re-check next placement), and
-/// `best_delay` is the max-delay fallback survivor. `time_limit_ms` bounds
+/// `(killers, pair_anchors, counter_threats, tactical_pairs, unresolved, best_delay, threat_pv)` where
+/// `killers` are single refuting placements, `pair_anchors` are `(first,
+/// second)` pairs that jointly refute (play `first`, re-check next placement),
+/// `counter_threats` is the offensive subset that takes initiative,
+/// `tactical_pairs` are exact covers whose deeper status is unresolved,
+/// `unresolved` contains legal replies whose deeper re-check exhausted the
+/// budget, and `best_delay` is the max-delay fallback survivor. `time_limit_ms` bounds
 /// the whole analysis (partial results on expiry).
 #[pyfunction]
 #[pyo3(signature = (state, depth_cap=40, node_budget=20_000_000, time_limit_ms=3_000, wide=false))]
@@ -2049,6 +2052,9 @@ fn solve_defense(
 ) -> Option<(
     Vec<(i32, i32)>,
     Vec<((i32, i32), (i32, i32))>,
+    Vec<((i32, i32), (i32, i32))>,
+    Vec<((i32, i32), (i32, i32))>,
+    Vec<(i32, i32)>,
     Option<(i32, i32)>,
     Vec<(i32, i32)>,
 )> {
@@ -2067,9 +2073,15 @@ fn solve_defense(
             std::time::Duration::from_millis(time_limit_ms),
             wide,
         ) {
-            crate::mcts::forcing::DefenseVerdict::Threat(a) => {
-                Some((a.killers, a.pair_anchors, a.best_delay, a.threat_pv))
-            }
+            crate::mcts::forcing::DefenseVerdict::Threat(a) => Some((
+                a.killers,
+                a.pair_anchors,
+                a.counter_threats,
+                a.tactical_pairs,
+                a.unresolved,
+                a.best_delay,
+                a.threat_pv,
+            )),
             _ => None,
         }
     })

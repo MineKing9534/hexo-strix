@@ -211,6 +211,8 @@ function parseHtttx(text) {
 let analysisTree = null;
 let analysisMain = [];
 let analysisCurrent = null;
+let forcingDefensePairIndex = 0;
+let forcingDefensePairSource = null;
 let analysisCancel = null;  // AbortController for an in-flight /analyze_game
 let inferenceWorker = null;
 let inferenceRequestSerial = 0;
@@ -1016,10 +1018,13 @@ function betterDefenceBundle(run, candidate, best) {
   const result = best.result;
   if (!result.certificate || !result.certificateSummary) return null;
   const defender = run.context.loser;
+  const isCounterWin = best.classification === "counter_win";
   const stones = candidate.afterAttackNode.result.stones.map(stone => [
     Number(stone[0][0]), Number(stone[0][1]), stone[1],
   ]);
-  for (const [q, r] of best.cover) stones.push([q, r, defender]);
+  if (!isCounterWin) {
+    for (const [q, r] of best.cover) stones.push([q, r, defender]);
+  }
   const optimization = {
     method: "pdspn-shortest-v1",
     shortestCertified: Boolean(result.shortestCertified),
@@ -1032,7 +1037,7 @@ function betterDefenceBundle(run, candidate, best) {
     format: "hexo-pdspn-proof-bundle-v1",
     position: {
       stones,
-      attacker: run.context.winner,
+      attacker: isCounterWin ? defender : run.context.winner,
       placements_remaining: 2,
       config: {
         win_length: analysisCfg.winLength,
@@ -1055,14 +1060,18 @@ function renderBetterDefenceResult(run, candidate, best) {
   const loser = run.context.loser;
   const playedTotal = candidate.winnerTurnsPlayed + candidate.remainingWinnerTurns;
   const betterTotal = best.upper > 0 ? candidate.winnerTurnsPlayed + best.upper : null;
-  const heading = best.classification === "refutes"
-    ? `${loser} can break this forcing line at ${candidate.positionLabel}`
-    : `${loser} can hold out longer at ${candidate.positionLabel}`;
-  const betterCopy = best.classification === "refutes"
-    ? `The forcing prover proved that this fixed ${winner} attack has no forcing continuation after the defence.`
-    : best.result.shortestCertified
-      ? `${winner}'s shortest forced win is ${best.upper} turns from here (${betterTotal} total instead of ${playedTotal}).`
-      : `${winner} cannot force a win within ${best.lower} turns from here; a win is proved within ${best.upper}.`;
+  const heading = best.classification === "counter_win"
+    ? `${loser} can seize the initiative at ${candidate.positionLabel}`
+    : best.classification === "refutes"
+      ? `${loser} can break this forcing line at ${candidate.positionLabel}`
+      : `${loser} can hold out longer at ${candidate.positionLabel}`;
+  const betterCopy = best.classification === "counter_win"
+    ? `${loser} has a certified forcing win from here. This counter-threat makes ${winner} answer first.`
+    : best.classification === "refutes"
+      ? `The forcing prover proved that this fixed ${winner} attack has no forcing continuation after the defence.`
+      : best.result.shortestCertified
+        ? `${winner}'s shortest forced win is ${best.upper} turns from here (${betterTotal} total instead of ${playedTotal}).`
+        : `${winner} cannot force a win within ${best.lower} turns from here; a win is proved within ${best.upper}.`;
   run.bundle = betterDefenceBundle(run, candidate, best);
   result._proofBundle = run.bundle;
   result._defenceSelection = {candidate, cover: best.cover};
@@ -1075,7 +1084,7 @@ function renderBetterDefenceResult(run, candidate, best) {
     + `<span class="proof-defence-pair">${formatDefencePair(best.cover)}</span>`
     + `<span> · ${betterCopy}</span></div></div>`
     + `<div class="proof-defence-review-actions"><button class="secondary-button" type="button" onclick="tryBetterDefence()">Try this defence</button>`
-    + (run.bundle ? `<button class="secondary-button" type="button" onclick="openBetterDefenceProof()">Explore better-defence proof</button>` : "")
+    + (run.bundle ? `<button class="secondary-button" type="button" onclick="openBetterDefenceProof()">${best.classification === "counter_win" ? "Explore counter-threat proof" : "Explore better-defence proof"}</button>` : "")
     + `<button class="secondary-button" type="button" onclick="returnToMainline()">Back to recorded game</button></div>`;
   result.hidden = false;
   result.querySelector("h4")?.focus({preventScroll: true});
@@ -1129,7 +1138,9 @@ function runNextDefenceCandidate(run) {
     if (message.requestId !== run.id) return;
     if (message.type === "defense-progress") {
       setDefenceReviewStatus(
-        `Checking ${candidate.positionLabel} · ${message.evaluated} of ${message.total} alternative defences…`,
+        message.classification === "counter_win"
+          ? `Certified counter-threat found at ${candidate.positionLabel}…`
+          : `Checking ${candidate.positionLabel} · ${message.evaluated} of ${message.total} alternative defences…`,
       );
       return;
     }
@@ -1142,7 +1153,7 @@ function runNextDefenceCandidate(run) {
     run.worker = null;
     const used = BigInt(message.nodes || "0");
     run.remainingNodes = used < run.remainingNodes ? run.remainingNodes - used : 0n;
-    if ((message.status === "refutes" || message.status === "extends") && message.best) {
+    if (["counter_win", "refutes", "extends"].includes(message.status) && message.best) {
       finishBetterDefence(run, candidate, message.best);
       return;
     }
@@ -1899,7 +1910,8 @@ window.addEventListener("keydown", onAnalysisArrowKeydown);
 
 function forcingIsUnstoppable(forcing) {
   const d = forcing?.defense;
-  return Boolean(d && !(d.killers?.length || d.pair_anchors?.length) && d.best_delay);
+  return Boolean(d && !(d.killers?.length || d.pair_anchors?.length
+    || d.tactical_pairs?.length || d.unresolved?.length) && d.best_delay);
 }
 
 function forcingIsCertain(forcing) {
@@ -2651,7 +2663,7 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves, startD
   }
   // Defense read-out overlay (threat banners from single-position analysis):
   // killers as check-marked rings in the DEFENDER's stone colour, pair
-  // defenses as dashed anchor rings linked to a faded follow-up cell, the
+  // defenses as two equal role badges linked into one unordered turn pair, the
   // max-delay fallback as a lone dotted ring. Board markers instead of raw
   // coordinates — the board has no coordinate labels.
   if (forcing && forcing.defense) {
@@ -2679,17 +2691,34 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves, startD
       for (const c of d.killers) {
         body += badge(c, false, "✓", 0.95, "Defends: the threat is no longer provable after this placement");
       }
-    } else if (d.pair_anchors.length) {
-      // Multiple verified pairs would clutter the board; show only the best
-      // one. The solver emits anchors in threat-PV order (most direct
-      // refutation first), so the first pair is the natural pick.
-      const [a, b] = d.pair_anchors[0];
+    } else if (d.pair_anchors.length || d.tactical_pairs?.length) {
+      // Show one linked pair at a time so pair membership stays unambiguous.
+      // Pair order is search order, never placement order or a global ranking.
+      const isTactical = !d.pair_anchors.length;
+      const pairOptions = d.counter_threats?.length ? d.counter_threats
+        : d.pair_anchors.length ? d.pair_anchors : d.tactical_pairs;
+      const pairIndex = forcingDefensePairIndex % pairOptions.length;
+      const [a, b] = pairOptions[pairIndex];
+      const isCounterThreat = (d.counter_threats || []).some(([c, e]) =>
+        c[0] === a[0] && c[1] === a[1] && e[0] === b[0] && e[1] === b[1]);
       const ba = badgeAt(a), bb = badgeAt(b);
       body += `<line class="defense-badge" x1="${ba.x}" y1="${ba.y}" x2="${bb.x}" y2="${bb.y}" stroke="${dColor}" stroke-width="${S * 0.045}" stroke-dasharray="${S * 0.11} ${S * 0.11}" opacity="0.35" pointer-events="none"/>`;
-      body += badge(a, true, "1", 0.95, "Pair defense: play this first — it only refutes together with the linked follow-up");
-      body += badge(b, true, "2", 0.6, "Pair defense follow-up (re-checked after the first placement)");
+      const pairIcon = isCounterThreat ? "⚔︎" : "🛡︎";
+      const pairTip = isCounterThreat
+        ? "Counter-threat pair: play both marked sword cells this turn, in either order"
+        : isTactical
+          ? "Exact cover pair: both shield cells stop the immediate line; the deeper outcome is unresolved"
+          : "Defensive pair: play both marked shield cells this turn, in either order";
+      body += badge(a, true, pairIcon, 0.95, pairTip);
+      body += badge(b, true, pairIcon, 0.95, pairTip);
+    } else if (d.unresolved?.length) {
+      for (const c of d.unresolved) {
+        body += badge(c, true, "?", 0.9,
+          "Tactical reply: the deeper check exhausted its budget, so this is not yet proved safe");
+      }
     } else if (d.best_delay) {
-      body += badge(d.best_delay, true, "…", 0.75, "The search did not prove a move that stops the threat. This move delays it longest.");
+      body += badge(d.best_delay, true, "…", 0.75,
+        "No reply remained unresolved, and this proved losing reply delays the win beyond the opponent's next turn");
     }
   }
   // Move-quality icon: mark EVERY placement of the verdict's turn (not just the
@@ -2752,7 +2781,12 @@ function updateForcingBanner(forcing) {
     ? ` · every saved reply checked; win within ${forcing.certificate_summary.maxAttackerTurns} turns by the winning side`
     : "";
   const d = forcing.defense;
-  const hasCheckedDefense = Boolean(d && (d.killers.length || d.pair_anchors.length));
+  if (forcingDefensePairSource !== d) {
+    forcingDefensePairSource = d;
+    forcingDefensePairIndex = 0;
+  }
+  const hasCheckedDefense = Boolean(d && (d.killers.length || d.pair_anchors.length
+    || d.tactical_pairs?.length));
   const isUnstoppable = forcingIsUnstoppable(forcing);
   banner.textContent = forcing.attacker_is_mover
     ? `${forcing.winner} has a forced win (${proofText}${certified})`
@@ -2780,7 +2814,8 @@ function updateForcingBanner(forcing) {
   // read-out: which placements refute the threat. Advisory (verified at
   // analysis budgets, time-boxed) — absent on wins, old extensions, or when
   // the defense sub-analysis had trouble.
-  if (d && (d.killers.length || d.pair_anchors.length || d.best_delay)) {
+  if (d && (d.killers.length || d.pair_anchors.length || d.tactical_pairs?.length
+      || d.unresolved?.length || d.best_delay)) {
     // The cells themselves are marked on the board (rings in the defender's
     // colour — see drawAnalysisBoard's defense overlay); the banner only
     // summarizes what kind of defense exists.
@@ -2789,16 +2824,57 @@ function updateForcingBanner(forcing) {
       text = d.killers.length === 1
         ? "1 defending placement marked ✓ on the board"
         : `${d.killers.length} defending placements marked ✓ on the board`;
-    } else if (d.pair_anchors.length) {
-      text = "defense needs a pair — play 1, then 2 (best pair marked on the board)"
-        + (d.pair_anchors.length > 1 ? ` — ${d.pair_anchors.length - 1} alternative${d.pair_anchors.length > 2 ? "s" : ""} exist` : "");
+    } else if (d.pair_anchors.length || d.tactical_pairs?.length) {
+      const isTactical = !d.pair_anchors.length;
+      const options = d.counter_threats?.length ? d.counter_threats
+        : d.pair_anchors.length ? d.pair_anchors : d.tactical_pairs;
+      const shown = (forcingDefensePairIndex % options.length) + 1;
+      if (d.counter_threats?.length) {
+        text = options.length === 1
+          ? "A verified counter-threat stops this line — play both marked ⚔︎ cells this turn, in either order"
+          : `${options.length} verified counter-threat pairs stop this line · showing ${shown} of ${options.length} · play both marked ⚔︎ cells in either order`;
+      } else if (isTactical) {
+        text = options.length === 1
+          ? "This exact 🛡︎ cover pair stops the immediate line; the deeper outcome is unresolved"
+          : `${options.length} exact 🛡︎ cover pairs stop the immediate line · showing ${shown} of ${options.length} · deeper outcomes unresolved`;
+      } else {
+        text = options.length === 1
+          ? "Defense needs both marked 🛡︎ cells this turn, in either order"
+          : `${options.length} verified defensive pairs · showing ${shown} of ${options.length} · play both marked 🛡︎ cells in either order`;
+      }
+    } else if (d.unresolved?.length) {
+      text = d.unresolved.length === 1
+        ? "One tactical reply is marked ?. Its deeper check ran out of effort, so no best-defense claim is made."
+        : `${d.unresolved.length} tactical replies are marked ?. Their deeper checks ran out of effort, so no best-defense claim is made.`;
     } else {
-      text = "No defense stops the win. The move that delays it longest is marked … on the board.";
+      text = "No defense or unresolved tactical reply was found. A proved delaying move is marked … on the board.";
     }
     const line = document.createElement("div");
     line.className = "forcing-defense-line";
     line.textContent = text;
     line.title = "These defensive moves were checked with the selected effort. A longer search may find more.";
+    if (d.pair_anchors.length || d.tactical_pairs?.length) {
+      const options = d.counter_threats?.length ? d.counter_threats
+        : d.pair_anchors.length ? d.pair_anchors : d.tactical_pairs;
+      if (options.length > 1) {
+        const controls = document.createElement("span");
+        controls.className = "forcing-defense-options";
+        for (const [delta, label] of [[-1, "Previous defense"], [1, "Next defense"]]) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "forcing-defense-option-button";
+          button.setAttribute("aria-label", label);
+          button.textContent = delta < 0 ? "‹" : "›";
+          button.addEventListener("click", event => {
+            event.stopPropagation();
+            forcingDefensePairIndex = (forcingDefensePairIndex + delta + options.length) % options.length;
+            renderNode(analysisCurrent);
+          });
+          controls.appendChild(button);
+        }
+        line.appendChild(controls);
+      }
+    }
     banner.appendChild(line);
   } else if (forcing.defense_status === "budget") {
     const line = document.createElement("div");

@@ -84,16 +84,17 @@ const dfpnNoOrigin = solver.solve(noOrigin, new SolverLimits(6, 20000n, SolverEn
 ok("dfpn on no-origin board is BudgetExceeded (no panic)", dfpnNoOrigin.kind === 2);
 console.log(`  dfpn no-origin: kind=BudgetExceeded (game-valid gate, honest give-up)`);
 
-// 8. solve_defense on a position where the opponent has a refutable threat.
-// P1 has (0,0),(1,0),(2,0); P2 already blocks (3,0); P2 to move. Threat: P1 wins
-// at (-1,0). P2 can refute (block (-1,0) plus a second). Defense should find the
-// threat AND a refutation (a killer or a pair anchor).
+// 8. solve_defense on a position where the opponent has a threat.
+// P1 has (0,0),(1,0),(2,0); P2 already blocks (3,0); P2 to move. The sample
+// threat starts at (-1,0), but blocking that sample cell does not prove the
+// absence of every later P1 forcing continuation.
 const defensePos = new Position(4, 8, 300, Player.P2, 2, [0,0,1, 1,0,1, 2,0,1, 3,0,2, 5,5,2]);
 const defense = solver.solve_defense(defensePos, new SolverLimits(6, 20000n, SolverEngineEnum.Idtt));
 ok("defense finds threat", defense.kind === 0 /* ThreatFound */);
 ok("defense threat present", defense.threat !== null && defense.threat !== undefined);
 ok("defense threat has a pv", defense.threat.pv.length > 0);
-ok("defense found a refutation (killer or pair)", defense.killers.length > 0 || defense.pair_anchors.length > 0);
+ok("defense does not invent a budget-starved refutation",
+  defense.killers.length === 0 && defense.pair_anchors.length === 0);
 ok("defense best_delay present", defense.best_delay !== null && defense.best_delay !== undefined);
 console.log(`  defense: kind=ThreatFound killers=${defense.killers.length} pair_anchors=${defense.pair_anchors.length} best_delay=${JSON.stringify([defense.best_delay.q, defense.best_delay.r])}`);
 

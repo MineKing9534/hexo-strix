@@ -5,7 +5,10 @@ let apiPromise;
 const botPromises = new Map();
 const ANALYSIS_CACHE_DB = "hexo-local-analysis";
 const ANALYSIS_CACHE_STORE = "positions";
-const ANALYSIS_CACHE_VERSION = 2;
+// Bump whenever inference, forcing-defense semantics, or the cached result
+// shape changes. The version is part of every key, so old results become
+// unreachable immediately and the position is fully reanalyzed.
+const ANALYSIS_CACHE_VERSION = 3;
 const ANALYSIS_CACHE_MAX_ENTRIES = 512;
 let analysisCachePromise;
 
@@ -62,6 +65,10 @@ function analysisCacheKey(message, position) {
     .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
   return JSON.stringify([
     ANALYSIS_CACHE_VERSION,
+    // The server derives this query token from the newest static asset mtime.
+    // Any deployed worker/WASM change therefore invalidates local results even
+    // if a developer forgets the explicit semantic-version bump above.
+    self.location.search,
     message.modelUrl,
     position.config.win_length,
     position.config.placement_radius,
@@ -207,14 +214,16 @@ function takeCoord(coord) {
 }
 
 function takeDefense(outcome) {
-  const killers = outcome.killers.map(takeCoord);
-  const pairAnchors = outcome.pair_anchors.map(pair => {
+  const takePairs = pairs => pairs.map(pair => {
     try { return [takeCoord(pair.first), takeCoord(pair.second)]; }
     finally { try { pair.free(); } catch (_error) {} }
   });
   return {
-    killers,
-    pair_anchors: pairAnchors,
+    killers: outcome.killers.map(takeCoord),
+    pair_anchors: takePairs(outcome.pair_anchors),
+    counter_threats: takePairs(outcome.counter_threats || []),
+    tactical_pairs: takePairs(outcome.tactical_pairs || []),
+    unresolved: (outcome.unresolved || []).map(takeCoord),
     best_delay: takeCoord(outcome.best_delay),
     wide: true,
   };

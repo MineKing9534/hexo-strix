@@ -329,6 +329,153 @@ test.describe("proof lab search method", () => {
 });
 
 
+test("forcing banner exposes every verified counter-threat option", async ({page}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "solver UI regression runs once");
+  await page.goto("/analysis");
+  await page.evaluate(() => {
+    const app = window as typeof window & {
+      updateForcingBanner(value: unknown): void;
+      counterFixture?: unknown;
+    };
+    app.counterFixture = {
+      winner: "P2", attacker_is_mover: false, depth: 2,
+      pv: [[-3, 1], [-2, 3], [-3, 0], [-3, 5], [-4, 3], [-1, 3]],
+      line_placements: 6, wide: true,
+      defense: {
+        killers: [],
+        pair_anchors: [[[-2, 0], [-1, 0]], [[-1, 0], [2, 0]], [[2, 0], [3, 0]]],
+        counter_threats: [[[-2, 0], [-1, 0]], [[-1, 0], [2, 0]], [[2, 0], [3, 0]]],
+        unresolved: [], best_delay: null,
+      },
+    };
+    app.updateForcingBanner(app.counterFixture);
+  });
+  const banner = page.locator("#forcing-banner");
+  await expect(banner.locator(".forcing-defense-line")).toContainText("3 verified counter-threat pairs");
+  await expect(banner.locator(".forcing-defense-line")).toContainText("showing 1 of 3");
+  await expect(banner).toContainText("P2 threatens a forced win");
+  await expect(banner).not.toContainText("unstoppable");
+  await banner.getByRole("button", {name: "Next defense"}).click();
+  await page.evaluate(() => {
+    const app = window as typeof window & {
+      updateForcingBanner(value: unknown): void;
+      counterFixture?: unknown;
+    };
+    app.updateForcingBanner(app.counterFixture);
+  });
+  await expect(banner.locator(".forcing-defense-line")).toContainText("showing 2 of 3");
+  await expect(banner.locator(".forcing-defense-line")).toContainText("in either order");
+  await page.evaluate(() => {
+    const app = window as typeof window & {
+      counterFixture?: unknown;
+      drawAnalysisBoard(board: unknown, heat: unknown, quality: unknown,
+        played: unknown, depth: number): void;
+    };
+    (document.getElementById("analysis-threats") as HTMLInputElement).checked = true;
+    const board = {
+      legal: [[-2, 0], [-1, 0], [2, 0], [3, 0]], stones: [[[0, 0], "P1"]],
+      current_player: "P1", forcing: app.counterFixture,
+    };
+    app.drawAnalysisBoard(board, board, null, null, 0);
+  });
+  const pairBadges = page.locator("#analysis-board .defense-badge text");
+  await expect(pairBadges).toHaveCount(2);
+  await expect(pairBadges.nth(0)).toHaveText("⚔︎");
+  await expect(pairBadges.nth(1)).toHaveText("⚔︎");
+  await expect(page.locator("#analysis-board .defense-badge title").first())
+    .toContainText("in either order");
+
+  await page.evaluate(() => {
+    const app = window as typeof window & {
+      updateForcingBanner(value: unknown): void;
+      drawAnalysisBoard(board: unknown, heat: unknown, quality: unknown,
+        played: unknown, depth: number): void;
+    };
+    const forcing = {
+      winner: "P2", attacker_is_mover: false, depth: 2, pv: [[4, 0], [5, 0]],
+      line_placements: 2, wide: true,
+      defense: {
+        killers: [], pair_anchors: [[[4, 0], [5, 0]]],
+        counter_threats: [], unresolved: [], best_delay: null,
+      },
+    };
+    app.updateForcingBanner(forcing);
+    const board = {
+      legal: [[4, 0], [5, 0]], stones: [[[0, 0], "P1"]],
+      current_player: "P1", forcing,
+    };
+    app.drawAnalysisBoard(board, board, null, null, 0);
+  });
+  await expect(banner.locator(".forcing-defense-line")).toContainText("both marked 🛡︎ cells");
+  await expect(page.locator("#analysis-board .defense-badge text").nth(0)).toHaveText("🛡︎");
+  await expect(page.locator("#analysis-board .defense-badge text").nth(1)).toHaveText("🛡︎");
+});
+
+test("forcing banner does not call a budget-starved tactical block best delay", async ({page}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "solver UI regression runs once");
+  await page.goto("/analysis");
+  await page.evaluate(() => {
+    const app = window as typeof window & {updateForcingBanner(value: unknown): void};
+    app.updateForcingBanner({
+      winner: "P1", attacker_is_mover: false, depth: 1,
+      pv: [[-1, 0], [4, 0]], line_placements: 2, wide: true,
+      defense: {
+        killers: [], pair_anchors: [], counter_threats: [],
+        unresolved: [[4, 0]], best_delay: null,
+      },
+    });
+  });
+  const line = page.locator("#forcing-banner .forcing-defense-line");
+  await expect(line).toContainText("marked ?");
+  await expect(line).toContainText("no best-defense claim");
+  await expect(line).not.toContainText("delays it longest");
+  await expect(line).toHaveCSS("justify-content", "center");
+  await expect(page.locator("#forcing-banner")).not.toContainText("unstoppable");
+});
+
+
+
+test("forcing banner keeps exact tactical cover pairs visible", async ({page}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "solver UI regression runs once");
+  await page.goto("/analysis");
+  await page.evaluate(() => {
+    const app = window as typeof window & {
+      updateForcingBanner(value: unknown): void;
+      drawAnalysisBoard(board: unknown, heat: unknown, quality: unknown,
+        played: unknown, depth: number): void;
+    };
+    (document.getElementById("analysis-threats") as HTMLInputElement).checked = true;
+    const forcing = {
+      winner: "P1", attacker_is_mover: false, depth: 1,
+      pv: [[3, -2], [3, -1]], line_placements: 2, wide: true,
+      defense: {
+        killers: [], pair_anchors: [], counter_threats: [],
+        tactical_pairs: [
+          [[3, -2], [3, 4]], [[3, -1], [3, 4]], [[3, -1], [3, 5]],
+        ],
+        unresolved: [], best_delay: null,
+      },
+    };
+    app.updateForcingBanner(forcing);
+    const board = {
+      legal: [[3, -2], [3, -1], [3, 4], [3, 5]],
+      stones: [[[0, 0], "P1"]], current_player: "P2", forcing,
+    };
+    app.drawAnalysisBoard(board, board, null, null, 0);
+  });
+  const banner = page.locator("#forcing-banner");
+  await expect(banner.locator(".forcing-defense-line"))
+    .toContainText("3 exact 🛡︎ cover pairs stop the immediate line");
+  await expect(banner.locator(".forcing-defense-line")).toContainText("showing 1 of 3");
+  await expect(banner.getByRole("button", {name: "Next defense"})).toHaveCount(1);
+  const badges = page.locator("#analysis-board .defense-badge text");
+  await expect(badges).toHaveCount(2);
+  await expect(badges.nth(0)).toHaveText("🛡︎");
+  await expect(badges.nth(1)).toHaveText("🛡︎");
+  await expect(page.locator("#analysis-board .defense-badge title").first())
+    .toContainText("deeper outcome is unresolved");
+});
+
 test.describe("better defence review", () => {
   test("explains when a completed replay is required", async ({page}) => {
     await page.goto("/analysis");
@@ -345,6 +492,44 @@ test.describe("better defence review", () => {
     await expect(page.locator("#proof-defence-review")).toBeVisible();
     await expect(page.locator("#proof-defence-review-copy")).toContainText("Load a completed game with a winner");
     await expect(page.locator("#proof-find-defence-btn")).toBeDisabled();
+  });
+
+
+  test("renders a certified counter-win with the defender as proof attacker", async ({page}, testInfo) => {
+    test.skip(testInfo.project.name !== "desktop-chromium", "counter-win UI regression runs once");
+    await page.goto("/analysis");
+    await page.evaluate(() => {
+      const app = window as typeof window & {
+        openProofLab(): void;
+        renderBetterDefenceResult(run: unknown, candidate: unknown, best: unknown): void;
+      };
+      app.openProofLab();
+      const run = {context: {winner: "P2", loser: "P1"}, width: "wide", bundle: null};
+      const candidate = {
+        positionLabel: "round 8", winnerTurnsPlayed: 7, remainingWinnerTurns: 9,
+        playedCover: [[-3, 1], [-2, 3]],
+        afterAttackNode: {result: {stones: [[[0, 0], "P1"], [[1, 2], "P2"]]}},
+      };
+      const best = {
+        classification: "counter_win", cover: [[2, 0], [3, 0]], upper: 17, lower: 16,
+        result: {
+          certificate: {version: 1, width: "wide", root: 0, nodes: []},
+          certificateSummary: {dagNodes: 1, proofEdges: 0, maxAttackerTurns: 17},
+          turns: [{turn: 0, player: "P1", cells: [[2, 0], [3, 0]]}],
+          shortestCertified: false, excludedThroughDepth: 16,
+        },
+      };
+      app.renderBetterDefenceResult(run, candidate, best);
+    });
+    const result = page.locator("#proof-defence-result");
+    await expect(result).toContainText("P1 can seize the initiative at round 8");
+    await expect(result).toContainText("certified forcing win");
+    await expect(result.locator("button", {hasText: "Explore counter-threat proof"})).toHaveCount(1);
+    const bundle = await result.evaluate(element => (element as HTMLElement & {
+      _proofBundle?: {position: {attacker: string; stones: unknown[]}};
+    })._proofBundle);
+    expect(bundle?.position.attacker).toBe("P1");
+    expect(bundle?.position.stones).toHaveLength(2); // root defence is in the certificate, not pre-applied
   });
 
   test("accepts a completed selected side line", async ({page}, testInfo) => {

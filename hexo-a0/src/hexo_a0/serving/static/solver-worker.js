@@ -123,7 +123,7 @@ function stagedShortestBranch(api, solver, position, settings) {
       ? solver.solve_wide(position, limits)
       : solver.solve(position, limits);
     const certificateJson = proofOutcome.certificate_json;
-    if (certificateJson) {
+    if (certificateJson && settings.optimize !== false) {
       initialNodes = BigInt(proofOutcome.nodes);
       const totalBudget = BigInt(settings.nodeBudget);
       const remainingBudget = totalBudget > initialNodes ? totalBudget - initialNodes : 0n;
@@ -185,6 +185,19 @@ function sameCover(left, right) {
   return JSON.stringify(canonicalCover(left)) === JSON.stringify(canonicalCover(right));
 }
 
+function takeDefensePairs(values) {
+  return values.map(pair => {
+    const first = pair.first;
+    const second = pair.second;
+    try { return [[first.q, first.r], [second.q, second.r]]; }
+    finally {
+      freeQuietly(first);
+      freeQuietly(second);
+      freeQuietly(pair);
+    }
+  });
+}
+
 self.onmessage = async (event) => {
   const message = event.data || {};
   if (!["solve", "verify", "minimum-defenses", "rank-defenses"].includes(message.type)) return;
@@ -231,25 +244,120 @@ self.onmessage = async (event) => {
       } finally {
         freeQuietly(defenses);
       }
-      if (serialized.kind !== "covers") {
-        self.postMessage({
-          type: "defense-result", requestId,
-          status: serialized.kind, evaluated: 0, total: 0, nodes: "0", best: null,
-        });
-        return;
-      }
-      const alternatives = serialized.covers.filter(
-        cover => !sameCover(cover, message.playedCover || []),
-      );
+      const alternatives = serialized.kind === "covers"
+        ? serialized.covers.filter(
+          cover => !sameCover(cover, message.playedCover || []),
+        ) : [];
+      const defenderName = input.toMove === "P1" ? "P2" : "P1";
       const defenderNumber = input.toMove === "P1" ? 2 : 1;
       let best = null;
       let unresolved = false;
       let evaluated = 0;
       let nodesUsed = 0n;
       const totalBudget = BigInt(message.nodeBudget);
+
+      // The defender moves now. A separate swapped-root proof starts from
+      // this real pre-defence state; no cover is pre-applied and nobody gets an
+      // extra turn. Run it when exact-cover enumeration has no legal witness;
+      // ordinary cover comparisons retain the full run allowance.
+      // Certificate-backed counter-wins are expensive in browser WASM.
+      // Standard effort keeps the established backward review responsive;
+      // Thorough and above opt into the swapped-root PDS-PN proof.
+      const counterBudget = serialized.kind !== "covers" && totalBudget >= 1_000_000n
+        ? totalBudget : 0n;
+      let counterCharge = 0n;
+      const proveCounterWin = () => {
+        let counterPosition, screenLimits, defenseOutcome;
+        try {
+          counterPosition = new api.Position(
+            input.winLength, input.placementRadius, input.maxMoves,
+            playerValue(api, defenderName), 2, new Int32Array(input.stonesFlat),
+          );
+          // Shared IDTT defense analysis is a cheap initiative witness. Do not
+          // launch the much deeper swapped PDS-PN proof unless it found an
+          // independently verified offensive pair.
+          const screenBudget = counterBudget < 5_000n ? counterBudget : 5_000n;
+          if (screenBudget === 0n) return null;
+          counterCharge = screenBudget;
+          screenLimits = new api.SolverLimits(
+            message.depthCap, screenBudget, api.SolverEngineEnum.Idtt,
+          );
+          defenseOutcome = message.width === "wide"
+            ? solver.solve_defense_wide(counterPosition, screenLimits)
+            : solver.solve_defense(counterPosition, screenLimits);
+          const counterHints = takeDefensePairs(defenseOutcome.counter_threats || []);
+          if (!counterHints.length) return null;
+          const proofBudget = counterBudget > screenBudget
+            ? counterBudget - screenBudget : 0n;
+          if (proofBudget === 0n) {
+            unresolved = true;
+            return null;
+          }
+          counterCharge = counterBudget;
+          const counterResult = stagedShortestBranch(api, solver, counterPosition, {
+            width: message.width,
+            depthCap: message.depthCap,
+            nodeBudget: proofBudget.toString(),
+            leafNodeBudget: message.leafNodeBudget,
+            optimize: false,
+          });
+          const rootCover = counterResult.turns?.[0]?.cells || [];
+          const matchingCover = alternatives.find(cover => sameCover(cover, rootCover));
+          const suggestedCover = matchingCover || canonicalCover(rootCover);
+          const isInitiativeRoot = counterHints.some(pair => sameCover(pair, suggestedCover));
+          if (counterResult.kind === "budget_exceeded") unresolved = true;
+          if (counterResult.kind !== "win" || !counterResult.certificate
+              || !isInitiativeRoot
+              || suggestedCover.length < 1 || suggestedCover.length > 2
+              || sameCover(suggestedCover, message.playedCover || [])) return null;
+          const upper = Number(counterResult.bestUpperDepth
+            || counterResult.certificateSummary?.maxAttackerTurns
+            || counterResult.depth || 0);
+          return {
+            cover: suggestedCover, classification: "counter_win",
+            upper, lower: Number(counterResult.excludedThroughDepth || 0),
+            result: counterResult,
+          };
+        } finally {
+          freeQuietly(defenseOutcome);
+          freeQuietly(screenLimits);
+          freeQuietly(counterPosition);
+        }
+      };
+      const postCounterWin = candidate => {
+        self.postMessage({
+          type: "defense-progress", requestId, evaluated: evaluated + 1,
+          total: alternatives.length, cover: candidate.cover,
+          classification: "counter_win", upper: candidate.upper, lower: candidate.lower,
+        });
+        self.postMessage({
+          type: "defense-result", requestId, status: "counter_win",
+          evaluated: evaluated + 1, total: alternatives.length,
+          nodes: nodesUsed.toString(), best: candidate,
+        });
+      };
+
+      if (serialized.kind !== "covers") {
+        const counter = proveCounterWin();
+        // Charge the reserved slice, not the outer PDS counter: nested leaf
+        // searches are bounded by this slice but not all appear in `nodes`.
+        nodesUsed += counterCharge;
+        if (counter) {
+          postCounterWin(counter);
+          return;
+        }
+        self.postMessage({
+          type: "defense-result", requestId,
+          status: serialized.kind, evaluated: 0, total: 0,
+          nodes: nodesUsed.toString(), best: null,
+        });
+        return;
+      }
+
+      const coverBudget = totalBudget > counterBudget ? totalBudget - counterBudget : 0n;
       const perCoverBudget = alternatives.length
-        ? (totalBudget / BigInt(alternatives.length)).toString()
-        : totalBudget.toString();
+        ? (coverBudget / BigInt(alternatives.length)).toString()
+        : coverBudget.toString();
       for (const cover of alternatives) {
         let branchPosition;
         try {
@@ -291,6 +399,14 @@ self.onmessage = async (event) => {
           if (classification === "refutes") break;
         } finally {
           freeQuietly(branchPosition);
+        }
+      }
+      if (!best && counterBudget > 0n) {
+        const counter = proveCounterWin();
+        nodesUsed += counterCharge;
+        if (counter) {
+          postCounterWin(counter);
+          return;
         }
       }
       self.postMessage({
