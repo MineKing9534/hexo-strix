@@ -128,6 +128,46 @@ impl ProverConfig {
     }
 }
 
+/// Result of conditioning the forcing model on an attacker turn that has
+/// already been placed. `Covers` contains every exact two-stone minimum cover;
+/// proving the continuation after each cover is sufficient to prove the attack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DefenseReplies {
+    Covers(Vec<[Coord; 2]>),
+    /// Covering all threats needs at least three placements.
+    AttackerWin,
+    /// The fixed move was not forcing, or the defender can complete first.
+    NotForcing,
+}
+
+/// Enumerate all legal minimum replies to an already-played attacker turn using
+/// the same kernel and width as PDS-PN. The position stones must include the
+/// fixed attack, and `position.attacker` identifies the attacking player.
+pub fn minimum_defenses_after_attack(
+    position: &Position,
+    wide: bool,
+) -> Result<DefenseReplies, String> {
+    let mut kernel = kernel::KernelCtx::new_wide(
+        &position.stones,
+        position.attacker,
+        position.config.win_length,
+        position.config.placement_radius,
+        wide,
+    )
+    .ok_or("could not build the defense-reply kernel")?;
+    Ok(match kernel.and_eval() {
+        kernel::AndEval::Covers(covers) => DefenseReplies::Covers(
+            covers
+                .into_iter()
+                .map(|cover| <[Coord; 2]>::try_from(cover.cells())
+                    .map_err(|_| "forcing minimum cover did not contain two cells"))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        kernel::AndEval::AttackerWin => DefenseReplies::AttackerWin,
+        kernel::AndEval::Loss => DefenseReplies::NotForcing,
+    })
+}
+
 /// Cooperative search control: a wall-clock deadline plus a cancel flag a racing
 /// thread can raise. Every driver checks [`Ctl::expired`] at its budget cadence.
 #[derive(Clone)]

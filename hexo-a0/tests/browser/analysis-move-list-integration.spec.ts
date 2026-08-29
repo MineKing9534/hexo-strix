@@ -35,3 +35,17 @@ test("Copy as HTTTX copies the full loaded game record", async ({page}) => {
   expect(copied).toContain("version[1];");
   expect(copied).toContain("46.");
 });
+
+
+test("Loaded-game actions stay on one row with settings expanded", async ({page}) => {
+  await page.goto(`/analysis#c=${REPLAY}`);
+  const settings = page.locator("details.analysis-settings");
+  await settings.evaluate((element: HTMLDetailsElement) => { element.open = true; });
+  const copy = page.getByRole("button", {name: "Copy as HTTTX"});
+  const change = page.getByRole("button", {name: "Change"});
+  const [copyBox, changeBox] = await Promise.all([copy.boundingBox(), change.boundingBox()]);
+  expect(copyBox).not.toBeNull();
+  expect(changeBox).not.toBeNull();
+  expect(Math.abs(copyBox!.y - changeBox!.y)).toBeLessThan(2);
+  expect(copyBox!.x + copyBox!.width).toBeLessThanOrEqual(changeBox!.x);
+});

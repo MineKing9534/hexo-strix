@@ -370,6 +370,47 @@ fn certificate_shortest_pv_replays_and_is_no_longer_than_worst_case() {
     assert!(u32::from(shortest_turns) <= bound, "shortest line must respect the bound");
 }
 
+#[test]
+fn qietby7_turn9_enumerates_the_better_defense() {
+    let p = Position::load(&fixture("qietby7_after_attack_turn9.json"))
+        .expect("after-attack fixture");
+    let replies = super::minimum_defenses_after_attack(&p, true)
+        .expect("minimum covers");
+    let super::DefenseReplies::Covers(covers) = replies else {
+        panic!("turn 9 must have legal minimum covers");
+    };
+    assert_eq!(
+        covers,
+        vec![
+            [(0, 8), (6, 2)],
+            [(1, 7), (6, 2)],
+            [(1, 7), (7, 1)],
+        ],
+        "the production kernel must expose every canonical turn-9 cover",
+    );
+}
+
+/// Stronger qietby7 replay refutation: the alternative cover `(1,7), (6,2)`
+/// leaves the fixed turn-9 attack with no forcing continuation at all. This
+/// does not refute the root position's different 19-turn winning strategy.
+#[test]
+#[ignore = "slow qietby7 fixed-line refutation"]
+fn qietby7_turn9_alternative_refutes_the_fixed_attack() {
+    let mut p = Position::load(&fixture("qietby7_after_attack_turn9.json"))
+        .expect("after-attack fixture");
+    p.stones.push(((1, 7), P2));
+    p.stones.push(((6, 2), P2));
+    let cfg = ProverConfig {
+        node_budget: 125_000,
+        pn2_nodes: 50_000,
+        time_limit_s: 120.0,
+        wide: true,
+        ..ProverConfig::default()
+    };
+    let result = pdspn::solve(&p, &cfg, &Ctl::new(cfg.time_limit_s));
+    assert_eq!(result.verdict, Verdict::No);
+}
+
 /// Regression for the qietby7 line-refutation workflow. After the defender's
 /// turn-9 cover `(0,8), (6,2)`, nine attacker turns are not enough and ten are:
 /// the submitted 17-turn replay therefore extends to 19 under best defence.

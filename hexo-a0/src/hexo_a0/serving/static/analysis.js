@@ -168,6 +168,8 @@ const PDS_PORTFOLIO_BRANCH_BUDGETS = [2000, 5000, 50000];
 let forcingWorkers = [];
 let forcingRun = null;
 let forcingRequestSerial = 0;
+let defenceReviewRun = null;
+let defenceReviewRequestSerial = 0;
 let analysisView = { x: 0, y: 0, scale: 1 };
 let analysisPanning = false, analysisPanStart = { x: 0, y: 0, vx: 0, vy: 0 };
 let analysisEvalHoverIdx = null;
@@ -224,16 +226,21 @@ function setProofLabOpen(open) {
   const analysisTab = document.getElementById("analysis-mode-analysis");
   const analysisBody = document.getElementById("analysis-controls-body");
   const analysisInfo = document.getElementById("analysis-info");
+  const positionBrowser = document.getElementById("analysis-position-browser");
   if (!drawer || !proofTab || !analysisTab || !analysisBody) return;
   drawer.hidden = !open;
   analysisBody.hidden = open;
   if (analysisInfo) analysisInfo.hidden = open;
+  if (positionBrowser) positionBrowser.hidden = open;
   proofTab.setAttribute("aria-selected", String(open));
   analysisTab.setAttribute("aria-selected", String(!open));
   document.getElementById("analysis-panel")?.classList.toggle("proof-lab-open", open);
   if (open) {
     updateProofLabPosition();
     drawer.querySelector("select, input, button")?.focus();
+    if (window.innerWidth <= 768) {
+      requestAnimationFrame(() => drawer.scrollIntoView({block: "start"}));
+    }
   }
 }
 
@@ -251,8 +258,30 @@ function closeProofLab() {
 function updateProofLabPosition() {
   const label = document.getElementById("proof-lab-position");
   if (!label || !analysisCurrent) return;
-  const side = analysisCurrent.result?.current_player || "side to move";
-  label.textContent = `${positionWord()} ${positionNumber(analysisCurrent.depth)} · ${side} to move`;
+  const context = replayDefenceContext();
+  const finalSelected = context && analysisCurrent === context.finalNode;
+  if (finalSelected) label.textContent = `Game over · ${context.winner} won`;
+  else {
+    const side = analysisCurrent.result?.current_player || "side to move";
+    label.textContent = `${positionWord()} ${positionNumber(analysisCurrent.depth)} · ${side} to move`;
+  }
+  const copy = document.getElementById("proof-defence-review-copy");
+  const find = document.getElementById("proof-find-defence-btn");
+  const eligible = Boolean(context?.candidates.length);
+  if (copy) {
+    if (eligible) {
+      const source = context.source === "variation" ? "variation" : "replay";
+      copy.textContent = `${context.loser} lost this ${source}. Walk backward and find the latest defence that breaks or delays ${context.winner}'s forced win.`;
+    } else if (analysisMain.at(-1)?.result?.terminal) {
+      copy.textContent = "This replay has no complete lost defending turn to review.";
+    } else {
+      copy.textContent = "Load a completed game with a winner to review its defensive replies.";
+    }
+  }
+  if (find) {
+    find.disabled = !eligible || Boolean(defenceReviewRun) || Boolean(forcingRun) || analysisRunActive;
+    find.title = eligible ? "" : "Available after loading a completed game with a winner";
+  }
 }
 
 document.addEventListener("keydown", event => {
@@ -461,6 +490,14 @@ function positionWord() {
   return positionNumbering() === "round" ? "Round" : "Position";
 }
 
+function forcingLineNumber(index, startDepth) {
+  if (positionNumbering() !== "round") return index + 1;
+  const attackerPlacementsLeft = startDepth % 2 === 0 ? 2 : 1;
+  const firstRoundSize = attackerPlacementsLeft + 2;
+  if (index < firstRoundSize) return 1;
+  return Math.floor((index - firstRoundSize) / 4) + 2;
+}
+
 function forcingDepthFromUi() {
   const input = document.getElementById("analysis-forcing-depth");
   let depth = Number(input ? input.value : DEFAULT_ANALYSIS_FORCING_DEPTH);
@@ -567,7 +604,9 @@ function restoreForcingStatusForNode(node) {
 function setForcingControlsRunning(running) {
   const button = document.getElementById("analysis-solve-forcing-btn");
   const cancel = document.getElementById("analysis-cancel-forcing-btn");
-  button.disabled = running;
+  button.disabled = running || Boolean(defenceReviewRun);
+  const findDefence = document.getElementById("proof-find-defence-btn");
+  if (findDefence) findDefence.disabled = running || Boolean(defenceReviewRun);
   cancel.hidden = !running;
   for (const id of ["analysis-explore-certificate-btn", "analysis-share-certificate-btn",
                     "analysis-download-certificate-btn"]) {
@@ -886,6 +925,327 @@ function cancelForcingSolve(message = "Search cancelled. No result was recorded.
   setForcingStatus(message, "budget");
 }
 
+function replayNodeLine(node) {
+  const line = [];
+  for (let current = node; current; current = current.parent) line.unshift(current);
+  return line;
+}
+
+function replayDefenceContext() {
+  const recordedFinal = analysisMain.at(-1);
+  const selectedVariationFinal = analysisCurrent?.result?.terminal
+    && analysisCurrent.result.winner && analysisCurrent !== recordedFinal
+    ? analysisCurrent : null;
+  const finalNode = selectedVariationFinal || recordedFinal;
+  const line = selectedVariationFinal ? replayNodeLine(selectedVariationFinal) : analysisMain;
+  const winner = finalNode?.result?.terminal && finalNode.result.winner;
+  if (!winner) return null;
+  const loser = winner === "P1" ? "P2" : "P1";
+  const turns = _turnsOf(line.slice(1));
+  const candidates = [];
+  let winnerTurns = 0;
+  for (let index = 0; index < turns.length - 1; index++) {
+    const attack = turns[index];
+    if (attack.player !== winner) continue;
+    winnerTurns++;
+    const defence = turns[index + 1];
+    if (defence.player !== loser || defence.nodes.length !== 2) continue;
+    const remainingWinnerTurns = turns.slice(index + 2)
+      .filter(turn => turn.player === winner).length;
+    if (remainingWinnerTurns < 1) continue;
+    candidates.push({
+      attack, defence, afterAttackNode: attack.endNode,
+      playedCover: defence.nodes.map(node => node.move.slice()),
+      remainingWinnerTurns,
+      winnerTurnsPlayed: winnerTurns,
+      positionLabel: `${positionWord()} ${positionNumber(attack.endNode.depth)}`,
+    });
+  }
+  candidates.reverse();
+  return {winner, loser, candidates, finalNode,
+    source: selectedVariationFinal ? "variation" : "recorded"};
+}
+
+function defenceWorkerPosition(candidate, winner) {
+  const result = candidate.afterAttackNode.result;
+  return {
+    winLength: analysisCfg.winLength,
+    placementRadius: analysisCfg.placementRadius,
+    maxMoves: analysisCfg.maxMoves,
+    toMove: winner,
+    movesRemaining: 2,
+    stonesFlat: result.stones.flatMap(stone => [
+      Number(stone[0][0]), Number(stone[0][1]), stone[1] === "P1" ? 1 : 2,
+    ]),
+  };
+}
+
+function formatDefencePair(pair) {
+  return pair.map(cell => `[${cell[0]},${cell[1]}]`).join(" + ");
+}
+
+function setDefenceReviewRunning(running) {
+  const find = document.getElementById("proof-find-defence-btn");
+  const stop = document.getElementById("proof-stop-defence-btn");
+  if (find) find.disabled = running || !replayDefenceContext()?.candidates.length
+    || Boolean(forcingRun) || analysisRunActive;
+  if (stop) stop.hidden = !running;
+  const solve = document.getElementById("analysis-solve-forcing-btn");
+  if (solve) solve.disabled = running || Boolean(forcingRun);
+  const positionAnalysis = document.getElementById("analysis-position-btn");
+  const gameAnalysis = document.getElementById("analysis-game-btn");
+  if (positionAnalysis) positionAnalysis.disabled = running || analysisRunActive
+    || !analysisCurrent || Boolean(analysisCurrent.result?.terminal);
+  if (gameAnalysis) gameAnalysis.disabled = running || analysisRunActive || !analysisTree;
+  for (const id of ["analysis-forcing-engine", "analysis-forcing-width",
+                    "analysis-forcing-depth", "analysis-forcing-effort"]) {
+    const control = document.getElementById(id);
+    if (control) control.disabled = running || Boolean(forcingRun);
+  }
+}
+
+function setDefenceReviewStatus(message, state = "") {
+  const status = document.getElementById("proof-defence-status");
+  if (!status) return;
+  status.textContent = message;
+  if (state) status.dataset.state = state;
+  else delete status.dataset.state;
+}
+
+function betterDefenceBundle(run, candidate, best) {
+  const result = best.result;
+  if (!result.certificate || !result.certificateSummary) return null;
+  const defender = run.context.loser;
+  const stones = candidate.afterAttackNode.result.stones.map(stone => [
+    Number(stone[0][0]), Number(stone[0][1]), stone[1],
+  ]);
+  for (const [q, r] of best.cover) stones.push([q, r, defender]);
+  const optimization = {
+    method: "pdspn-shortest-v1",
+    shortestCertified: Boolean(result.shortestCertified),
+    bestUpperDepth: result.bestUpperDepth || result.certificateSummary.maxAttackerTurns,
+    excludedThroughDepth: result.excludedThroughDepth || 0,
+    thresholdProbes: result.thresholdProbes || 0,
+    ...(result.turns?.length ? {sampleLine: result.turns} : {}),
+  };
+  return {
+    format: "hexo-pdspn-proof-bundle-v1",
+    position: {
+      stones,
+      attacker: run.context.winner,
+      placements_remaining: 2,
+      config: {
+        win_length: analysisCfg.winLength,
+        placement_radius: analysisCfg.placementRadius,
+        max_moves: analysisCfg.maxMoves,
+      },
+    },
+    engine: "pdspn",
+    width: run.width,
+    verification: result.certificateSummary,
+    certificate: result.certificate,
+    optimization,
+  };
+}
+
+function renderBetterDefenceResult(run, candidate, best) {
+  const result = document.getElementById("proof-defence-result");
+  if (!result) return;
+  const winner = run.context.winner;
+  const loser = run.context.loser;
+  const playedTotal = candidate.winnerTurnsPlayed + candidate.remainingWinnerTurns;
+  const betterTotal = best.upper > 0 ? candidate.winnerTurnsPlayed + best.upper : null;
+  const heading = best.classification === "refutes"
+    ? `${loser} can break this forcing line at ${candidate.positionLabel}`
+    : `${loser} can hold out longer at ${candidate.positionLabel}`;
+  const betterCopy = best.classification === "refutes"
+    ? `The forcing prover proved that this fixed ${winner} attack has no forcing continuation after the defence.`
+    : best.result.shortestCertified
+      ? `${winner}'s shortest forced win is ${best.upper} turns from here (${betterTotal} total instead of ${playedTotal}).`
+      : `${winner} cannot force a win within ${best.lower} turns from here; a win is proved within ${best.upper}.`;
+  run.bundle = betterDefenceBundle(run, candidate, best);
+  result._proofBundle = run.bundle;
+  result._defenceSelection = {candidate, cover: best.cover};
+  result.innerHTML = `<h4 tabindex="-1">${heading}</h4>`
+    + `<div class="proof-defence-comparison">`
+    + `<div class="proof-defence-option"><strong>Played defence</strong>`
+    + `<span class="proof-defence-pair">${formatDefencePair(candidate.playedCover)}</span>`
+    + `<span> · the replay wins in ${candidate.remainingWinnerTurns} more ${winner} turns (${playedTotal} total).</span></div>`
+    + `<div class="proof-defence-option"><strong>Better defence</strong>`
+    + `<span class="proof-defence-pair">${formatDefencePair(best.cover)}</span>`
+    + `<span> · ${betterCopy}</span></div></div>`
+    + `<div class="proof-defence-review-actions"><button class="secondary-button" type="button" onclick="tryBetterDefence()">Try this defence</button>`
+    + (run.bundle ? `<button class="secondary-button" type="button" onclick="openBetterDefenceProof()">Explore better-defence proof</button>` : "")
+    + `<button class="secondary-button" type="button" onclick="returnToMainline()">Back to recorded game</button></div>`;
+  result.hidden = false;
+  result.querySelector("h4")?.focus({preventScroll: true});
+}
+
+function finishBetterDefence(run, candidate, best) {
+  if (defenceReviewRun !== run) return;
+  if (run.worker) run.worker.terminate();
+  defenceReviewRun = null;
+  setDefenceReviewRunning(false);
+  setCurrent(candidate.afterAttackNode);
+  renderBetterDefenceResult(run, candidate, best);
+  const caveat = run.hadUnresolved
+    ? " Some later replies were unresolved at this effort, so this is the latest proved improvement found."
+    : "";
+  setDefenceReviewStatus(`Better defence proved.${caveat}`, "win");
+}
+
+function finishBetterDefenceWithoutHit(run) {
+  if (defenceReviewRun !== run) return;
+  if (run.worker) run.worker.terminate();
+  defenceReviewRun = null;
+  setDefenceReviewRunning(false);
+  const result = document.getElementById("proof-defence-result");
+  if (result) result.hidden = true;
+  setDefenceReviewStatus(
+    run.hadUnresolved
+      ? "No conclusive improvement was found at this effort. Some replies remained unresolved; increase Search effort and try again."
+      : "No better forcing defence was found in the recorded turns.",
+    run.hadUnresolved ? "budget" : "no",
+  );
+}
+
+function runNextDefenceCandidate(run) {
+  if (defenceReviewRun !== run) return;
+  if (run.index >= run.context.candidates.length) {
+    finishBetterDefenceWithoutHit(run);
+    return;
+  }
+  const candidate = run.context.candidates[run.index++];
+  if (run.worker) run.worker.terminate();
+  const worker = new Worker(forcingWorkerUrl(), {type: "module", name: "strix-better-defence"});
+  run.worker = worker;
+  const candidateNumber = run.index;
+  setDefenceReviewStatus(
+    `Checking ${candidate.positionLabel} (${candidateNumber} of ${run.context.candidates.length})…`,
+  );
+  worker.onmessage = event => {
+    if (defenceReviewRun !== run) return;
+    const message = event.data || {};
+    if (message.requestId !== run.id) return;
+    if (message.type === "defense-progress") {
+      setDefenceReviewStatus(
+        `Checking ${candidate.positionLabel} · ${message.evaluated} of ${message.total} alternative defences…`,
+      );
+      return;
+    }
+    if (message.type === "error") {
+      cancelBetterDefence(`Defence review stopped: ${message.error || "the solver worker failed"}.`, "error");
+      return;
+    }
+    if (message.type !== "defense-result") return;
+    worker.terminate();
+    run.worker = null;
+    const used = BigInt(message.nodes || "0");
+    run.remainingNodes = used < run.remainingNodes ? run.remainingNodes - used : 0n;
+    if ((message.status === "refutes" || message.status === "extends") && message.best) {
+      finishBetterDefence(run, candidate, message.best);
+      return;
+    }
+    if (["unresolved", "not_forcing"].includes(message.status)) run.hadUnresolved = true;
+    if (run.remainingNodes === 0n) {
+      run.hadUnresolved = true;
+      finishBetterDefenceWithoutHit(run);
+      return;
+    }
+    runNextDefenceCandidate(run);
+  };
+  worker.onerror = event => cancelBetterDefence(
+    `Defence review stopped: ${event.message || "the solver worker crashed"}.`, "error",
+  );
+  worker.postMessage({
+    type: "rank-defenses",
+    requestId: run.id,
+    position: defenceWorkerPosition(candidate, run.context.winner),
+    playedCover: candidate.playedCover,
+    baselineRemainingTurns: candidate.remainingWinnerTurns,
+    width: run.width,
+    depthCap: run.depth,
+    nodeBudget: run.remainingNodes.toString(),
+    leafNodeBudget: "50000",
+  });
+}
+
+function findBetterDefence() {
+  if (defenceReviewRun || forcingRun) return;
+  if (analysisRunActive) {
+    setDefenceReviewStatus("Wait for the current game analysis to finish, then try again.", "budget");
+    return;
+  }
+  const context = replayDefenceContext();
+  if (!context || !context.candidates.length) {
+    setDefenceReviewStatus("Load a completed game with a winner and at least one full defending turn.", "error");
+    return;
+  }
+  const result = document.getElementById("proof-defence-result");
+  if (result) result.hidden = true;
+  const run = {
+    id: `defence-${++defenceReviewRequestSerial}`,
+    context, index: 0, worker: null, hadUnresolved: false, bundle: null,
+    effort: forcingEffortFromUi(), width: "wide", depth: forcingDepthFromUi(),
+  };
+  run.remainingNodes = BigInt(run.effort.nodeBudget);
+  defenceReviewRun = run;
+  setDefenceReviewRunning(true);
+  runNextDefenceCandidate(run);
+}
+
+function cancelBetterDefence(message = "Defence review stopped.", state = "budget") {
+  const run = defenceReviewRun;
+  if (!run) return;
+  if (run.worker) run.worker.terminate();
+  defenceReviewRun = null;
+  defenceReviewRequestSerial++;
+  setDefenceReviewRunning(false);
+  setDefenceReviewStatus(message, state);
+}
+
+function resetBetterDefenceReview() {
+  if (defenceReviewRun) cancelBetterDefence();
+  const result = document.getElementById("proof-defence-result");
+  if (result) {
+    result.hidden = true;
+    result.innerHTML = "";
+    result._proofBundle = null;
+    result._defenceSelection = null;
+  }
+  setDefenceReviewStatus("");
+}
+
+function tryBetterDefence() {
+  const selection = document.getElementById("proof-defence-result")?._defenceSelection;
+  if (!selection) return;
+  let node = selection.candidate.afterAttackNode;
+  for (const [q, r] of selection.cover) {
+    let child = node.children.find(existing => existing.move
+      && existing.move[0] === q && existing.move[1] === r);
+    if (!child) {
+      const moves = [...lineOf(node), [q, r]];
+      const result = replayEntryAt(moves, moves.length - 1, {
+        win_length: analysisCfg.winLength,
+        placement_radius: analysisCfg.placementRadius,
+        max_moves: analysisCfg.maxMoves,
+      });
+      child = _newNode([q, r], playerAtDepth(node.depth + 1), node, result);
+      node.children.push(child);
+    }
+    node = child;
+  }
+  setCurrent(node);
+  renderMoveTree();
+  if (automaticAnalysisEnabled() && !analysisRunActive && !node.result.terminal)
+    void analyzeNode(node, true);
+}
+
+function openBetterDefenceProof() {
+  const bundle = document.getElementById("proof-defence-result")?._proofBundle;
+  if (bundle) openProofExplorerBundle(bundle);
+}
+
 function solveCurrentForcing() {
   if (!analysisCurrent || !analysisCurrent.result) {
     setForcingStatus("Load a position before starting the search.", "error");
@@ -1105,6 +1465,7 @@ function analysisInputChanged() {
 }
 
 function loadGame() {
+  resetBetterDefenceReview();
   const text = document.getElementById("analysis-htttx").value;
   const moves = parseHtttx(text);
   if (moves.length === 0) {
@@ -1161,6 +1522,9 @@ async function copyAnalysisHtttx() {
 }
 
 async function analyzeWholeGame() {
+  if (defenceReviewRun) {
+    cancelBetterDefence("Defence review stopped because full-game analysis started.", "budget");
+  }
   const text = document.getElementById("analysis-htttx").value;
   const moves = parseHtttx(text);
   if (moves.length === 0) {
@@ -2094,7 +2458,7 @@ function renderNode(node) {
   }
   info.innerHTML = html;
   // The BOARD heatmap always shows THIS position's suggested next moves.
-  drawAnalysisBoard(result, result, q, playedMoves);
+  drawAnalysisBoard(result, result, q, playedMoves, node.depth);
 }
 
 // Update the advantage gauge (needle + pole readouts) from a P1-perspective
@@ -2148,7 +2512,7 @@ function renderTopMovesHtml(result, branchDepth) {
 // heatResult drives the q_hat / probs heatmap + best-move markers (== boardResult
 // for normal positions; the PRE-TURN position for a turn verdict). playedMoves,
 // if given, are this turn's placements to mark with the quality icon.
-function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
+function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves, startDepth) {
   const svg = document.getElementById("analysis-board");
   if (!boardResult || !boardResult.legal) { svg.innerHTML = ""; return; }
   heatResult = heatResult || boardResult;
@@ -2278,10 +2642,10 @@ function drawAnalysisBoard(boardResult, heatResult, quality, playedMoves) {
       const fontSize = Math.round(S * 0.42);
       if (isAttacker) {
         body += `<circle class="${cls}" cx="${p.x}" cy="${p.y}" r="${S * 0.42}" fill="${attackerColor}"/>`;
-        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}">${positionNumber(i)}</text>`;
+        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}">${forcingLineNumber(i, startDepth)}</text>`;
       } else {
         body += `<circle class="${cls}" cx="${p.x}" cy="${p.y}" r="${S * 0.42}" stroke="${defenderColor}"/>`;
-        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}" fill="${defenderColor}">${positionNumber(i)}</text>`;
+        body += `<text class="${labelCls}" x="${p.x}" y="${p.y + 1}" font-size="${fontSize}" fill="${defenderColor}">${forcingLineNumber(i, startDepth)}</text>`;
       }
     });
   }

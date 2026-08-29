@@ -28,6 +28,9 @@ interface AppActions {
     updateForcingEffortUi(): void;
     solveCurrentForcing(): void;
     cancelForcingSolve(): void;
+    findBetterDefence(): void;
+    cancelBetterDefence(): void;
+    tryBetterDefence(): void;
     openProofExplorer(): void;
     shareForcingCertificate(): void;
     downloadForcingCertificate(): void;
@@ -334,6 +337,18 @@ const proofLabDrawer = (): TemplateResult => html`
         <p class="proof-lab-intro">Check whether the player to move can force a win that the opponent cannot stop.</p>
       </div>
     </header>
+    <section id="proof-defence-review" class="proof-defence-review" aria-labelledby="proof-defence-review-title">
+      <div>
+        <h3 id="proof-defence-review-title">How could I have defended?</h3>
+        <p id="proof-defence-review-copy">Walk back through this lost replay and find the latest defence that breaks or delays the forced win.</p>
+      </div>
+      <div class="proof-defence-review-actions">
+        <button id="proof-find-defence-btn" class="secondary-button" type="button" @click=${() => invoke("findBetterDefence")}>Find a better defence</button>
+        <button id="proof-stop-defence-btn" class="secondary-button" type="button" hidden @click=${() => invoke("cancelBetterDefence")}>Stop</button>
+      </div>
+      <div id="proof-defence-status" class="proof-defence-status" role="status" aria-live="polite"></div>
+      <div id="proof-defence-result" class="proof-defence-result" hidden></div>
+    </section>
     ${forcingControls()}
   </aside>
 `;

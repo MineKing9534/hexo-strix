@@ -73,6 +73,30 @@ function serializePv(api, outcome) {
   return {turns: turnsOut, placements, owners};
 }
 
+function serializeMinimumDefenses(api, outcome) {
+  const covers = [];
+  const values = outcome.covers;
+  try {
+    for (const cover of values) {
+      const first = cover.first;
+      const second = cover.second;
+      try {
+        covers.push([[first.q, first.r], [second.q, second.r]]);
+      } finally {
+        freeQuietly(first);
+        freeQuietly(second);
+        freeQuietly(cover);
+      }
+    }
+  } finally {
+    // wasm-bindgen returns a copied JS array; its elements are freed above.
+  }
+  const kind = outcome.kind === api.MinimumDefenseKind.Covers ? "covers"
+    : outcome.kind === api.MinimumDefenseKind.AttackerWin ? "attacker_win"
+      : "not_forcing";
+  return {kind, covers};
+}
+
 function freeQuietly(value) {
   if (!value) return;
   try { value.free(); }
@@ -83,9 +107,87 @@ function freeQuietly(value) {
   }
 }
 
+function stagedShortestBranch(api, solver, position, settings) {
+  let limits, optimizeLimits, proofOutcome, outcome;
+  const started = performance.now();
+  let initialNodes = 0n;
+  let optimized = false;
+  try {
+    limits = new api.SolverLimits(
+      settings.depthCap,
+      BigInt(settings.nodeBudget),
+      api.SolverEngineEnum.Pdspn,
+    );
+    limits.pn2_nodes = BigInt(settings.leafNodeBudget || "50000");
+    proofOutcome = settings.width === "wide"
+      ? solver.solve_wide(position, limits)
+      : solver.solve(position, limits);
+    const certificateJson = proofOutcome.certificate_json;
+    if (certificateJson) {
+      initialNodes = BigInt(proofOutcome.nodes);
+      const totalBudget = BigInt(settings.nodeBudget);
+      const remainingBudget = totalBudget > initialNodes ? totalBudget - initialNodes : 0n;
+      if (remainingBudget > 0n) {
+        optimizeLimits = new api.SolverLimits(
+          settings.depthCap,
+          remainingBudget,
+          api.SolverEngineEnum.Pdspn,
+        );
+        optimizeLimits.pn2_nodes = BigInt(settings.leafNodeBudget || "50000");
+        outcome = solver.optimize_certificate(
+          position, optimizeLimits, certificateJson, settings.width === "wide",
+        );
+        optimized = true;
+      }
+    }
+    if (!outcome) {
+      outcome = proofOutcome;
+      proofOutcome = null;
+    }
+    const pv = serializePv(api, outcome);
+    const finalCertificateJson = outcome.certificate_json;
+    const certificate = finalCertificateJson ? JSON.parse(finalCertificateJson) : null;
+    return {
+      kind: kindName(api, outcome.kind),
+      depth: outcome.depth > 0 ? outcome.depth : null,
+      nodes: (optimized ? initialNodes + BigInt(outcome.nodes) : BigInt(outcome.nodes)).toString(),
+      elapsedMs: performance.now() - started,
+      turns: pv.turns,
+      pv: pv.placements,
+      pvOwners: pv.owners,
+      certificate,
+      certificateSummary: certificate ? {
+        dagNodes: Number(outcome.certificate_nodes),
+        proofEdges: Number(outcome.certificate_edges),
+        maxAttackerTurns: outcome.certificate_max_attacker_turns,
+      } : null,
+      bestUpperDepth: optimized && outcome.best_upper_depth > 0
+        ? outcome.best_upper_depth : null,
+      excludedThroughDepth: optimized && outcome.excluded_through_depth > 0
+        ? outcome.excluded_through_depth : 0,
+      thresholdProbes: optimized ? Number(outcome.threshold_probes) : 0,
+      shortestCertified: optimized && Boolean(outcome.shortest_certified),
+    };
+  } finally {
+    freeQuietly(proofOutcome);
+    freeQuietly(outcome);
+    freeQuietly(optimizeLimits);
+    freeQuietly(limits);
+  }
+}
+
+function canonicalCover(cover) {
+  return cover.map(cell => [Number(cell[0]), Number(cell[1])])
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+}
+
+function sameCover(left, right) {
+  return JSON.stringify(canonicalCover(left)) === JSON.stringify(canonicalCover(right));
+}
+
 self.onmessage = async (event) => {
   const message = event.data || {};
-  if (message.type !== "solve" && message.type !== "verify") return;
+  if (!["solve", "verify", "minimum-defenses", "rank-defenses"].includes(message.type)) return;
   const requestId = message.requestId;
   let solver, position, limits, optimizeLimits, outcome, proofOutcome, verification;
   try {
@@ -100,6 +202,104 @@ self.onmessage = async (event) => {
       new Int32Array(input.stonesFlat),
     );
     solver = new api.StrixSolver();
+
+    if (message.type === "minimum-defenses") {
+      const defenses = solver.minimum_defenses_after_attack(
+        position,
+        message.width === "wide",
+      );
+      try {
+        self.postMessage({
+          type: "minimum-defenses",
+          requestId,
+          ...serializeMinimumDefenses(api, defenses),
+        });
+      } finally {
+        freeQuietly(defenses);
+      }
+      return;
+    }
+
+    if (message.type === "rank-defenses") {
+      const defenses = solver.minimum_defenses_after_attack(
+        position,
+        message.width === "wide",
+      );
+      let serialized;
+      try {
+        serialized = serializeMinimumDefenses(api, defenses);
+      } finally {
+        freeQuietly(defenses);
+      }
+      if (serialized.kind !== "covers") {
+        self.postMessage({
+          type: "defense-result", requestId,
+          status: serialized.kind, evaluated: 0, total: 0, nodes: "0", best: null,
+        });
+        return;
+      }
+      const alternatives = serialized.covers.filter(
+        cover => !sameCover(cover, message.playedCover || []),
+      );
+      const defenderNumber = input.toMove === "P1" ? 2 : 1;
+      let best = null;
+      let unresolved = false;
+      let evaluated = 0;
+      let nodesUsed = 0n;
+      const totalBudget = BigInt(message.nodeBudget);
+      const perCoverBudget = alternatives.length
+        ? (totalBudget / BigInt(alternatives.length)).toString()
+        : totalBudget.toString();
+      for (const cover of alternatives) {
+        let branchPosition;
+        try {
+          const stonesFlat = [...input.stonesFlat];
+          for (const [q, r] of cover) stonesFlat.push(q, r, defenderNumber);
+          branchPosition = new api.Position(
+            input.winLength, input.placementRadius, input.maxMoves,
+            playerValue(api, input.toMove), 2, new Int32Array(stonesFlat),
+          );
+          const result = stagedShortestBranch(api, solver, branchPosition, {
+            width: message.width,
+            depthCap: message.depthCap,
+            nodeBudget: perCoverBudget,
+            leafNodeBudget: message.leafNodeBudget,
+          });
+          evaluated++;
+          nodesUsed += BigInt(result.nodes || "0");
+          const upper = Number(result.bestUpperDepth
+            || (result.certificateSummary && result.certificateSummary.maxAttackerTurns)
+            || result.depth || 0);
+          const lower = Number(result.excludedThroughDepth || 0);
+          let classification = "unresolved";
+          if (result.kind === "no") classification = "refutes";
+          else if (lower >= Number(message.baselineRemainingTurns)) classification = "extends";
+          else if (result.kind === "win" && upper > 0
+              && upper <= Number(message.baselineRemainingTurns)) classification = "holds";
+          else unresolved = true;
+          const candidate = {cover, classification, upper, lower, result};
+          if (classification === "refutes"
+              || (classification === "extends" && (!best
+                || best.classification !== "refutes"
+                && (lower > best.lower || (lower === best.lower && upper > best.upper))))) {
+            best = candidate;
+          }
+          self.postMessage({
+            type: "defense-progress", requestId, evaluated,
+            total: alternatives.length, cover, classification, upper, lower,
+          });
+          if (classification === "refutes") break;
+        } finally {
+          freeQuietly(branchPosition);
+        }
+      }
+      self.postMessage({
+        type: "defense-result", requestId,
+        status: best ? best.classification : unresolved ? "unresolved" : "no_improvement",
+        evaluated, total: alternatives.length, nodes: nodesUsed.toString(), best,
+      });
+      return;
+    }
 
     if (message.type === "verify") {
       verification = solver.verify_certificate(

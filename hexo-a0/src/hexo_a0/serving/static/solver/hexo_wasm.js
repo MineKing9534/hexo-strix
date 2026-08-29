@@ -320,6 +320,127 @@ export class DefenseOutcome {
 }
 if (Symbol.dispose) DefenseOutcome.prototype[Symbol.dispose] = DefenseOutcome.prototype.free;
 
+/**
+ * One exact two-stone minimum cover after a fixed attacker turn.
+ */
+export class MinimumDefenseCover {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(MinimumDefenseCover.prototype);
+        obj.__wbg_ptr = ptr;
+        MinimumDefenseCoverFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    static __unwrap(jsValue) {
+        if (!(jsValue instanceof MinimumDefenseCover)) {
+            return 0;
+        }
+        return jsValue.__destroy_into_raw();
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        MinimumDefenseCoverFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_minimumdefensecover_free(ptr, 0);
+    }
+    /**
+     * @returns {CoordW}
+     */
+    get first() {
+        const ret = wasm.__wbg_get_minimumdefensecover_first(this.__wbg_ptr);
+        return CoordW.__wrap(ret);
+    }
+    /**
+     * @returns {CoordW}
+     */
+    get second() {
+        const ret = wasm.__wbg_get_minimumdefensecover_second(this.__wbg_ptr);
+        return CoordW.__wrap(ret);
+    }
+    /**
+     * @param {CoordW} arg0
+     */
+    set first(arg0) {
+        _assertClass(arg0, CoordW);
+        var ptr0 = arg0.__destroy_into_raw();
+        wasm.__wbg_set_minimumdefensecover_first(this.__wbg_ptr, ptr0);
+    }
+    /**
+     * @param {CoordW} arg0
+     */
+    set second(arg0) {
+        _assertClass(arg0, CoordW);
+        var ptr0 = arg0.__destroy_into_raw();
+        wasm.__wbg_set_minimumdefensecover_second(this.__wbg_ptr, ptr0);
+    }
+}
+if (Symbol.dispose) MinimumDefenseCover.prototype[Symbol.dispose] = MinimumDefenseCover.prototype.free;
+
+/**
+ * Classification of the fixed attacker turn used by the replay defence prover.
+ * @enum {0 | 1 | 2}
+ */
+export const MinimumDefenseKind = Object.freeze({
+    Covers: 0, "0": "Covers",
+    AttackerWin: 1, "1": "AttackerWin",
+    NotForcing: 2, "2": "NotForcing",
+});
+
+export class MinimumDefenseOutcome {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(MinimumDefenseOutcome.prototype);
+        obj.__wbg_ptr = ptr;
+        MinimumDefenseOutcomeFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        MinimumDefenseOutcomeFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_minimumdefenseoutcome_free(ptr, 0);
+    }
+    /**
+     * @returns {MinimumDefenseCover[]}
+     */
+    get covers() {
+        const ret = wasm.__wbg_get_minimumdefenseoutcome_covers(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * @returns {MinimumDefenseKind}
+     */
+    get kind() {
+        const ret = wasm.__wbg_get_minimumdefenseoutcome_kind(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @param {MinimumDefenseCover[]} arg0
+     */
+    set covers(arg0) {
+        const ptr0 = passArrayJsValueToWasm0(arg0, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_minimumdefenseoutcome_covers(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {MinimumDefenseKind} arg0
+     */
+    set kind(arg0) {
+        wasm.__wbg_set_minimumdefenseoutcome_kind(this.__wbg_ptr, arg0);
+    }
+}
+if (Symbol.dispose) MinimumDefenseOutcome.prototype[Symbol.dispose] = MinimumDefenseOutcome.prototype.free;
+
 export class PairAnchor {
     static __wrap(ptr) {
         ptr = ptr >>> 0;
@@ -1152,6 +1273,22 @@ export class StrixSolver {
         const ptr = this.__destroy_into_raw();
         wasm.__wbg_strixsolver_free(ptr, 0);
     }
+    /**
+     * Enumerate every exact minimum cover after an attacker turn that has
+     * already been placed. `position.to_move` identifies that attacker even
+     * though the historical game is now waiting for the defender's reply.
+     * @param {Position} position
+     * @param {boolean} wide
+     * @returns {MinimumDefenseOutcome}
+     */
+    minimum_defenses_after_attack(position, wide) {
+        _assertClass(position, Position);
+        const ret = wasm.strixsolver_minimum_defenses_after_attack(this.__wbg_ptr, position.__wbg_ptr, wide);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return MinimumDefenseOutcome.__wrap(ret[0]);
+    }
     constructor() {
         const ret = wasm.strixsolver_new();
         this.__wbg_ptr = ret >>> 0;
@@ -1404,6 +1541,14 @@ function __wbg_get_imports() {
             const ret = CoordW.__unwrap(arg0);
             return ret;
         },
+        __wbg_minimumdefensecover_new: function(arg0) {
+            const ret = MinimumDefenseCover.__wrap(arg0);
+            return ret;
+        },
+        __wbg_minimumdefensecover_unwrap: function(arg0) {
+            const ret = MinimumDefenseCover.__unwrap(arg0);
+            return ret;
+        },
         __wbg_pairanchor_new: function(arg0) {
             const ret = PairAnchor.__wrap(arg0);
             return ret;
@@ -1453,6 +1598,12 @@ const CoordWFinalization = (typeof FinalizationRegistry === 'undefined')
 const DefenseOutcomeFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_defenseoutcome_free(ptr >>> 0, 1));
+const MinimumDefenseCoverFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_minimumdefensecover_free(ptr >>> 0, 1));
+const MinimumDefenseOutcomeFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_minimumdefenseoutcome_free(ptr >>> 0, 1));
 const PairAnchorFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_pairanchor_free(ptr >>> 0, 1));

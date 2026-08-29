@@ -213,6 +213,30 @@ pub struct PairAnchor {
     pub second: CoordW,
 }
 
+/// Classification of the fixed attacker turn used by the replay defence prover.
+#[wasm_bindgen]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinimumDefenseKind {
+    Covers = 0,
+    AttackerWin = 1,
+    NotForcing = 2,
+}
+
+/// One exact two-stone minimum cover after a fixed attacker turn.
+#[wasm_bindgen]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MinimumDefenseCover {
+    pub first: CoordW,
+    pub second: CoordW,
+}
+
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Debug)]
+pub struct MinimumDefenseOutcome {
+    pub kind: MinimumDefenseKind,
+    pub covers: Vec<MinimumDefenseCover>,
+}
+
 #[wasm_bindgen(getter_with_clone)]
 #[derive(Debug)]
 pub struct DefenseOutcome {
@@ -440,6 +464,59 @@ impl StrixSolver {
         };
         flipped.moves_remaining = 2;
         Self::solve_inner(&flipped, limits, true)
+    }
+
+    /// Enumerate every exact minimum cover after an attacker turn that has
+    /// already been placed. `position.to_move` identifies that attacker even
+    /// though the historical game is now waiting for the defender's reply.
+    pub fn minimum_defenses_after_attack(
+        &self,
+        position: &Position,
+        wide: bool,
+    ) -> Result<MinimumDefenseOutcome, JsError> {
+        let pos = convert_position(position)?;
+        if !is_game_valid_board(&pos.stones) {
+            return Err(JsError::new(
+                "minimum_defenses_after_attack requires a game-valid board",
+            ));
+        }
+        if !(1..=64).contains(&pos.placement_radius) {
+            return Err(JsError::new(
+                "minimum_defenses_after_attack requires 1 <= placement_radius <= 64",
+            ));
+        }
+        if pos.moves_remaining != 2 {
+            return Err(JsError::new(
+                "minimum_defenses_after_attack requires a complete historical attacker turn",
+            ));
+        }
+        let replies = hexo_solver::prover::minimum_defenses_after_attack(
+            &prover_position(&pos),
+            wide,
+        )
+        .map_err(|error| JsError::new(&error))?;
+        Ok(match replies {
+            hexo_solver::prover::DefenseReplies::Covers(covers) => {
+                let covers = covers
+                    .into_iter()
+                    .map(|[first, second]| {
+                        MinimumDefenseCover {
+                            first: CoordW { q: first.0, r: first.1 },
+                            second: CoordW { q: second.0, r: second.1 },
+                        }
+                    })
+                    .collect();
+                MinimumDefenseOutcome { kind: MinimumDefenseKind::Covers, covers }
+            }
+            hexo_solver::prover::DefenseReplies::AttackerWin => MinimumDefenseOutcome {
+                kind: MinimumDefenseKind::AttackerWin,
+                covers: Vec::new(),
+            },
+            hexo_solver::prover::DefenseReplies::NotForcing => MinimumDefenseOutcome {
+                kind: MinimumDefenseKind::NotForcing,
+                covers: Vec::new(),
+            },
+        })
     }
 
     /// Defensive analysis for the side to move: detects the opponent's

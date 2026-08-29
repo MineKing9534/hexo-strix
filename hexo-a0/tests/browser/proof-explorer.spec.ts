@@ -1,4 +1,9 @@
 import {expect, test, type Page} from "@playwright/test";
+import {readFileSync} from "node:fs";
+
+const QIETBY7_LOST_REPLAY = JSON.parse(readFileSync(
+  "scripts/fixtures/forcing_puzzles/qietby7_17_line.json", "utf8",
+)).moves as [number, number, "P1" | "P2"][];
 
 const PROOF_BUNDLE = {
   format: "hexo-pdspn-proof-bundle-v1",
@@ -320,5 +325,136 @@ test.describe("proof lab search method", () => {
     });
     await expect(page.locator("#analysis-forcing-effort-label")).toHaveText("Deep");
     await expect(page.locator("#analysis-forcing-effort-hint")).toContainText("keep your device busy");
+  });
+});
+
+
+test.describe("better defence review", () => {
+  test("explains when a completed replay is required", async ({page}) => {
+    await page.goto("/analysis");
+    await page.evaluate(() => {
+      const app = window as typeof window & {
+        serializeHtttx(value: [number, number][]): string;
+        loadGame(): void;
+      };
+      (document.getElementById("analysis-htttx") as HTMLTextAreaElement).value =
+        app.serializeHtttx([[0, 0], [1, 0], [2, 0]]);
+      app.loadGame();
+    });
+    await page.evaluate(() => (window as typeof window & {openProofLab(): void}).openProofLab());
+    await expect(page.locator("#proof-defence-review")).toBeVisible();
+    await expect(page.locator("#proof-defence-review-copy")).toContainText("Load a completed game with a winner");
+    await expect(page.locator("#proof-find-defence-btn")).toBeDisabled();
+  });
+
+  test("accepts a completed selected side line", async ({page}, testInfo) => {
+    test.skip(testInfo.project.name !== "desktop-chromium", "variation setup runs once");
+    await page.goto("/analysis");
+    await page.evaluate(moves => {
+      const app = window as typeof window & {
+        serializeHtttx(value: [number, number][]): string;
+        loadGame(): void;
+        analysisCellClick(q: number, r: number): void;
+        openProofLab(): void;
+      };
+      const split = moves.length - 4;
+      (document.getElementById("analysis-htttx") as HTMLTextAreaElement).value =
+        app.serializeHtttx(moves.slice(0, split).map(([q, r]) => [q, r]));
+      app.loadGame();
+      for (const [q, r] of moves.slice(split)) app.analysisCellClick(q, r);
+      app.openProofLab();
+    }, QIETBY7_LOST_REPLAY);
+    await expect(page.locator("#proof-defence-review-copy")).toContainText("lost this variation");
+    await expect(page.locator("#proof-find-defence-btn")).toBeEnabled();
+  });
+
+  test("keeps the replay review action reachable in the phone sheet", async ({page}, testInfo) => {
+    test.skip(!testInfo.project.name.startsWith("phone-"), "phone bottom-sheet regression");
+    await page.goto("/analysis");
+    await page.evaluate(moves => {
+      const app = window as typeof window & {
+        serializeHtttx(value: [number, number][]): string;
+        loadGame(): void;
+        openProofLab(): void;
+      };
+      (document.getElementById("analysis-htttx") as HTMLTextAreaElement).value =
+        app.serializeHtttx(moves.map(([q, r]) => [q, r]));
+      app.loadGame();
+    }, QIETBY7_LOST_REPLAY);
+    await page.evaluate(() => (window as typeof window & {openProofLab(): void}).openProofLab());
+    await expect(page.locator("#proof-find-defence-btn")).toBeInViewport();
+  });
+
+  test("shares one node allowance across the backward walk", async ({page}, testInfo) => {
+    test.skip(testInfo.project.name !== "desktop-chromium", "worker budget regression runs once");
+    await page.addInitScript(() => {
+      class ExhaustingWorker {
+        static starts = 0;
+        onmessage: ((event: MessageEvent) => void) | null = null;
+        onerror: ((event: ErrorEvent) => void) | null = null;
+        constructor() { ExhaustingWorker.starts++; }
+        postMessage(message: {requestId: string}) {
+          setTimeout(() => this.onmessage?.({data: {
+            type: "defense-result", requestId: message.requestId,
+            status: "unresolved", evaluated: 1, total: 1,
+            nodes: "999999999999", best: null,
+          }} as MessageEvent), 0);
+        }
+        terminate() {}
+      }
+      Object.defineProperty(window, "Worker", {configurable: true, value: ExhaustingWorker});
+      Object.defineProperty(window, "defenceWorkerStarts", {
+        configurable: true, get: () => ExhaustingWorker.starts,
+      });
+    });
+    await page.goto("/analysis");
+    await page.evaluate(moves => {
+      const app = window as typeof window & {
+        serializeHtttx(value: [number, number][]): string;
+        loadGame(): void;
+        openProofLab(): void;
+      };
+      (document.getElementById("analysis-htttx") as HTMLTextAreaElement).value =
+        app.serializeHtttx(moves.map(([q, r]) => [q, r]));
+      app.loadGame();
+      app.openProofLab();
+    }, QIETBY7_LOST_REPLAY);
+    await page.locator("#proof-find-defence-btn").click();
+    await expect(page.locator("#proof-defence-status")).toContainText("No conclusive improvement");
+    await expect.poll(() => page.evaluate(() =>
+      (window as typeof window & {defenceWorkerStarts: number}).defenceWorkerStarts)).toBe(1);
+  });
+
+  test("walks backward through qietby7 and finds a refuting defence", async ({page}, testInfo) => {
+    test.skip(testInfo.project.name !== "desktop-chromium", "deep WASM regression runs once");
+    test.setTimeout(180_000);
+    await page.goto("/analysis");
+    await page.evaluate(moves => {
+      const app = window as typeof window & {
+        serializeHtttx(value: [number, number][]): string;
+        loadGame(): void;
+      };
+      const cells = moves.map(([q, r]) => [q, r] as [number, number]);
+      (document.getElementById("analysis-htttx") as HTMLTextAreaElement).value = app.serializeHtttx(cells);
+      app.loadGame();
+    }, QIETBY7_LOST_REPLAY);
+    await page.locator("#proof-lab-launch").click();
+    await expect(page.locator("#proof-defence-review")).toBeVisible();
+    await expect(page.locator("#proof-defence-review-copy")).toContainText("P2 lost this replay");
+    await page.locator("#proof-find-defence-btn").click();
+    await expect(page.locator("#proof-stop-defence-btn")).toBeVisible();
+    await expect(page.locator("#analysis-game-btn")).toBeDisabled();
+    await page.locator("#proof-stop-defence-btn").click();
+    await expect(page.locator("#proof-defence-status")).toHaveText("Defence review stopped.");
+    await expect(page.locator("#analysis-game-btn")).toBeEnabled();
+    await page.locator("#proof-find-defence-btn").click();
+    await expect(page.locator("#proof-defence-result")).toBeVisible({timeout: 150_000});
+    await expect(page.locator("#proof-defence-result")).toContainText("P2 can break this forcing line");
+    await expect(page.locator("#proof-defence-result")).toContainText("[1,7] + [6,2]");
+    await expect(page.locator("#proof-find-defence-btn")).toBeEnabled();
+    await page.getByRole("button", {name: "Try this defence"}).click();
+    await expect(page.locator("#proof-lab-position")).toContainText("P1 to move");
+    await page.getByRole("button", {name: "Back to recorded game"}).click();
+    await expect(page.locator("#proof-lab-position")).toContainText("Game over");
   });
 });

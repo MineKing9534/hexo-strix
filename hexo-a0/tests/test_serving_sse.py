@@ -157,7 +157,8 @@ def test_html_exposes_authoritative_rules_to_worker_client():
         assert b"analysis-download-certificate-btn" in ui
         assert b"analysis-explore-certificate-btn" in ui
         assert b"proof-explorer" in ui
-        assert b"Extra search for each branch" in ui
+        assert b"analysis-forcing-effort" in ui
+        assert b"Find a better defence" in ui
         csp = _response_header(port, "/analysis", "Content-Security-Policy")
         assert "worker-src 'self'" in csp
         assert "'wasm-unsafe-eval'" in csp

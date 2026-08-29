@@ -182,6 +182,86 @@ for (const [requestId, engine] of ["idtt", "pdspn"].entries()) {
   }
 }
 
+const qietAfterAttack = JSON.parse(await readFile(resolve(
+  here, "../../scripts/fixtures/forcing_puzzles/qietby7_after_attack_turn9.json",
+), "utf8"));
+posted.length = 0;
+await self.onmessage({data: {
+  type: "minimum-defenses",
+  requestId: "qietby7-turn9-defenses",
+  position: {
+    winLength: 6,
+    placementRadius: 8,
+    maxMoves: 300,
+    toMove: qietAfterAttack.attacker,
+    movesRemaining: 2,
+    stonesFlat: qietAfterAttack.stones.flatMap(([q, r, player]) => [
+      q, r, player === "P1" ? 1 : 2,
+    ]),
+  },
+  width: "wide",
+}});
+assert.equal(posted.length, 1);
+assert.equal(posted[0].type, "minimum-defenses", posted[0].error || "defense enumeration error");
+assert.equal(posted[0].kind, "covers");
+assert.ok(posted[0].covers.some(cover => JSON.stringify(cover) === JSON.stringify([[0, 8], [6, 2]])));
+
+posted.length = 0;
+await self.onmessage({data: {
+  type: "rank-defenses",
+  requestId: "qietby7-turn9-starved",
+  position: {
+    winLength: 6,
+    placementRadius: 8,
+    maxMoves: 300,
+    toMove: qietAfterAttack.attacker,
+    movesRemaining: 2,
+    stonesFlat: qietAfterAttack.stones.flatMap(([q, r, player]) => [
+      q, r, player === "P1" ? 1 : 2,
+    ]),
+  },
+  playedCover: [[1, 7], [7, 1]],
+  baselineRemainingTurns: 8,
+  width: "wide",
+  depthCap: 25,
+  nodeBudget: "1",
+  leafNodeBudget: "1",
+}});
+const starved = posted.find(message => message.type === "defense-result");
+assert.equal(starved.status, "unresolved", "budget starvation must not refute a line");
+
+posted.length = 0;
+await self.onmessage({data: {
+  type: "rank-defenses",
+  requestId: "qietby7-turn9-ranked",
+  position: {
+    winLength: 6,
+    placementRadius: 8,
+    maxMoves: 300,
+    toMove: qietAfterAttack.attacker,
+    movesRemaining: 2,
+    stonesFlat: qietAfterAttack.stones.flatMap(([q, r, player]) => [
+      q, r, player === "P1" ? 1 : 2,
+    ]),
+  },
+  playedCover: [[1, 7], [7, 1]],
+  baselineRemainingTurns: 8,
+  width: "wide",
+  depthCap: 25,
+  nodeBudget: "250000",
+  leafNodeBudget: "50000",
+}});
+const extension = posted.find(message => message.type === "defense-progress"
+  && message.classification === "extends");
+assert.deepEqual(extension?.cover, [[0, 8], [6, 2]],
+  "the first better cover must prove an extension before the stronger refutation");
+assert.ok(extension.lower >= 8);
+const ranked = posted.find(message => message.type === "defense-result");
+assert.ok(ranked, "ranked defence should return a final result");
+assert.equal(ranked.status, "refutes");
+assert.deepEqual(ranked.best.cover, [[1, 7], [6, 2]]);
+assert.equal(ranked.best.result.kind, "no", "better defence must refute the fixed attack");
+
 posted.length = 0;
 await self.onmessage({data: {
   type: "solve",

@@ -55,6 +55,52 @@ for (const [d, expectedPly, expectedRound, label] of cases) {
   }
 }
 
+// A forcing PV is relative to the attacker at the selected position. Its first
+// displayed round is the rest of that attacker turn plus the defender's full
+// reply; later attacker+defender rounds have the usual four placements.
+assert.equal((src.match(/forcingLineNumber\(i, startDepth\)/g) || []).length, 2,
+  "attacker and defender overlay labels must use the current position phase");
+const forcingStart = src.indexOf("function forcingLineNumber(index, startDepth) {");
+assert.ok(forcingStart > 0, "could not find forcingLineNumber in analysis.js");
+let forcingEnd = forcingStart;
+let forcingDepth = 0;
+while (forcingEnd < src.length) {
+  if (src[forcingEnd] === "{") forcingDepth++;
+  else if (src[forcingEnd] === "}") {
+    forcingDepth--;
+    if (forcingDepth === 0) { forcingEnd++; break; }
+  }
+  forcingEnd++;
+}
+const forcingSrc = src.slice(forcingStart, forcingEnd);
+function buildForcingFn(mode, absolutePositionNumber) {
+  const swapped = forcingSrc.replace(/positionNumbering\(\)/g, JSON.stringify(mode));
+  const compiled = new Function("index", "startDepth", "positionNumber",
+    swapped + "\nreturn forcingLineNumber(index, startDepth);");
+  return (index, startDepth) => compiled(index, startDepth, absolutePositionNumber);
+}
+try {
+  const forcingRound = buildForcingFn("round", roundFn);
+  const forcingPly = buildForcingFn("ply", plyFn);
+  assert.deepEqual(Array.from({length: 8}, (_, i) => forcingRound(i, 0)),
+    [1, 1, 1, 1, 2, 2, 2, 2], "full round from the seed");
+  assert.deepEqual(Array.from({length: 8}, (_, i) => forcingRound(i, 1)),
+    [1, 1, 1, 2, 2, 2, 2, 3], "one placement already used in the current turn");
+  assert.deepEqual(Array.from({length: 8}, (_, i) => forcingRound(i, 2)),
+    [1, 1, 1, 1, 2, 2, 2, 2], "fresh attacker turn starts a full forcing round");
+  assert.deepEqual(Array.from({length: 8}, (_, i) => forcingRound(i, 3)),
+    [1, 1, 1, 2, 2, 2, 2, 3], "halfway through the attacker turn leaves three cells in round 1");
+  assert.deepEqual(Array.from({length: 8}, (_, i) => forcingRound(i, 4)),
+    [1, 1, 1, 1, 2, 2, 2, 2], "new round boundary");
+  assert.deepEqual(Array.from({length: 8}, (_, i) => forcingPly(i, 3)),
+    [1, 2, 3, 4, 5, 6, 7, 8], "ply labels remain relative");
+  console.log("OK: forcing-line rounds respect the attacker turn phase");
+  pass++;
+} catch (e) {
+  console.log("FAIL: forcing-line numbering -", e.message);
+  fail++;
+}
+
 if (fail) {
   console.log(fail + " failures, " + pass + " passed");
   process.exit(1);
