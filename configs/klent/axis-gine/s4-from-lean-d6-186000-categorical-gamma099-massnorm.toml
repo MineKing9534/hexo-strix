@@ -87,7 +87,7 @@ opponent_mcts_simulations = 24
 opponent_mcts_actions = 8
 
 [run]
-iterations = 60
+iterations = 200
 device = "cuda"
 precision = "bf16"
 compile = true
