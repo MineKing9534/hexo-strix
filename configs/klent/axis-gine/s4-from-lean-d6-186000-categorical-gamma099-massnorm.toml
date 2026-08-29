@@ -45,24 +45,22 @@ gamma = 0.99
 critic_mass_floor = 0.20
 
 [collection]
-# Roughly 4k complete games at the observed 65-move mean, while retaining the
-# current position-budget contract and 64 effective optimizer steps per FIT.
-positions_per_iteration = 262_144
+positions_per_iteration = 524288
 parallel_games = 512
 inference_batch_size = 256
-inference_edge_budget = 500_000
+inference_edge_budget = 250_000
 workers = 4
 batch_timeout_ms = 2.0
 
 [training]
 batch_size = 4_096
-edge_budget = 500_000
+edge_budget = 250_000
 policy_diagnostic_samples = 2_048
 grad_accumulation = true
 prefetch_batches = true
 fit_max_autotune = true
 fit_compile_seed_nodes = 16_384
-learning_rate = 1e-4
+learning_rate = 1e-5
 learning_rate_warmup_iterations = 20
 learning_rate_warmup_start_factor = 0.2
 weight_decay = 1e-4
