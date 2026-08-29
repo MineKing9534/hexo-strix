@@ -7,6 +7,8 @@
 # Rust build output (can be gigabytes) — rebuilt inside the image
 **/target/
 **/target-*/
+hexo-rs/hexo-wasm/pkg/
+hexo-rs/hexo-wasm/pkg-node/
 
 # Python envs / caches — rebuilt inside the image
 .venv

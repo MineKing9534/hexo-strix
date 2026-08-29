@@ -35,7 +35,7 @@
 FROM python:3.13-slim-bookworm AS builder
 
 # uv (Astral) — copied from the official multi-arch image (amd64 + arm64).
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /uvx /usr/local/bin/
 
 # Rust toolchain + a C linker for the maturin/PyO3 build, in one layer. No libtorch.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -51,6 +51,7 @@ ENV PATH="/root/.cargo/bin:${PATH}" \
     CARGO_HOME=/root/.cargo \
     CARGO_TARGET_DIR=/root/cargo-target \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \
+    CARGO_PROFILE_RELEASE_INCREMENTAL=true \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never

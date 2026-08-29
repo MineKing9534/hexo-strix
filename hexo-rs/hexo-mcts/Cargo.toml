@@ -12,7 +12,7 @@ categories = ["algorithms", "science"]
 
 [lib]
 name = "hexo_rs"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [features]
 python = ["pyo3"]

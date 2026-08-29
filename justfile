@@ -25,10 +25,36 @@ self-play:
 # Build everything: Python extension + self-play binary
 build: sync self-play
 
-# Build the ARM64 serving image and push it to GHCR (for the Oracle box).
-# Requires `docker login ghcr.io`. Emulated arm64 build, so first run is slow;
-# the builder stage caches. Usage: just image-push [tag]   (default tag: arm64)
-image-push tag="arm64":
+# Build the ARM64 serving image natively on the Oracle Docker host while using
+# this local checkout as the build context, then push it to GHCR. The server does
+# not need a repository clone: Buildx streams the filtered context over SSH. The
+# named remote builder persists its Cargo/BuildKit cache between invocations.
+# Requires local `docker login ghcr.io` and SSH/Docker access to ubuntu@oracle.
+# Usage: just image-push [tag] [host]
+image-push tag="arm64" host="ubuntu@oracle":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    builder="hexo-oracle-arm"
+    if ! docker buildx inspect "$builder" >/dev/null 2>&1; then
+        echo "-> creating native ARM64 builder on {{host}}..."
+        docker buildx create \
+            --name "$builder" \
+            --driver docker-container \
+            --platform linux/arm64 \
+            "ssh://{{host}}"
+    fi
+    echo "-> starting native ARM64 builder and sending local source context..."
+    docker buildx inspect "$builder" --bootstrap >/dev/null
+    docker buildx build \
+        --builder "$builder" \
+        --platform linux/arm64 \
+        --push \
+        -t "ghcr.io/sootyowl/hexo-serve:{{tag}}" \
+        .
+
+# Local fallback. This runs ARM64 rustc through QEMU on the x86 workstation and
+# is therefore several minutes slower whenever hexo-rs changes.
+image-push-emulated tag="arm64":
     docker buildx build --platform linux/arm64 --push -t ghcr.io/sootyowl/hexo-serve:{{tag}} .
 
 # Ship a checkpoint + deploy files to the Oracle box (Ubuntu). Usage:
