@@ -3,12 +3,19 @@
 //! This crate intentionally exposes a tiny, stable boundary for JVM callers:
 //! UTF-8 JSON in, heap-allocated UTF-8 JSON out. Kotlin/JNA must release returned
 //! strings with [`hexo_free_string`].
+//!
+//! Honesty contract (mirrors the wasm surface): `hexo_solve_defense_json` never
+//! reports `no_threat` when the threat check merely ran out of budget — that
+//! case is `budget_exceeded`. Defensive responses distinguish globally verified
+//! refutations (`pair_anchors`) from exact immediate covers whose deeper status
+//! is open (`tactical_pairs`), expose initiative-taking pairs
+//! (`counter_threats`), and list budget-starved candidates (`unresolved`).
 
 use hexo_engine::types::Player;
 use hexo_solver::forcing::Outcome;
 use hexo_solver::{
-    SolverEngine, SolverPosition, is_game_valid_board, solve_defense_from_position,
-    solve_from_position, solve_wide_from_position,
+    DefenseVerdict, SolverEngine, SolverPosition, is_game_valid_board,
+    solve_defense_verdict_from_position, solve_from_position, solve_wide_from_position,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
@@ -66,6 +73,17 @@ struct DefenseResponse {
     threat: Option<ThreatResponse>,
     killers: Vec<CoordResponse>,
     pair_anchors: Vec<PairAnchorResponse>,
+    /// Pair anchors that refute by taking the initiative (the opponent must
+    /// answer the mover's new forcing threat first).
+    counter_threats: Vec<PairAnchorResponse>,
+    /// Exact minimum covers of the immediate attack whose deeper whole-line
+    /// verification was inconclusive: they stop the current line but are NOT
+    /// global refutations.
+    tactical_pairs: Vec<PairAnchorResponse>,
+    /// Candidate replies whose deeper re-check exhausted the work budget.
+    unresolved: Vec<CoordResponse>,
+    /// Whether the wide (threat + quiet-builder) generator was used.
+    wide: bool,
     best_delay: Option<CoordResponse>,
     error: Option<String>,
 }
@@ -100,6 +118,10 @@ pub unsafe extern "C" fn hexo_solve_json(input: *const c_char) -> *mut c_char {
 
 /// Run defensive analysis for the side to move from a JSON request.
 ///
+/// Response `kind` is one of `no_threat`, `budget_exceeded`, `threat_found`, or
+/// `error`. `budget_exceeded` means the threat check ran out of work budget —
+/// retry with a larger budget; it is never a safety verdict.
+
 /// # Safety
 ///
 /// `input` must either be null or point to a valid NUL-terminated C string for
@@ -203,6 +225,7 @@ fn solve_request(request: SolveRequest) -> Result<SolveResponse, String> {
 }
 
 fn defense_request(request: SolveRequest) -> Result<DefenseResponse, String> {
+    let wide = request.wide;
     let depth_cap = request.depth_cap;
     let node_budget = request.node_budget;
     let time_limit = Duration::from_millis(request.time_limit_ms.unwrap_or(10_000));
@@ -220,36 +243,49 @@ fn defense_request(request: SolveRequest) -> Result<DefenseResponse, String> {
     // as the wasm surface so untrusted callers cannot force an oversized
     // allocation.
     if !(1..=64).contains(&position.placement_radius) {
-        return Err(
-            "solve_defense requires 1 <= placement_radius <= 64"
-                .to_owned(),
-        );
+        return Err("solve_defense requires 1 <= placement_radius <= 64".to_owned());
     }
 
-    match solve_defense_from_position(&position, depth_cap, node_budget, time_limit) {
-        None => Ok(DefenseResponse {
+    // The verdict API is load-bearing here: a starved threat check reports
+    // `budget_exceeded`, never the dangerous `no_threat` (the legacy
+    // Option-returning wrapper conflated the two).
+    match solve_defense_verdict_from_position(&position, depth_cap, node_budget, time_limit, wide) {
+        DefenseVerdict::NoThreat => Ok(DefenseResponse {
             kind: "no_threat",
             threat: None,
             killers: Vec::new(),
             pair_anchors: Vec::new(),
+            counter_threats: Vec::new(),
+            tactical_pairs: Vec::new(),
+            unresolved: Vec::new(),
+            wide,
             best_delay: None,
             error: None,
         }),
-        Some(analysis) => Ok(DefenseResponse {
+        DefenseVerdict::BudgetExceeded => Ok(DefenseResponse {
+            kind: "budget_exceeded",
+            threat: None,
+            killers: Vec::new(),
+            pair_anchors: Vec::new(),
+            counter_threats: Vec::new(),
+            tactical_pairs: Vec::new(),
+            unresolved: Vec::new(),
+            wide,
+            best_delay: None,
+            error: None,
+        }),
+        DefenseVerdict::Threat(analysis) => Ok(DefenseResponse {
             kind: "threat_found",
             threat: Some(ThreatResponse {
                 depth: analysis.threat_depth,
                 pv: chunk_pv(analysis.threat_pv, 2, threat_attacker),
             }),
             killers: coords_response(analysis.killers),
-            pair_anchors: analysis
-                .pair_anchors
-                .into_iter()
-                .map(|(first, second)| PairAnchorResponse {
-                    first: coord_response(first),
-                    second: coord_response(second),
-                })
-                .collect(),
+            pair_anchors: pairs_response(analysis.pair_anchors),
+            counter_threats: pairs_response(analysis.counter_threats),
+            tactical_pairs: pairs_response(analysis.tactical_pairs),
+            unresolved: coords_response(analysis.unresolved),
+            wide,
             best_delay: analysis.best_delay.map(coord_response),
             error: None,
         }),
@@ -295,6 +331,16 @@ fn coord_response((q, r): (i32, i32)) -> CoordResponse {
 
 fn coords_response(coords: Vec<(i32, i32)>) -> Vec<CoordResponse> {
     coords.into_iter().map(coord_response).collect()
+}
+
+fn pairs_response(pairs: Vec<((i32, i32), (i32, i32))>) -> Vec<PairAnchorResponse> {
+    pairs
+        .into_iter()
+        .map(|(first, second)| PairAnchorResponse {
+            first: coord_response(first),
+            second: coord_response(second),
+        })
+        .collect()
 }
 
 /// Chunk the flat solver PV into wasm-compatible turn records.
@@ -359,6 +405,10 @@ fn defense_error_json(message: &str) -> String {
         threat: None,
         killers: Vec::new(),
         pair_anchors: Vec::new(),
+        counter_threats: Vec::new(),
+        tactical_pairs: Vec::new(),
+        unresolved: Vec::new(),
+        wide: false,
         best_delay: None,
         error: Some(message.to_owned()),
     })
@@ -383,4 +433,130 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
         .map(|s| (*s).to_owned())
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn call_json(raw: &str) -> String {
+        let input = CString::new(raw).expect("test json has no NUL bytes");
+        let ptr = unsafe { hexo_solve_json(input.as_ptr()) };
+        assert!(!ptr.is_null());
+        let out = unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("responses are utf-8")
+            .to_owned();
+        unsafe { hexo_free_string(ptr) };
+        out
+    }
+
+    fn call_defense_json(raw: &str) -> String {
+        let input = CString::new(raw).expect("test json has no NUL bytes");
+        let ptr = unsafe { hexo_solve_defense_json(input.as_ptr()) };
+        assert!(!ptr.is_null());
+        let out = unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("responses are utf-8")
+            .to_owned();
+        unsafe { hexo_free_string(ptr) };
+        out
+    }
+
+    const WIN_REQUEST: &str = r#"{"win_length":6,"placement_radius":8,"max_moves":400,"to_move":1,"moves_remaining":2,"depth_cap":8,"node_budget":20000,"stones":[[0,0,1],[1,0,1],[2,0,1],[3,0,1],[5,5,2]]}"#;
+
+    const QIET_REQUEST_PREFIX: &str = r#"{"win_length":6,"placement_radius":8,"max_moves":400,"to_move":1,"moves_remaining":2,"depth_cap":12,"node_budget":100000,"wide":true,"stones":"#;
+
+    #[test]
+    fn solve_reports_win_with_turn_chunks() {
+        let response: serde_json::Value = serde_json::from_str(&call_json(WIN_REQUEST)).unwrap();
+        assert_eq!(response["kind"], "win");
+        assert_eq!(response["error"], serde_json::Value::Null);
+        let turns = response["pv"].as_array().unwrap();
+        assert!(!turns.is_empty());
+        assert_eq!(turns[0]["player"], 1);
+        assert!(turns[0]["cells"].as_array().unwrap().len() <= 2);
+    }
+
+    #[test]
+    fn invalid_request_is_a_clean_error() {
+        let response: serde_json::Value = serde_json::from_str(&call_json("{}")).unwrap();
+        assert_eq!(response["kind"], "error");
+        assert!(response["error"].as_str().unwrap().contains("win_length"));
+    }
+
+    #[test]
+    fn defense_reports_honest_budget_exceeded() {
+        // The qiet position has a real threat whose sighting needs more than
+        // one node. The legacy wrapper conflated that starved check with
+        // NoThreat; the FFI must say budget_exceeded instead.
+        let replay: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/forcing_puzzles/qietby7_17_line.json"
+        ))
+        .unwrap();
+        let stones: Vec<[i32; 3]> = replay["moves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(31)
+            .map(|m| {
+                [
+                    m[0].as_i64().unwrap() as i32,
+                    m[1].as_i64().unwrap() as i32,
+                    if m[2] == "P1" { 1 } else { 2 },
+                ]
+            })
+            .collect();
+        let request = serde_json::json!({
+            "win_length": 6,
+            "placement_radius": 8,
+            "max_moves": 400,
+            "to_move": 1,
+            "moves_remaining": 2,
+            "depth_cap": 40,
+            "node_budget": 1,
+            "stones": stones,
+        });
+        let response: serde_json::Value =
+            serde_json::from_str(&call_defense_json(&request.to_string())).unwrap();
+        assert_eq!(response["kind"], "budget_exceeded");
+        assert_eq!(response["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn defense_exposes_initiative_evidence() {
+        let replay: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/forcing_puzzles/qietby7_17_line.json"
+        ))
+        .unwrap();
+        let stones: Vec<[i32; 3]> = replay["moves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(31)
+            .map(|m| {
+                [
+                    m[0].as_i64().unwrap() as i32,
+                    m[1].as_i64().unwrap() as i32,
+                    if m[2] == "P1" { 1 } else { 2 },
+                ]
+            })
+            .collect();
+        let mut request = String::from(QIET_REQUEST_PREFIX);
+        request.push_str(&serde_json::to_string(&stones).unwrap());
+        request.push('}');
+        let response: serde_json::Value =
+            serde_json::from_str(&call_defense_json(&request)).unwrap();
+        assert_eq!(response["kind"], "threat_found");
+        assert_eq!(response["wide"], true);
+        let counter = response["counter_threats"].as_array().unwrap();
+        assert!(counter.iter().any(|pair| pair["first"]["q"] == 2
+            && pair["first"]["r"] == 0
+            && pair["second"]["q"] == 3
+            && pair["second"]["r"] == 0));
+        // The honesty fields are always present, even when empty.
+        assert!(response["tactical_pairs"].is_array());
+        assert!(response["unresolved"].is_array());
+    }
 }
