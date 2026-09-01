@@ -38,7 +38,7 @@ placement_radius = 8
 rollout_horizon = 300
 
 [algorithm]
-alpha = 0.01
+alpha = 0.03
 beta = 0.10
 tau = inf
 gamma = 0.99
