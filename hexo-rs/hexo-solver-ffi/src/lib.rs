@@ -33,10 +33,36 @@ struct SolveRequest {
     depth_cap: u8,
     node_budget: u64,
     #[serde(default)]
+    engine: SolverEngineRequest,
+    #[serde(default)]
     wide: bool,
     #[serde(default)]
     time_limit_ms: Option<u64>,
     stones: Vec<StoneRequest>,
+}
+
+/// Solver engine selected by the JSON API. Lowercase names match the public
+/// engine names used by the other wrappers; omission remains backward
+/// compatible and selects the production IDTT engine.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SolverEngineRequest {
+    #[default]
+    Idtt,
+    Pns,
+    Dfpn,
+    Pdspn,
+}
+
+impl From<SolverEngineRequest> for SolverEngine {
+    fn from(engine: SolverEngineRequest) -> Self {
+        match engine {
+            SolverEngineRequest::Idtt => SolverEngine::Idtt,
+            SolverEngineRequest::Pns => SolverEngine::Pns,
+            SolverEngineRequest::Dfpn => SolverEngine::Dfpn,
+            SolverEngineRequest::Pdspn => SolverEngine::Pdspn,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +216,7 @@ fn parse_request(input: *const c_char) -> Result<SolveRequest, String> {
 
 fn solve_request(request: SolveRequest) -> Result<SolveResponse, String> {
     let wide = request.wide;
+    let engine = request.engine.into();
     let depth_cap = request.depth_cap;
     let node_budget = request.node_budget;
     let moves_remaining = request.moves_remaining;
@@ -197,9 +224,9 @@ fn solve_request(request: SolveRequest) -> Result<SolveResponse, String> {
     let position = request.into_position()?;
 
     let outcome = if wide {
-        solve_wide_from_position(&position, SolverEngine::Idtt, depth_cap, node_budget)
+        solve_wide_from_position(&position, engine, depth_cap, node_budget)
     } else {
-        solve_from_position(&position, SolverEngine::Idtt, depth_cap, node_budget)
+        solve_from_position(&position, engine, depth_cap, node_budget)
     };
 
     Ok(match outcome {
@@ -484,6 +511,43 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&call_json("{}")).unwrap();
         assert_eq!(response["kind"], "error");
         assert!(response["error"].as_str().unwrap().contains("win_length"));
+    }
+
+    #[test]
+    fn request_accepts_every_solver_engine_and_defaults_to_idtt() {
+        let request = CString::new(WIN_REQUEST).unwrap();
+        let parsed = parse_request(request.as_ptr()).unwrap();
+        assert!(matches!(parsed.engine, SolverEngineRequest::Idtt));
+
+        for (name, expected) in [
+            ("idtt", SolverEngineRequest::Idtt),
+            ("pns", SolverEngineRequest::Pns),
+            ("dfpn", SolverEngineRequest::Dfpn),
+            ("pdspn", SolverEngineRequest::Pdspn),
+        ] {
+            let raw = WIN_REQUEST.replacen(
+                r#""depth_cap":8"#,
+                &format!(r#""engine":"{name}","depth_cap":8"#),
+                1,
+            );
+            let request = CString::new(raw).unwrap();
+            let parsed = parse_request(request.as_ptr()).unwrap();
+            assert!(std::mem::discriminant(&parsed.engine) == std::mem::discriminant(&expected));
+        }
+    }
+
+    #[test]
+    fn unknown_solver_engine_is_a_clean_error() {
+        let raw =
+            WIN_REQUEST.replacen(r#""depth_cap":8"#, r#""engine":"unknown","depth_cap":8"#, 1);
+        let response: serde_json::Value = serde_json::from_str(&call_json(&raw)).unwrap();
+        assert_eq!(response["kind"], "error");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown variant")
+        );
     }
 
     #[test]
